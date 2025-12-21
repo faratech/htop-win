@@ -1,0 +1,88 @@
+================================================================================
+                        HTOP REFERENCE LAYOUT (80x24)
+================================================================================
+
+LINE 01:   0[||||||||||||||||||||||                      45.2%]   1[||||                                           8.3%]
+LINE 02:   2[|||||||||||||||||||||||||||                 55.1%]   3[||||||||||||||||||                            35.7%]
+LINE 03:   4[|||||||||||||||||                           33.4%]   5[|||||||||||||||||||||||||||||||               62.8%]
+LINE 04:   6[||||||||||||||||||||||||||||||||||||||||    80.5%]   7[|||||||||||||||||||||||||||||||||||||||||||   88.9%]
+LINE 05: Mem[|||||||||||||||||||||||||||||||||     4.52G/7.89G]
+LINE 06: Swp[                                        0K/2.00G]
+LINE 07: Tasks: 245, 892 thr; 2 running
+LINE 08: Uptime: 12:34:56
+LINE 09:
+LINE 10:   PID USER      PRI  NI  VIRT   RES   SHR S CPU% MEM%   TIME+  Command
+LINE 11: ▶1234 root       20   0  123M   45M   12M R 45.2  5.7  1:23.45 /usr/bin/process
+LINE 12:  5678 user       20   0  456M  123M   34M S 12.3  1.5  0:45.67 /home/user/app
+LINE 13:   890 www-data   20   0   89M   23M    8M S  2.1  0.3  0:12.34 nginx: worker
+LINE 14:  1111 mysql      20   0 1.23G  456M   12M S  5.4  5.8  5:43.21 /usr/sbin/mysqld
+LINE 15:  2222 postgres   20   0  234M   89M   45M S  1.2  1.1  0:34.56 postgres: main
+LINE 16:  3333 redis      20   0   56M   12M    4M S  0.5  0.2  0:05.67 redis-server
+LINE 17:  4444 root        0 -20  789M  234M   56M S  8.9  3.0  2:34.56 dockerd
+LINE 18:  5555 systemd+   20   0   34M    8M    5M S  0.1  0.1  0:01.23 systemd-resolve
+LINE 19:  6666 root       20   0   12M    4M    2M S  0.0  0.1  0:00.45 /sbin/init
+LINE 20:  7777 user       20   0  567M  178M   89M S  3.4  2.3  0:56.78 code
+LINE 21:  8888 user       20   0  234M   67M   23M S  1.1  0.9  0:23.45 bash
+LINE 22:  9999 user       39  19   45M   12M    6M S  0.0  0.2  0:00.12 nice-process
+LINE 23: F1Help  F2Setup F3Search F4Filter F5Tree  F6SortBy F7Nice- F8Nice+ F9Kill  F10Quit
+LINE 24:
+
+================================================================================
+                           HTOP UI ELEMENT REFERENCE
+================================================================================
+
+## CPU Bar Format:
+   N[|||||...     XX.X%]
+   │ │           │
+   │ │           └── Percentage (right-aligned, 5 chars + %)
+   │ └── Bar fill (| chars) + empty spaces
+   └── CPU number (right-aligned, 3 chars)
+
+## Colors:
+   - CPU bar < 50%: GREEN
+   - CPU bar 50-80%: YELLOW
+   - CPU bar > 80%: RED
+   - Memory bar: GREEN to BLUE gradient
+   - Swap bar: Same as memory
+   - Process Running (R): GREEN
+   - Process Sleeping (S): Normal/GRAY
+   - Process Zombie (Z): RED
+   - Process Stopped (T): YELLOW
+   - Selected row: INVERSE (black on cyan)
+   - Tagged process: YELLOW text
+
+## Column Widths (approximate):
+   PID:     7 chars (right-aligned)
+   USER:   10 chars (left-aligned)
+   PRI:     4 chars (right-aligned)
+   NI:      4 chars (right-aligned)
+   VIRT:    7 chars (right-aligned, human-readable)
+   RES:     7 chars (right-aligned, human-readable)
+   SHR:     7 chars (right-aligned, human-readable)
+   S:       1 char  (centered)
+   CPU%:    5 chars (right-aligned, 1 decimal)
+   MEM%:    5 chars (right-aligned, 1 decimal)
+   TIME+:  10 chars (right-aligned, MM:SS.cc or HH:MM:SS)
+   Command: remaining width (left-aligned)
+
+## Tree View Prefixes:
+   ├─ child process (not last)
+   └─ child process (last)
+     ├─ grandchild (indent 2 spaces per level)
+
+## Function Key Bar:
+   F1Help  F2Setup F3Search F4Filter F5Tree  F6SortBy F7Nice- F8Nice+ F9Kill  F10Quit
+   │       │
+   │       └── Label (normal text)
+   └── Key (inverse/highlighted)
+
+## Header Section:
+   - CPUs displayed in 2 columns
+   - Memory bar spans full width
+   - Swap bar spans full width
+   - Tasks line: "Tasks: N, M thr; K running"
+   - Uptime line: "Uptime: DD:HH:MM:SS" or "HH:MM:SS"
+
+## Footer (2 lines):
+   - Line 1: Function keys F1-F10
+   - Line 2: Status info (filter, search, sort indicator)
