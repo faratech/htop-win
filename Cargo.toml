@@ -1,0 +1,39 @@
+[package]
+name = "htop-win"
+version = "0.1.0"
+edition = "2021"
+description = "A Windows clone of htop - interactive process viewer"
+authors = ["htop-win contributors"]
+license = "MIT"
+repository = "https://github.com/htop-win/htop-win"
+keywords = ["htop", "process", "monitor", "tui", "windows"]
+categories = ["command-line-utilities", "os::windows-apis"]
+
+[dependencies]
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = "0.28"  # Match ratatui's crossterm version
+sysinfo = { version = "0.37", features = ["disk", "network"] }
+anyhow = "1"
+unicode-width = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+directories = "5"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [  # Match sysinfo's windows version
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Power",
+    "Win32_NetworkManagement_IpHelper",
+] }
+
+[profile.release]
+opt-level = "z"      # Optimize for size
+lto = true
+codegen-units = 1
+panic = "abort"      # Smaller binary, no unwinding
+strip = true         # Strip symbols

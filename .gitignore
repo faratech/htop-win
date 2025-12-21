@@ -1,0 +1,31 @@
+# Rust / Cargo
+/target/
+Cargo.lock
+
+# Reference code (not part of this project)
+/htop-reference/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Debug
+*.pdb
+
+# Local config
+.env
+.env.local
+
+# Claude Code local settings
+.claude/
+
+# Windows reserved names
+nul
