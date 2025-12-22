@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.0.1)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: amd64
+            os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            arch: arm64
+            os: windows-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Rename binary
+        shell: pwsh
+        run: |
+          $src = "target/${{ matrix.target }}/release/htop-win.exe"
+          $dst = "htop-win-${{ matrix.arch }}.exe"
+          Copy-Item $src $dst
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: htop-win-${{ matrix.arch }}.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: htop-win-${{ matrix.arch }}
+          path: htop-win-${{ matrix.arch }}.exe
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: htop-win ${{ steps.tag.outputs.tag }}
+          draft: false
+          prerelease: false
+          files: |
+            artifacts/htop-win-amd64.exe
+            artifacts/htop-win-arm64.exe
+          body: |
+            ## htop-win ${{ steps.tag.outputs.tag }}
+
+            Windows process viewer inspired by htop.
+
+            ### Downloads
+            - `htop-win-amd64.exe` - Windows x64
+            - `htop-win-arm64.exe` - Windows ARM64
+
+            ### Verification
+            All binaries are signed with GitHub artifact attestation. Verify with:
+            ```
+            gh attestation verify htop-win-amd64.exe --owner ${{ github.repository_owner }}
+            gh attestation verify htop-win-arm64.exe --owner ${{ github.repository_owner }}
+            ```
