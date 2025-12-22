@@ -20,6 +20,13 @@ Desktop.ini
 # Debug
 *.pdb
 
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
 # Local config
 .env
 .env.local
@@ -29,3 +36,6 @@ Desktop.ini
 
 # Windows reserved names
 nul
+
+# Full-resolution demo (only web version tracked)
+images/demo.gif

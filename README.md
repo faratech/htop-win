@@ -8,6 +8,8 @@ A Windows clone of [htop](https://htop.dev/) - interactive process viewer writte
 
 > Inspired by the original [htop](https://github.com/htop-dev/htop) by Hisham Muhammad and contributors.
 
+![htop-win demo](images/demo_web.gif)
+
 ## Features
 
 - **Real-time system monitoring**
