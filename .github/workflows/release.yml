@@ -102,10 +102,3 @@ jobs:
             ### Downloads
             - `htop-win-amd64.exe` - Windows x64
             - `htop-win-arm64.exe` - Windows ARM64
-
-            ### Verification
-            All binaries are signed with GitHub artifact attestation. Verify with:
-            ```
-            gh attestation verify htop-win-amd64.exe --owner ${{ github.repository_owner }}
-            gh attestation verify htop-win-arm64.exe --owner ${{ github.repository_owner }}
-            ```
