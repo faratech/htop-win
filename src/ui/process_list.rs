@@ -167,8 +167,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 theme.text
                             };
+                            // Build prefix with indicators
+                            let elevated_icon = if proc.is_elevated { "🛡️" } else { "" };
+                            let arch_str = proc.arch.as_str();
+                            let arch_prefix = if arch_str.is_empty() {
+                                String::new()
+                            } else {
+                                format!("[{}]", arch_str)
+                            };
                             (
-                                format!("{}{}", tree_prefix, display_command),
+                                format!("{}{}{}{}", elevated_icon, arch_prefix, tree_prefix, display_command),
                                 if is_selected { theme.selection_fg } else { cmd_color }
                             )
                         }

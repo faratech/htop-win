@@ -15,7 +15,8 @@ use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HLOCAL};
 use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 #[cfg(windows)]
 use windows::Win32::Security::{
-    GetTokenInformation, LookupAccountSidW, TokenUser, PSID, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER,
+    GetTokenInformation, LookupAccountSidW, TokenElevation, TokenUser, PSID, SID_NAME_USE,
+    TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
 };
 #[cfg(windows)]
 use windows::Win32::System::Diagnostics::ToolHelp::{
@@ -30,11 +31,16 @@ use windows::Win32::System::Threading::IO_COUNTERS;
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
     GetPriorityClass, GetProcessHandleCount, GetProcessInformation, GetProcessIoCounters,
-    GetProcessTimes, OpenProcess, ProcessPowerThrottling, SetPriorityClass, TerminateProcess,
-    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
-    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-    PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_INFORMATION, PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
+    GetProcessTimes, IsWow64Process2, OpenProcess, OpenProcessToken, ProcessPowerThrottling,
+    SetPriorityClass, TerminateProcess, ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS,
+    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
+    PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
+};
+#[cfg(windows)]
+use windows::Win32::System::SystemInformation::{
+    IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386,
 };
 
 // Cache for SID to username lookups
@@ -159,6 +165,28 @@ fn get_process_owner(pid: u32) -> Option<String> {
     }
 }
 
+/// Process architecture
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ProcessArch {
+    #[default]
+    Native,   // Native architecture (matches OS)
+    X86,      // 32-bit x86 (WoW64 on x64/ARM64)
+    X64,      // x64 running on ARM64 via emulation
+    ARM64,    // Native ARM64
+}
+
+impl ProcessArch {
+    /// Short display string for the architecture
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProcessArch::Native => "",
+            ProcessArch::X86 => "x86",
+            ProcessArch::X64 => "x64",
+            ProcessArch::ARM64 => "ARM",
+        }
+    }
+}
+
 /// Extended process info from Windows API (combined for efficiency)
 #[cfg(windows)]
 struct WinProcessInfo {
@@ -171,6 +199,8 @@ struct WinProcessInfo {
     io_write_bytes: u64,
     shared_mem: u64,
     efficiency_mode: bool, // Windows 11 EcoQoS
+    is_elevated: bool,     // Running as admin
+    arch: ProcessArch,     // Process architecture
 }
 
 /// Get priority, nice, CPU time, handle count, and I/O counters with a single OpenProcess call
@@ -186,6 +216,8 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
         io_write_bytes: 0,
         shared_mem: 0,
         efficiency_mode: false,
+        is_elevated: false,
+        arch: ProcessArch::Native,
     };
 
     unsafe {
@@ -296,6 +328,58 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
             }
         };
 
+        // Check if process is elevated (running as admin)
+        let is_elevated = {
+            let mut token_handle = HANDLE::default();
+            if OpenProcessToken(handle, TOKEN_QUERY, &mut token_handle).is_ok() {
+                let mut elevation = TOKEN_ELEVATION::default();
+                let mut return_length: u32 = 0;
+                let elevated = GetTokenInformation(
+                    token_handle,
+                    TokenElevation,
+                    Some(&mut elevation as *mut _ as *mut _),
+                    std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                    &mut return_length,
+                )
+                .is_ok()
+                    && elevation.TokenIsElevated != 0;
+                let _ = CloseHandle(token_handle);
+                elevated
+            } else {
+                false
+            }
+        };
+
+        // Detect process architecture (x86/x64/ARM64)
+        let arch = {
+            use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
+            let mut process_machine = IMAGE_FILE_MACHINE::default();
+            let mut native_machine = IMAGE_FILE_MACHINE::default();
+            if IsWow64Process2(
+                handle,
+                &mut process_machine,
+                Some(&mut native_machine),
+            )
+            .is_ok()
+            {
+                if process_machine.0 == 0 {
+                    // Not running under WoW64, native process
+                    ProcessArch::Native
+                } else if process_machine == IMAGE_FILE_MACHINE_I386 {
+                    ProcessArch::X86
+                } else if process_machine == IMAGE_FILE_MACHINE_AMD64 {
+                    // x64 process on ARM64 (via emulation)
+                    ProcessArch::X64
+                } else if process_machine == IMAGE_FILE_MACHINE_ARM64 {
+                    ProcessArch::ARM64
+                } else {
+                    ProcessArch::Native
+                }
+            } else {
+                ProcessArch::Native
+            }
+        };
+
         let _ = CloseHandle(handle);
 
         WinProcessInfo {
@@ -308,6 +392,8 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
             io_write_bytes,
             shared_mem,
             efficiency_mode,
+            is_elevated,
+            arch,
         }
     }
 }
@@ -323,6 +409,8 @@ struct WinProcessInfo {
     io_write_bytes: u64,
     shared_mem: u64,
     efficiency_mode: bool,
+    is_elevated: bool,
+    arch: ProcessArch,
 }
 
 #[cfg(not(windows))]
@@ -337,6 +425,8 @@ fn get_win_process_info(_pid: u32) -> WinProcessInfo {
         io_write_bytes: 0,
         shared_mem: 0,
         efficiency_mode: false,
+        is_elevated: false,
+        arch: ProcessArch::Native,
     }
 }
 
@@ -517,6 +607,10 @@ pub struct ProcessInfo {
     pub matches_search: bool,
     // Windows 11 Efficiency Mode (EcoQoS)
     pub efficiency_mode: bool,
+    // Running as administrator
+    pub is_elevated: bool,
+    // Process architecture (x86/x64/ARM64)
+    pub arch: ProcessArch,
 }
 
 impl ProcessInfo {
@@ -624,6 +718,8 @@ impl ProcessInfo {
                     user_lower,
                     matches_search: false, // Set during filtering
                     efficiency_mode: win_info.efficiency_mode,
+                    is_elevated: win_info.is_elevated,
+                    arch: win_info.arch,
                 }
             })
             .collect()
