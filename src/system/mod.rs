@@ -10,6 +10,7 @@ pub use process::{
 
 use sysinfo::{
     CpuRefreshKind, MemoryRefreshKind, Networks, ProcessRefreshKind, RefreshKind, System,
+    UpdateKind,
 };
 
 /// System metrics
@@ -45,19 +46,30 @@ pub struct SystemMetrics {
     prev_disk_write: u64,
 }
 
+/// Create optimized ProcessRefreshKind - only what we actually need
+fn process_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::nothing()
+        .with_cpu()                                    // CPU usage
+        .with_memory()                                 // Memory usage
+        .with_disk_usage()                             // Disk I/O
+        .with_user(UpdateKind::OnlyIfNotSet)           // User (cached after first lookup)
+        .with_exe(UpdateKind::OnlyIfNotSet)            // Exe path (doesn't change)
+        .with_cmd(UpdateKind::OnlyIfNotSet)            // Command line (doesn't change)
+}
+
 impl Default for SystemMetrics {
     fn default() -> Self {
         let mut sys = System::new_with_specifics(
             RefreshKind::nothing()
                 .with_cpu(CpuRefreshKind::everything())
                 .with_memory(MemoryRefreshKind::everything())
-                .with_processes(ProcessRefreshKind::everything()),
+                .with_processes(process_refresh_kind()),
         );
         sys.refresh_specifics(
             RefreshKind::nothing()
                 .with_cpu(CpuRefreshKind::everything())
                 .with_memory(MemoryRefreshKind::everything())
-                .with_processes(ProcessRefreshKind::everything()),
+                .with_processes(process_refresh_kind()),
         );
 
         Self {
@@ -96,7 +108,7 @@ impl SystemMetrics {
             RefreshKind::nothing()
                 .with_cpu(CpuRefreshKind::everything())
                 .with_memory(MemoryRefreshKind::everything())
-                .with_processes(ProcessRefreshKind::everything()),
+                .with_processes(process_refresh_kind()),
         );
 
         // Refresh existing network interfaces without re-scanning the system each tick

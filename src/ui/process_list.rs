@@ -1,8 +1,8 @@
 use ratatui::{
     layout::{Constraint, Rect},
-    style::{Modifier, Style},
-    text::Span,
-    widgets::{Block, Borders, Row, Table},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Cell, Row, Table},
     Frame,
 };
 
@@ -27,6 +27,10 @@ fn column_width(col: &SortColumn) -> Constraint {
         SortColumn::Time => Constraint::Length(10),
         SortColumn::StartTime => Constraint::Length(8),
         SortColumn::Command => Constraint::Min(20),
+        // Windows-specific columns
+        SortColumn::Elevated => Constraint::Length(4),
+        SortColumn::Arch => Constraint::Length(5),
+        SortColumn::Efficiency => Constraint::Length(4),
     }
 }
 
@@ -93,9 +97,49 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             };
 
             // Build cells only for visible columns
-            let cells: Vec<Span> = visible_columns
+            let cells: Vec<Cell> = visible_columns
                 .iter()
                 .map(|col| {
+                    // Command column uses multi-span for colored indicators
+                    if *col == SortColumn::Command {
+                        let cmd_color = if app.tree_view && !tree_prefix.is_empty() {
+                            theme.process_tree
+                        } else {
+                            theme.text
+                        };
+                        let cmd_color = if is_selected { theme.selection_fg } else { cmd_color };
+
+                        // Build spans with distinct colors
+                        let mut spans: Vec<Span> = Vec::new();
+
+                        // Elevated indicator - gold/yellow color
+                        if proc.is_elevated {
+                            spans.push(Span::styled(
+                                "🛡️",
+                                Style::default().fg(if is_selected { theme.selection_fg } else { Color::Yellow })
+                            ));
+                        }
+
+                        // Architecture indicator - cyan color
+                        let arch_str = proc.arch.as_str();
+                        if !arch_str.is_empty() {
+                            spans.push(Span::styled(
+                                format!("[{}]", arch_str),
+                                Style::default().fg(if is_selected { theme.selection_fg } else { Color::Cyan })
+                            ));
+                        }
+
+                        // Tree prefix
+                        if !tree_prefix.is_empty() {
+                            spans.push(Span::styled(tree_prefix.clone(), Style::default().fg(cmd_color)));
+                        }
+
+                        // Command text
+                        spans.push(Span::styled(display_command.to_string(), Style::default().fg(cmd_color)));
+
+                        return Cell::from(Line::from(spans));
+                    }
+
                     let (text, color) = match col {
                         SortColumn::Pid => (
                             if is_selected { format!("▶{:>5}", proc.pid) } else { format!("{:>6}", proc.pid) },
@@ -161,27 +205,22 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             format!("{:>7}", format_start_time(proc.start_time)),
                             if is_selected { theme.selection_fg } else { theme.text_dim }
                         ),
-                        SortColumn::Command => {
-                            let cmd_color = if app.tree_view && !tree_prefix.is_empty() {
-                                theme.process_tree
-                            } else {
-                                theme.text
-                            };
-                            // Build prefix with indicators
-                            let elevated_icon = if proc.is_elevated { "🛡️" } else { "" };
-                            let arch_str = proc.arch.as_str();
-                            let arch_prefix = if arch_str.is_empty() {
-                                String::new()
-                            } else {
-                                format!("[{}]", arch_str)
-                            };
-                            (
-                                format!("{}{}{}{}", elevated_icon, arch_prefix, tree_prefix, display_command),
-                                if is_selected { theme.selection_fg } else { cmd_color }
-                            )
-                        }
+                        SortColumn::Command => unreachable!(), // Handled above
+                        // Windows-specific columns
+                        SortColumn::Elevated => (
+                            if proc.is_elevated { "🛡️".to_string() } else { " ".to_string() },
+                            if is_selected { theme.selection_fg } else { Color::Yellow }
+                        ),
+                        SortColumn::Arch => (
+                            format!("{:>4}", proc.arch.as_str()),
+                            if is_selected { theme.selection_fg } else { Color::Cyan }
+                        ),
+                        SortColumn::Efficiency => (
+                            if proc.efficiency_mode { "🌿".to_string() } else { " ".to_string() },
+                            if is_selected { theme.selection_fg } else { Color::Green }
+                        ),
                     };
-                    Span::styled(text, Style::default().fg(color))
+                    Cell::from(Span::styled(text, Style::default().fg(color)))
                 })
                 .collect();
 

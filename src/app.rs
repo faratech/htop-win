@@ -22,6 +22,10 @@ pub enum SortColumn {
     Time,
     StartTime,
     Command,
+    // Windows-specific sort columns
+    Elevated,   // Running as admin
+    Arch,       // Process architecture (x86/x64/ARM)
+    Efficiency, // Efficiency mode (EcoQoS)
 }
 
 impl SortColumn {
@@ -42,6 +46,9 @@ impl SortColumn {
             SortColumn::Time,
             SortColumn::StartTime,
             SortColumn::Command,
+            SortColumn::Elevated,
+            SortColumn::Arch,
+            SortColumn::Efficiency,
         ]
     }
 
@@ -62,6 +69,9 @@ impl SortColumn {
             SortColumn::Time => "TIME+",
             SortColumn::StartTime => "START",
             SortColumn::Command => "Command",
+            SortColumn::Elevated => "ELEV",
+            SortColumn::Arch => "ARCH",
+            SortColumn::Efficiency => "ECO",
         }
     }
 }
@@ -426,6 +436,10 @@ impl App {
                 SortColumn::Time => a.cpu_time.cmp(&b.cpu_time),
                 SortColumn::StartTime => a.start_time.cmp(&b.start_time),
                 SortColumn::Command => a.command.cmp(&b.command),
+                // Windows-specific columns
+                SortColumn::Elevated => a.is_elevated.cmp(&b.is_elevated),
+                SortColumn::Arch => a.arch.as_str().cmp(b.arch.as_str()),
+                SortColumn::Efficiency => a.efficiency_mode.cmp(&b.efficiency_mode),
             };
             if self.sort_ascending { ord } else { ord.reverse() }
         };

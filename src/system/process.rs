@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 #[cfg(windows)]
 use std::sync::Mutex;
 use std::time::Duration;
@@ -60,12 +61,18 @@ static PID_USER_CACHE: LazyLock<Mutex<HashMap<u32, String>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // Cache for thread counts (expensive to compute - only refresh every 2 seconds)
+// Uses Arc to avoid cloning the entire HashMap on each access
 #[cfg(windows)]
-static THREAD_COUNT_CACHE: LazyLock<Mutex<(std::time::Instant, HashMap<u32, u32>)>> =
-    LazyLock::new(|| Mutex::new((std::time::Instant::now(), HashMap::new())));
+static THREAD_COUNT_CACHE: LazyLock<Mutex<(std::time::Instant, Arc<HashMap<u32, u32>>)>> =
+    LazyLock::new(|| Mutex::new((std::time::Instant::now(), Arc::new(HashMap::new()))));
 
 #[cfg(windows)]
 const THREAD_CACHE_DURATION_MS: u128 = 2000; // Refresh thread counts every 2 seconds
+
+// Cache for static process info (elevation, architecture) - these don't change during process lifetime
+#[cfg(windows)]
+static STATIC_PROCESS_INFO_CACHE: LazyLock<Mutex<HashMap<u32, (bool, ProcessArch)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Get the owner of a process by PID using Windows API
 #[cfg(windows)]
@@ -220,6 +227,12 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
         arch: ProcessArch::Native,
     };
 
+    // Check cache for static info (elevation, architecture)
+    let cached_static = STATIC_PROCESS_INFO_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&pid).copied());
+
     unsafe {
         // Try full access first, fall back to limited
         let handle = match OpenProcess(PROCESS_QUERY_INFORMATION, false, pid) {
@@ -309,7 +322,7 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
             0
         };
 
-        // Check for Efficiency Mode (EcoQoS) - Windows 11+
+        // Check for Efficiency Mode (EcoQoS) - Windows 11+ (dynamic, can change)
         let efficiency_mode = {
             let mut throttle_state = PROCESS_POWER_THROTTLING_STATE::default();
             throttle_state.Version = 1; // PROCESS_POWER_THROTTLING_CURRENT_VERSION
@@ -328,56 +341,68 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
             }
         };
 
-        // Check if process is elevated (running as admin)
-        let is_elevated = {
-            let mut token_handle = HANDLE::default();
-            if OpenProcessToken(handle, TOKEN_QUERY, &mut token_handle).is_ok() {
-                let mut elevation = TOKEN_ELEVATION::default();
-                let mut return_length: u32 = 0;
-                let elevated = GetTokenInformation(
-                    token_handle,
-                    TokenElevation,
-                    Some(&mut elevation as *mut _ as *mut _),
-                    std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                    &mut return_length,
+        // Use cached static info if available, otherwise query and cache
+        let (is_elevated, arch) = if let Some((elevated, arch)) = cached_static {
+            (elevated, arch)
+        } else {
+            // Query elevation (static - doesn't change during process lifetime)
+            let is_elevated = {
+                let mut token_handle = HANDLE::default();
+                if OpenProcessToken(handle, TOKEN_QUERY, &mut token_handle).is_ok() {
+                    let mut elevation = TOKEN_ELEVATION::default();
+                    let mut return_length: u32 = 0;
+                    let elevated = GetTokenInformation(
+                        token_handle,
+                        TokenElevation,
+                        Some(&mut elevation as *mut _ as *mut _),
+                        std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                        &mut return_length,
+                    )
+                    .is_ok()
+                        && elevation.TokenIsElevated != 0;
+                    let _ = CloseHandle(token_handle);
+                    elevated
+                } else {
+                    false
+                }
+            };
+
+            // Query architecture (static - doesn't change during process lifetime)
+            let arch = {
+                use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
+                let mut process_machine = IMAGE_FILE_MACHINE::default();
+                let mut native_machine = IMAGE_FILE_MACHINE::default();
+                if IsWow64Process2(
+                    handle,
+                    &mut process_machine,
+                    Some(&mut native_machine),
                 )
                 .is_ok()
-                    && elevation.TokenIsElevated != 0;
-                let _ = CloseHandle(token_handle);
-                elevated
-            } else {
-                false
-            }
-        };
-
-        // Detect process architecture (x86/x64/ARM64)
-        let arch = {
-            use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
-            let mut process_machine = IMAGE_FILE_MACHINE::default();
-            let mut native_machine = IMAGE_FILE_MACHINE::default();
-            if IsWow64Process2(
-                handle,
-                &mut process_machine,
-                Some(&mut native_machine),
-            )
-            .is_ok()
-            {
-                if process_machine.0 == 0 {
-                    // Not running under WoW64, native process
-                    ProcessArch::Native
-                } else if process_machine == IMAGE_FILE_MACHINE_I386 {
-                    ProcessArch::X86
-                } else if process_machine == IMAGE_FILE_MACHINE_AMD64 {
-                    // x64 process on ARM64 (via emulation)
-                    ProcessArch::X64
-                } else if process_machine == IMAGE_FILE_MACHINE_ARM64 {
-                    ProcessArch::ARM64
+                {
+                    if process_machine.0 == 0 {
+                        // Not running under WoW64, native process
+                        ProcessArch::Native
+                    } else if process_machine == IMAGE_FILE_MACHINE_I386 {
+                        ProcessArch::X86
+                    } else if process_machine == IMAGE_FILE_MACHINE_AMD64 {
+                        // x64 process on ARM64 (via emulation)
+                        ProcessArch::X64
+                    } else if process_machine == IMAGE_FILE_MACHINE_ARM64 {
+                        ProcessArch::ARM64
+                    } else {
+                        ProcessArch::Native
+                    }
                 } else {
                     ProcessArch::Native
                 }
-            } else {
-                ProcessArch::Native
+            };
+
+            // Cache the static info
+            if let Ok(mut cache) = STATIC_PROCESS_INFO_CACHE.lock() {
+                cache.insert(pid, (is_elevated, arch));
             }
+
+            (is_elevated, arch)
         };
 
         let _ = CloseHandle(handle);
@@ -437,12 +462,12 @@ fn get_process_owner(_pid: u32) -> Option<String> {
 
 /// Get thread counts for all processes in one efficient call (cached)
 #[cfg(windows)]
-fn get_all_thread_counts() -> HashMap<u32, u32> {
+fn get_all_thread_counts() -> Arc<HashMap<u32, u32>> {
     // Check if we can use cached thread counts
     if let Ok(mut cache) = THREAD_COUNT_CACHE.lock() {
         let elapsed = cache.0.elapsed().as_millis();
         if elapsed < THREAD_CACHE_DURATION_MS && !cache.1.is_empty() {
-            return cache.1.clone();
+            return Arc::clone(&cache.1);
         }
 
         // Need to refresh - compute new counts
@@ -477,19 +502,20 @@ fn get_all_thread_counts() -> HashMap<u32, u32> {
             }
         }
 
-        // Update cache
+        // Update cache with Arc-wrapped counts
+        let counts_arc = Arc::new(counts);
         cache.0 = std::time::Instant::now();
-        cache.1 = counts.clone();
-        counts
+        cache.1 = Arc::clone(&counts_arc);
+        counts_arc
     } else {
         // Fallback if lock fails
-        HashMap::new()
+        Arc::new(HashMap::new())
     }
 }
 
 #[cfg(not(windows))]
-fn get_all_thread_counts() -> HashMap<u32, u32> {
-    HashMap::new()
+fn get_all_thread_counts() -> Arc<HashMap<u32, u32>> {
+    Arc::new(HashMap::new())
 }
 
 /// Convert a Windows SID string to a username
