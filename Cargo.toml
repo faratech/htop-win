@@ -1,7 +1,7 @@
 [package]
 name = "htop-win"
-version = "0.0.1"
-edition = "2021"
+version = "0.0.2"
+edition = "2024"
 description = "A Windows clone of htop - interactive process viewer"
 authors = ["htop-win contributors"]
 license = "MIT"
@@ -28,6 +28,8 @@ windows = { version = "0.61", features = [  # Match sysinfo's windows version
     "Win32_Security_Authorization",
     "Win32_System_Power",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_WindowsProgramming",
+    "Wdk_System_SystemInformation",
 ] }
 
 [profile.release]

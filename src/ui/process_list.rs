@@ -9,8 +9,36 @@ use ratatui::{
 use crate::app::{App, SortColumn};
 use crate::system::format_bytes;
 
+/// Get column width constraint for a given column
+fn column_width(col: &SortColumn) -> Constraint {
+    match col {
+        SortColumn::Pid => Constraint::Length(7),
+        SortColumn::PPid => Constraint::Length(7),
+        SortColumn::User => Constraint::Length(10),
+        SortColumn::Priority => Constraint::Length(4),
+        SortColumn::Nice => Constraint::Length(4),
+        SortColumn::Threads => Constraint::Length(4),
+        SortColumn::Virt => Constraint::Length(8),
+        SortColumn::Res => Constraint::Length(8),
+        SortColumn::Shr => Constraint::Length(8),
+        SortColumn::Status => Constraint::Length(2),
+        SortColumn::Cpu => Constraint::Length(6),
+        SortColumn::Mem => Constraint::Length(6),
+        SortColumn::Time => Constraint::Length(10),
+        SortColumn::StartTime => Constraint::Length(8),
+        SortColumn::Command => Constraint::Min(20),
+    }
+}
+
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
+
+    // Get visible columns
+    let visible_columns: Vec<SortColumn> = SortColumn::all()
+        .iter()
+        .filter(|col| app.config.is_column_visible(col.name()))
+        .copied()
+        .collect();
 
     // htop header style: black text on green background
     let header_style = Style::default()
@@ -18,8 +46,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .bg(theme.header_bg)
         .add_modifier(Modifier::BOLD);
 
-    // Build header with sort indicator - htop style
-    let header_cells: Vec<Span> = SortColumn::all()
+    // Build header with sort indicator - only for visible columns
+    let header_cells: Vec<Span> = visible_columns
         .iter()
         .map(|col| {
             let name = col.name();
@@ -34,24 +62,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
     let header = Row::new(header_cells).style(header_style).height(1);
 
-    // Column widths
-    let widths = [
-        Constraint::Length(7),  // PID
-        Constraint::Length(7),  // PPID
-        Constraint::Length(10), // USER
-        Constraint::Length(4),  // PRI
-        Constraint::Length(4),  // NI
-        Constraint::Length(4),  // THR (Threads)
-        Constraint::Length(8),  // VIRT
-        Constraint::Length(8),  // RES
-        Constraint::Length(8),  // SHR
-        Constraint::Length(2),  // S
-        Constraint::Length(6),  // CPU%
-        Constraint::Length(6),  // MEM%
-        Constraint::Length(10), // TIME+
-        Constraint::Length(8),  // START
-        Constraint::Min(20),    // Command
-    ];
+    // Column widths for visible columns only
+    let widths: Vec<Constraint> = visible_columns.iter().map(column_width).collect();
 
     // Build rows
     let rows: Vec<Row> = app
@@ -73,50 +85,89 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 } else { proc.tree_prefix.clone() }
             } else { String::new() };
 
-            // Pre-format all cell text once (avoid duplication)
-            let texts: [String; 15] = [
-                if is_selected { format!("▶{:>5}", proc.pid) } else { format!("{:>6}", proc.pid) },
-                format!("{:>6}", proc.parent_pid),
-                format!("{:10}", truncate_str(&proc.user, 10)),
-                format!("{:>3}", proc.priority),
-                format!("{:>3}", proc.nice),
-                format!("{:>3}", proc.thread_count),
-                format!("{:>7}", format_bytes(proc.virtual_mem)),
-                format!("{:>7}", format_bytes(proc.resident_mem)),
-                format!("{:>7}", format_bytes(proc.shared_mem)),
-                format!("{}", proc.status),
-                format!("{:>5.1}", proc.cpu_percent),
-                format!("{:>5.1}", proc.mem_percent),
-                format!("{:>9}", proc.format_cpu_time()),
-                format!("{:>7}", format_start_time(proc.start_time)),
-                format!("{}{}", tree_prefix, proc.command),
-            ];
-
-            // Build cells - uniform color when selected, varied colors otherwise
-            let cells: Vec<Span> = if is_selected {
-                let s = Style::default().fg(theme.selection_fg);
-                texts.into_iter().map(|t| Span::styled(t, s)).collect()
+            // Choose between full command path or just the program name
+            let display_command = if app.config.show_program_path {
+                &proc.command
             } else {
-                let pri_color = theme.priority_color_for_nice(proc.nice);
-                let cmd_color = if app.tree_view && !tree_prefix.is_empty() { theme.process_tree } else { theme.text };
-                vec![
-                    Span::styled(texts[0].clone(), Style::default().fg(theme.pid_color)),
-                    Span::styled(texts[1].clone(), Style::default().fg(theme.text_dim)),
-                    Span::styled(texts[2].clone(), Style::default().fg(theme.user_color)),
-                    Span::styled(texts[3].clone(), Style::default().fg(pri_color)),
-                    Span::styled(texts[4].clone(), Style::default().fg(pri_color)),
-                    Span::styled(texts[5].clone(), Style::default().fg(theme.threads_color)),
-                    Span::styled(texts[6].clone(), Style::default().fg(theme.memory_size_color(proc.virtual_mem))),
-                    Span::styled(texts[7].clone(), Style::default().fg(theme.memory_size_color(proc.resident_mem))),
-                    Span::styled(texts[8].clone(), Style::default().fg(theme.memory_size_color(proc.shared_mem))),
-                    Span::styled(texts[9].clone(), Style::default().fg(theme.status_color(proc.status))),
-                    Span::styled(texts[10].clone(), Style::default().fg(theme.cpu_color(proc.cpu_percent))),
-                    Span::styled(texts[11].clone(), Style::default().fg(theme.mem_low)),
-                    Span::styled(texts[12].clone(), Style::default().fg(theme.time_color)),
-                    Span::styled(texts[13].clone(), Style::default().fg(theme.text_dim)),
-                    Span::styled(texts[14].clone(), Style::default().fg(cmd_color)),
-                ]
+                &proc.name
             };
+
+            // Build cells only for visible columns
+            let cells: Vec<Span> = visible_columns
+                .iter()
+                .map(|col| {
+                    let (text, color) = match col {
+                        SortColumn::Pid => (
+                            if is_selected { format!("▶{:>5}", proc.pid) } else { format!("{:>6}", proc.pid) },
+                            if is_selected { theme.selection_fg } else { theme.pid_color }
+                        ),
+                        SortColumn::PPid => (
+                            format!("{:>6}", proc.parent_pid),
+                            if is_selected { theme.selection_fg } else { theme.text_dim }
+                        ),
+                        SortColumn::User => (
+                            format!("{:10}", truncate_str(&proc.user, 10)),
+                            if is_selected { theme.selection_fg } else { theme.user_color }
+                        ),
+                        SortColumn::Priority => (
+                            format!("{:>3}", proc.priority),
+                            if is_selected { theme.selection_fg } else { theme.priority_color_for_nice(proc.nice) }
+                        ),
+                        SortColumn::Nice => (
+                            format!("{:>3}", proc.nice),
+                            if is_selected { theme.selection_fg } else { theme.priority_color_for_nice(proc.nice) }
+                        ),
+                        SortColumn::Threads => (
+                            format!("{:>3}", proc.thread_count),
+                            if is_selected { theme.selection_fg } else { theme.threads_color }
+                        ),
+                        SortColumn::Virt => (
+                            format!("{:>7}", format_bytes(proc.virtual_mem)),
+                            if is_selected { theme.selection_fg } else { theme.memory_size_color(proc.virtual_mem) }
+                        ),
+                        SortColumn::Res => (
+                            format!("{:>7}", format_bytes(proc.resident_mem)),
+                            if is_selected { theme.selection_fg } else { theme.memory_size_color(proc.resident_mem) }
+                        ),
+                        SortColumn::Shr => (
+                            format!("{:>7}", format_bytes(proc.shared_mem)),
+                            if is_selected { theme.selection_fg } else { theme.memory_size_color(proc.shared_mem) }
+                        ),
+                        SortColumn::Status => (
+                            format!("{}", proc.status),
+                            if is_selected { theme.selection_fg } else { theme.status_color(proc.status) }
+                        ),
+                        SortColumn::Cpu => (
+                            format!("{:>5.1}", proc.cpu_percent),
+                            if is_selected { theme.selection_fg } else { theme.cpu_color(proc.cpu_percent) }
+                        ),
+                        SortColumn::Mem => (
+                            format!("{:>5.1}", proc.mem_percent),
+                            if is_selected { theme.selection_fg } else { theme.mem_low }
+                        ),
+                        SortColumn::Time => (
+                            format!("{:>9}", proc.format_cpu_time()),
+                            if is_selected { theme.selection_fg } else { theme.time_color }
+                        ),
+                        SortColumn::StartTime => (
+                            format!("{:>7}", format_start_time(proc.start_time)),
+                            if is_selected { theme.selection_fg } else { theme.text_dim }
+                        ),
+                        SortColumn::Command => {
+                            let cmd_color = if app.tree_view && !tree_prefix.is_empty() {
+                                theme.process_tree
+                            } else {
+                                theme.text
+                            };
+                            (
+                                format!("{}{}", tree_prefix, display_command),
+                                if is_selected { theme.selection_fg } else { cmd_color }
+                            )
+                        }
+                    };
+                    Span::styled(text, Style::default().fg(color))
+                })
+                .collect();
 
             // Row styling - always set background from theme
             let row_style = if is_selected {

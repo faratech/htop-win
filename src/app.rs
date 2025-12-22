@@ -68,6 +68,7 @@ impl SortColumn {
 
 /// Current view mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum ViewMode {
     Normal,
     Help,
@@ -167,14 +168,6 @@ pub struct App {
     pub pid_search_buffer: String,
     /// Last PID search time (for timeout)
     pub pid_search_time: Option<Instant>,
-    /// PIDs from previous refresh (for new/dying process detection)
-    pub previous_pids: HashSet<u32>,
-    /// New PIDs (appeared this refresh)
-    pub new_pids: HashSet<u32>,
-    /// Dying PIDs (disappeared this refresh)
-    pub dying_pids: HashSet<u32>,
-    /// Time when new/dying detection happened
-    pub highlight_time: Option<Instant>,
     /// Show header meters
     pub show_header: bool,
     /// Command wrap scroll offset
@@ -189,6 +182,10 @@ pub struct App {
     pub affinity_mask: u64,
     /// Selected CPU in affinity dialog
     pub affinity_selected: usize,
+    /// CPU usage history for graph mode (per core, last N samples)
+    pub cpu_history: Vec<Vec<f32>>,
+    /// Memory usage history for graph mode (last N samples)
+    pub mem_history: Vec<f32>,
 }
 
 impl App {
@@ -235,10 +232,6 @@ impl App {
             env_scroll: 0,
             pid_search_buffer: String::new(),
             pid_search_time: None,
-            previous_pids: HashSet::new(),
-            new_pids: HashSet::new(),
-            dying_pids: HashSet::new(),
-            highlight_time: None,
             show_header: true,
             command_wrap_scroll: 0,
             max_iterations: None,
@@ -246,6 +239,8 @@ impl App {
             column_config_index: 0,
             affinity_mask: 0,
             affinity_selected: 0,
+            cpu_history: Vec::new(),
+            mem_history: Vec::new(),
         }
     }
 
@@ -282,6 +277,39 @@ impl App {
         self.system_metrics.refresh();
         self.processes = self.system_metrics.get_processes();
         self.update_displayed_processes();
+
+        // Update history for graph mode
+        self.update_meter_history();
+    }
+
+    /// Update CPU and memory history for graph mode rendering
+    fn update_meter_history(&mut self) {
+        // htop uses up to 32768 samples; we use 512 for reasonable memory usage
+        // At 1.5s refresh, this is ~12 minutes of history
+        // Each char displays 2 samples, so 256 chars width of graph data
+        const MAX_HISTORY: usize = 512;
+
+        let cpu_count = self.system_metrics.cpu.core_usage.len();
+
+        // Initialize CPU history if needed
+        if self.cpu_history.len() != cpu_count {
+            self.cpu_history = vec![Vec::with_capacity(MAX_HISTORY); cpu_count];
+        }
+
+        // Add current CPU usage to history
+        for (i, &usage) in self.system_metrics.cpu.core_usage.iter().enumerate() {
+            let history = &mut self.cpu_history[i];
+            if history.len() >= MAX_HISTORY {
+                history.remove(0);
+            }
+            history.push(usage);
+        }
+
+        // Add current memory usage to history
+        if self.mem_history.len() >= MAX_HISTORY {
+            self.mem_history.remove(0);
+        }
+        self.mem_history.push(self.system_metrics.memory.used_percent);
     }
 
     /// Update displayed processes based on filter and sort
@@ -292,9 +320,29 @@ impl App {
 
         // Filter-then-clone: only clone processes that pass all filters
         // Also set matches_search flag during this pass to avoid recomputing in render
+        let show_kernel = self.config.show_kernel_threads;
+        let show_user = self.config.show_user_threads;
+
         let mut processes: Vec<ProcessInfo> = self.processes
             .iter()
             .filter(|p| {
+                // Kernel/System threads filter
+                // On Windows, "kernel threads" are SYSTEM user processes
+                let is_kernel = p.user_lower == "system"
+                    || p.user_lower.starts_with("nt authority")
+                    || p.pid == 0
+                    || p.pid == 4;
+
+                if !show_kernel && is_kernel {
+                    return false;
+                }
+
+                // User threads filter
+                // On Windows, "user threads" are non-system processes
+                if !show_user && !is_kernel {
+                    return false;
+                }
+
                 // PID filter (from CLI -p option)
                 if let Some(ref pids) = self.pid_filter {
                     if !pids.contains(&p.pid) {
@@ -492,19 +540,6 @@ impl App {
         }
     }
 
-    /// Toggle tree collapse/expand at selected process
-    pub fn toggle_tree_collapse(&mut self) {
-        let pid = self.selected_process().map(|p| p.pid);
-        if let Some(pid) = pid {
-            if self.collapsed_pids.contains(&pid) {
-                self.collapsed_pids.remove(&pid);
-            } else {
-                self.collapsed_pids.insert(pid);
-            }
-            self.update_displayed_processes();
-        }
-    }
-
     /// Collapse all tree branches
     pub fn collapse_all(&mut self) {
         // Collapse all processes that have children
@@ -652,36 +687,6 @@ impl App {
                 self.selected_index = idx;
                 self.ensure_visible();
                 break;
-            }
-        }
-    }
-
-    /// Find previous search match
-    pub fn find_prev(&mut self) {
-        if self.search_string_lower.is_empty() {
-            return;
-        }
-        let start = self.selected_index + self.displayed_processes.len() - 1;
-        for i in 0..self.displayed_processes.len() {
-            let idx = (start - i) % self.displayed_processes.len();
-            let p = &self.displayed_processes[idx];
-            // Use pre-computed lowercase strings
-            if p.name_lower.contains(&self.search_string_lower)
-                || p.command_lower.contains(&self.search_string_lower)
-            {
-                self.selected_index = idx;
-                self.ensure_visible();
-                break;
-            }
-        }
-    }
-
-    /// Kill selected process
-    pub fn kill_selected(&mut self, signal: u32) {
-        if let Some(proc) = self.selected_process() {
-            let pid = proc.pid;
-            if let Err(e) = crate::system::kill_process(pid, signal) {
-                self.last_error = Some(format!("Failed to kill process {}: {}", pid, e));
             }
         }
     }

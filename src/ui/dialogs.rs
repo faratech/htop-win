@@ -324,6 +324,8 @@ pub fn draw_setup(frame: &mut Frame, app: &App) {
     // Build setup items with actual config values
     let setup_items: Vec<(&str, String)> = vec![
         ("Refresh rate", format!("{} ms", app.config.refresh_rate_ms)),
+        ("CPU meter mode", meter_mode_str(app.config.cpu_meter_mode)),
+        ("Memory meter mode", meter_mode_str(app.config.memory_meter_mode)),
         ("Show kernel threads", bool_to_str(app.config.show_kernel_threads)),
         ("Show user threads", bool_to_str(app.config.show_user_threads)),
         ("Show program path", bool_to_str(app.config.show_program_path)),
@@ -331,6 +333,7 @@ pub fn draw_setup(frame: &mut Frame, app: &App) {
         ("Highlight large numbers", bool_to_str(app.config.highlight_large_numbers)),
         ("Tree view", bool_to_str(app.tree_view)),
         ("Color scheme", app.config.color_scheme.name().to_string()),
+        ("Configure columns", "→".to_string()),
     ];
 
     let items: Vec<ListItem> = setup_items
@@ -360,6 +363,16 @@ pub fn draw_setup(frame: &mut Frame, app: &App) {
 
 fn bool_to_str(val: bool) -> String {
     if val { "Yes".to_string() } else { "No".to_string() }
+}
+
+fn meter_mode_str(mode: crate::config::MeterMode) -> String {
+    use crate::config::MeterMode;
+    match mode {
+        MeterMode::Bar => "Bar".to_string(),
+        MeterMode::Text => "Text".to_string(),
+        MeterMode::Graph => "Graph".to_string(),
+        MeterMode::Hidden => "Hidden".to_string(),
+    }
 }
 
 /// Draw process info dialog

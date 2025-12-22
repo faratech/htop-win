@@ -7,7 +7,20 @@ use ratatui::{
 };
 
 use crate::app::App;
+use crate::config::MeterMode;
 use crate::system::format_bytes;
+
+/// Braille characters for sparkline graph - htop style
+/// Each character encodes TWO data points (left column, right column)
+/// Index = left_height * 5 + right_height (each 0-4 for 4 vertical dots)
+/// This gives 25 combinations per character cell
+const GRAPH_DOTS_UTF8: [&str; 25] = [
+    /*00*/" ", /*01*/"⢀", /*02*/"⢠", /*03*/"⢰", /*04*/"⢸",
+    /*10*/"⡀", /*11*/"⣀", /*12*/"⣠", /*13*/"⣰", /*14*/"⣸",
+    /*20*/"⡄", /*21*/"⣄", /*22*/"⣤", /*23*/"⣴", /*24*/"⣼",
+    /*30*/"⡆", /*31*/"⣆", /*32*/"⣦", /*33*/"⣶", /*34*/"⣾",
+    /*40*/"⡇", /*41*/"⣇", /*42*/"⣧", /*43*/"⣷", /*44*/"⣿",
+];
 
 /// Calculate the header height based on CPU count
 pub fn calculate_header_height(app: &App) -> u16 {
@@ -126,61 +139,186 @@ fn draw_right_column(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: Rect) {
+    let mode = app.config.cpu_meter_mode;
+
+    // Hidden mode: don't render anything
+    if mode == MeterMode::Hidden {
+        return;
+    }
+
     let usage_clamped = usage.clamp(0.0, 100.0);
     let theme = &app.theme;
+    let label = format!("{:>2}", cpu_idx);
 
-    // Color based on usage - htop uses green for user CPU (normal)
-    // For now we use threshold-based coloring since we don't have per-mode CPU breakdown
-    let bar_color = theme.cpu_color(usage_clamped);
+    let line = match mode {
+        MeterMode::Text => {
+            // Text mode: just show "N: XX.X%"
+            Line::from(vec![
+                Span::styled(label, Style::default().fg(theme.meter_label)),
+                Span::styled(": ", Style::default().fg(theme.text)),
+                Span::styled(
+                    format!("{:5.1}%", usage_clamped),
+                    Style::default().fg(theme.cpu_color(usage_clamped)),
+                ),
+            ])
+        }
+        MeterMode::Graph => {
+            // Graph mode: sparkline using history
+            let history = app.cpu_history.get(cpu_idx);
+            let graph_width = area.width.saturating_sub(10) as usize; // label + percent
 
-    // htop format: "  N[||||...     XX.X%]"
-    // Label is 4 chars (2 for number + "["), percentage is 6 chars (5.1f + "]")
-    let bar_width = area.width.saturating_sub(11) as usize; // 4 label + 7 percent = 11
-    let filled = ((usage_clamped as usize) * bar_width / 100).min(bar_width);
-    let empty = bar_width - filled;
+            let graph_str = if let Some(hist) = history {
+                render_sparkline(hist, graph_width)
+            } else {
+                " ".repeat(graph_width)
+            };
 
-    let bar_filled: String = "|".repeat(filled);
-    let bar_empty: String = " ".repeat(empty);
+            Line::from(vec![
+                Span::styled(format!("{}[", label), Style::default().fg(theme.meter_label)),
+                Span::styled(graph_str, Style::default().fg(theme.cpu_color(usage_clamped))),
+                Span::styled(format!("{:5.1}%]", usage_clamped), Style::default().fg(theme.text)),
+            ])
+        }
+        MeterMode::Bar | MeterMode::Hidden => {
+            // Bar mode (default): multi-segment bar with user/system breakdown
+            let bar_width = area.width.saturating_sub(11) as usize;
+            let percent = format!("{:5.1}%]", usage_clamped);
 
-    // htop uses right-aligned 2-char CPU number
-    let label = format!("{:>2}[", cpu_idx);
-    let percent = format!("{:5.1}%]", usage_clamped);
+            let breakdown = app
+                .system_metrics
+                .cpu
+                .core_breakdown
+                .get(cpu_idx)
+                .copied();
 
-    let line = Line::from(vec![
-        Span::styled(label, Style::default().fg(theme.meter_label)),
-        Span::styled(bar_filled, Style::default().fg(bar_color)),
-        Span::raw(bar_empty),
-        Span::styled(percent, Style::default().fg(theme.text)),
-    ]);
+            if let Some(bd) = breakdown {
+                let user_pct = bd.user.clamp(0.0, 100.0);
+                let system_pct = bd.system.clamp(0.0, 100.0);
+
+                let user_width = ((user_pct as usize) * bar_width / 100).min(bar_width);
+                let system_width = ((system_pct as usize) * bar_width / 100).min(bar_width - user_width);
+                let empty_width = bar_width.saturating_sub(user_width + system_width);
+
+                Line::from(vec![
+                    Span::styled(format!("{}[", label), Style::default().fg(theme.meter_label)),
+                    Span::styled("|".repeat(user_width), Style::default().fg(theme.cpu_normal)),
+                    Span::styled("|".repeat(system_width), Style::default().fg(theme.cpu_system)),
+                    Span::raw(" ".repeat(empty_width)),
+                    Span::styled(percent, Style::default().fg(theme.text)),
+                ])
+            } else {
+                let bar_color = theme.cpu_color(usage_clamped);
+                let filled = ((usage_clamped as usize) * bar_width / 100).min(bar_width);
+                let empty = bar_width - filled;
+
+                Line::from(vec![
+                    Span::styled(format!("{}[", label), Style::default().fg(theme.meter_label)),
+                    Span::styled("|".repeat(filled), Style::default().fg(bar_color)),
+                    Span::raw(" ".repeat(empty)),
+                    Span::styled(percent, Style::default().fg(theme.text)),
+                ])
+            }
+        }
+    };
 
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
 }
 
+/// Render a sparkline graph from history data - htop style
+/// Each character encodes TWO consecutive values (left and right halves)
+/// This doubles the effective horizontal resolution
+fn render_sparkline(history: &[f32], width: usize) -> String {
+    if history.is_empty() || width == 0 {
+        return " ".repeat(width);
+    }
+
+    // We need width*2 samples since each char shows 2 values
+    let samples_needed = width * 2;
+    let start = history.len().saturating_sub(samples_needed);
+    let samples = &history[start..];
+
+    let mut result = String::with_capacity(width * 3); // UTF-8 braille is 3 bytes
+    let mut char_count = 0;
+
+    // Process samples in pairs
+    let mut i = 0;
+    while i < samples.len() && char_count < width {
+        // Left value (older)
+        let v1 = samples[i];
+        // Right value (newer) - use same as left if at end
+        let v2 = if i + 1 < samples.len() { samples[i + 1] } else { v1 };
+
+        // Map 0-100% to 0-4 (5 levels for braille dots)
+        let left = ((v1 / 100.0 * 4.0).round() as usize).min(4);
+        let right = ((v2 / 100.0 * 4.0).round() as usize).min(4);
+
+        // Index into 5x5 braille grid
+        let idx = left * 5 + right;
+        result.push_str(GRAPH_DOTS_UTF8[idx]);
+        char_count += 1;
+        i += 2;
+    }
+
+    // Pad with spaces if not enough history
+    while char_count < width {
+        result.insert(0, ' ');
+        char_count += 1;
+    }
+
+    result
+}
+
 fn draw_memory_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let mode = app.config.memory_meter_mode;
+
+    if mode == MeterMode::Hidden {
+        return;
+    }
+
     let mem = &app.system_metrics.memory;
     let usage = mem.used_percent.clamp(0.0, 100.0);
     let theme = &app.theme;
-
-    // htop format: "Mem[||||...    X.XXG/X.XXG]"
     let mem_info = format!("{}/{}", format_bytes(mem.used), format_bytes(mem.total));
-    let info_len = mem_info.len() + 1; // +1 for the closing bracket
-    let bar_width = area.width.saturating_sub(4 + info_len as u16) as usize; // 4 for "Mem["
-    let filled = ((usage as usize) * bar_width / 100).min(bar_width);
-    let empty = bar_width - filled;
 
-    let bar_filled: String = "|".repeat(filled);
-    let bar_empty: String = " ".repeat(empty);
+    let line = match mode {
+        MeterMode::Text => {
+            // Text mode: just show "Mem: XX.X% (used/total)"
+            Line::from(vec![
+                Span::styled("Mem: ", Style::default().fg(theme.meter_label)),
+                Span::styled(
+                    format!("{:5.1}%", usage),
+                    Style::default().fg(theme.memory_used),
+                ),
+                Span::styled(format!(" ({})", mem_info), Style::default().fg(theme.text)),
+            ])
+        }
+        MeterMode::Graph => {
+            // Graph mode: sparkline using history
+            let graph_width = area.width.saturating_sub(mem_info.len() as u16 + 6) as usize;
+            let graph_str = render_sparkline(&app.mem_history, graph_width);
 
-    // Use theme color for memory bar (htop uses green for used memory)
-    let bar_color = theme.memory_used;
+            Line::from(vec![
+                Span::styled("Mem[", Style::default().fg(theme.meter_label)),
+                Span::styled(graph_str, Style::default().fg(theme.memory_used)),
+                Span::styled(format!("{}]", mem_info), Style::default().fg(theme.text)),
+            ])
+        }
+        MeterMode::Bar | MeterMode::Hidden => {
+            // Bar mode (default)
+            let info_len = mem_info.len() + 1;
+            let bar_width = area.width.saturating_sub(4 + info_len as u16) as usize;
+            let filled = ((usage as usize) * bar_width / 100).min(bar_width);
+            let empty = bar_width - filled;
 
-    let line = Line::from(vec![
-        Span::styled("Mem[", Style::default().fg(theme.meter_label)),
-        Span::styled(bar_filled, Style::default().fg(bar_color)),
-        Span::raw(bar_empty),
-        Span::styled(format!("{}]", mem_info), Style::default().fg(theme.text)),
-    ]);
+            Line::from(vec![
+                Span::styled("Mem[", Style::default().fg(theme.meter_label)),
+                Span::styled("|".repeat(filled), Style::default().fg(theme.memory_used)),
+                Span::raw(" ".repeat(empty)),
+                Span::styled(format!("{}]", mem_info), Style::default().fg(theme.text)),
+            ])
+        }
+    };
 
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);

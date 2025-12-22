@@ -64,6 +64,7 @@ impl ColorScheme {
 
 /// Complete color theme definition matching htop's ColorElements
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Theme {
     // === Base colors ===
     pub reset_color: Color,
@@ -516,7 +517,6 @@ impl Theme {
     /// - Uses terminal's own background (transparent)
     /// - Text colors adjusted to be visible on both light and dark backgrounds
     pub fn light_terminal() -> Self {
-        let bl = Color::Blue;
         let g = Color::Green;
         let y = Color::Yellow;
         let c = Color::Cyan;
@@ -856,6 +856,7 @@ impl Theme {
     }
 
     /// Get memory color based on usage percentage
+    #[allow(dead_code)]
     pub fn mem_color(&self, percent: f32) -> Color {
         if percent < 50.0 {
             self.mem_low
@@ -867,6 +868,7 @@ impl Theme {
     }
 
     /// Get swap color based on usage percentage
+    #[allow(dead_code)]
     pub fn swap_color(&self, percent: f32) -> Color {
         if percent < 50.0 {
             self.swap_low

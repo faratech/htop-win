@@ -417,7 +417,28 @@ fn handle_nice_keys(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
+    use crate::config::MeterMode;
     use crate::ui::colors::ColorScheme;
+
+    // Helper to cycle meter mode forward
+    let cycle_meter_mode = |mode: MeterMode| -> MeterMode {
+        match mode {
+            MeterMode::Bar => MeterMode::Text,
+            MeterMode::Text => MeterMode::Graph,
+            MeterMode::Graph => MeterMode::Hidden,
+            MeterMode::Hidden => MeterMode::Bar,
+        }
+    };
+
+    // Helper to cycle meter mode backward
+    let cycle_meter_mode_rev = |mode: MeterMode| -> MeterMode {
+        match mode {
+            MeterMode::Bar => MeterMode::Hidden,
+            MeterMode::Text => MeterMode::Bar,
+            MeterMode::Graph => MeterMode::Text,
+            MeterMode::Hidden => MeterMode::Graph,
+        }
+    };
 
     match key.code {
         KeyCode::Esc | KeyCode::F(2) => {
@@ -430,7 +451,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.setup_selected < 7 {
+            if app.setup_selected < 10 {
                 // Number of setup items - 1
                 app.setup_selected += 1;
             }
@@ -451,37 +472,49 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     };
                 }
                 1 => {
+                    // Cycle CPU meter mode
+                    app.config.cpu_meter_mode = cycle_meter_mode(app.config.cpu_meter_mode);
+                }
+                2 => {
+                    // Cycle Memory meter mode
+                    app.config.memory_meter_mode = cycle_meter_mode(app.config.memory_meter_mode);
+                }
+                3 => {
                     // Toggle show kernel threads
                     app.config.show_kernel_threads = !app.config.show_kernel_threads;
                 }
-                2 => {
+                4 => {
                     // Toggle show user threads
                     app.config.show_user_threads = !app.config.show_user_threads;
                 }
-                3 => {
+                5 => {
                     // Toggle show program path
                     app.config.show_program_path = !app.config.show_program_path;
                 }
-                4 => {
+                6 => {
                     // Toggle highlight new processes
                     app.config.highlight_new_processes = !app.config.highlight_new_processes;
                 }
-                5 => {
+                7 => {
                     // Toggle highlight large numbers
                     app.config.highlight_large_numbers = !app.config.highlight_large_numbers;
                 }
-                6 => {
+                8 => {
                     // Toggle tree view
                     app.toggle_tree_view();
                     app.config.tree_view_default = app.tree_view;
                 }
-                7 => {
+                9 => {
                     // Open color scheme selection
                     let schemes = ColorScheme::all();
                     app.color_scheme_index = schemes.iter()
                         .position(|s| *s == app.config.color_scheme)
                         .unwrap_or(0);
                     app.view_mode = ViewMode::ColorScheme;
+                }
+                10 => {
+                    // Open column configuration
+                    app.enter_column_config_mode();
                 }
                 _ => {}
             }
@@ -511,6 +544,22 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                             250 => 100,
                             _ => 5000,
                         };
+                    }
+                }
+                1 => {
+                    // Adjust CPU meter mode
+                    if key.code == KeyCode::Right {
+                        app.config.cpu_meter_mode = cycle_meter_mode(app.config.cpu_meter_mode);
+                    } else {
+                        app.config.cpu_meter_mode = cycle_meter_mode_rev(app.config.cpu_meter_mode);
+                    }
+                }
+                2 => {
+                    // Adjust Memory meter mode
+                    if key.code == KeyCode::Right {
+                        app.config.memory_meter_mode = cycle_meter_mode(app.config.memory_meter_mode);
+                    } else {
+                        app.config.memory_meter_mode = cycle_meter_mode_rev(app.config.memory_meter_mode);
                     }
                 }
                 _ => {}
