@@ -115,7 +115,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                         // Elevated indicator - gold/yellow color
                         if proc.is_elevated {
                             spans.push(Span::styled(
-                                "🛡️",
+                                "🛡️ ",
                                 Style::default().fg(if is_selected { theme.selection_fg } else { Color::Yellow })
                             ));
                         }
@@ -124,7 +124,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                         let arch_str = proc.arch.as_str();
                         if !arch_str.is_empty() {
                             spans.push(Span::styled(
-                                format!("[{}]", arch_str),
+                                format!("[{}] ", arch_str),
                                 Style::default().fg(if is_selected { theme.selection_fg } else { Color::Cyan })
                             ));
                         }

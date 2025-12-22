@@ -490,6 +490,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                 5 => {
                     // Toggle show program path
                     app.config.show_program_path = !app.config.show_program_path;
+                    app.update_displayed_processes();
                 }
                 6 => {
                     // Toggle highlight new processes
