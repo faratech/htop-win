@@ -1,9 +1,12 @@
 # htop-win
 
-A Windows clone of htop - interactive process viewer written in Rust.
+A Windows clone of [htop](https://htop.dev/) - interactive process viewer written in Rust.
 
 ![htop-win](https://img.shields.io/badge/platform-Windows-blue)
-![Rust](https://img.shields.io/badge/rust-1.70%2B-orange)
+![Rust](https://img.shields.io/badge/rust-2024-orange)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+> Inspired by the original [htop](https://github.com/htop-dev/htop) by Hisham Muhammad and contributors.
 
 ## Features
 
