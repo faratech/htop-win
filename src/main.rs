@@ -273,16 +273,21 @@ fn run_app<B: ratatui::backend::Backend>(
         }
 
         // Refresh system data at tick rate (unless paused)
-        if last_tick.elapsed() >= tick_rate && !app.paused {
-            app.refresh_system();
-            app.iteration_count += 1;
+        if last_tick.elapsed() >= tick_rate {
+            if !app.paused {
+                app.refresh_system();
+                app.iteration_count += 1;
 
-            // Check if we've reached max iterations
-            if let Some(max) = app.max_iterations {
-                if app.iteration_count >= max {
-                    return Ok(());
+                // Check if we've reached max iterations
+                if let Some(max) = app.max_iterations {
+                    if app.iteration_count >= max {
+                        return Ok(());
+                    }
                 }
             }
+
+            // Advance the tick even while paused to avoid busy-looping with a
+            // zero-duration poll timeout (which drives CPU usage up).
             last_tick = Instant::now();
         }
     }
