@@ -4,15 +4,19 @@ mod process;
 
 pub use cpu::CpuInfo;
 pub use memory::{format_bytes, MemoryInfo};
-pub use process::{kill_process, set_priority, get_process_affinity, set_process_affinity, ProcessInfo};
+pub use process::{
+    get_process_affinity, kill_process, set_priority, set_process_affinity, ProcessInfo,
+};
 
-use sysinfo::{Networks, System};
+use sysinfo::{
+    CpuRefreshKind, MemoryRefreshKind, Networks, ProcessRefreshKind, RefreshKind, System,
+};
 
 /// System metrics
-#[derive(Default)]
 pub struct SystemMetrics {
     sys: System,
     networks: Networks,
+    networks_initialized: bool,
     pub cpu: CpuInfo,
     pub memory: MemoryInfo,
     pub uptime: u64,
@@ -41,10 +45,67 @@ pub struct SystemMetrics {
     prev_disk_write: u64,
 }
 
+impl Default for SystemMetrics {
+    fn default() -> Self {
+        let mut sys = System::new_with_specifics(
+            RefreshKind::nothing()
+                .with_cpu(CpuRefreshKind::everything())
+                .with_memory(MemoryRefreshKind::everything())
+                .with_processes(ProcessRefreshKind::everything()),
+        );
+        sys.refresh_specifics(
+            RefreshKind::nothing()
+                .with_cpu(CpuRefreshKind::everything())
+                .with_memory(MemoryRefreshKind::everything())
+                .with_processes(ProcessRefreshKind::everything()),
+        );
+
+        Self {
+            sys,
+            networks: Networks::new(),
+            networks_initialized: false,
+            cpu: CpuInfo::default(),
+            memory: MemoryInfo::default(),
+            uptime: 0,
+            hostname: String::new(),
+            tasks_total: 0,
+            tasks_running: 0,
+            tasks_sleeping: 0,
+            threads_total: 0,
+            net_rx_bytes: 0,
+            net_tx_bytes: 0,
+            net_rx_rate: 0,
+            net_tx_rate: 0,
+            disk_read_bytes: 0,
+            disk_write_bytes: 0,
+            disk_read_rate: 0,
+            disk_write_rate: 0,
+            battery_percent: None,
+            battery_charging: false,
+            prev_net_rx: 0,
+            prev_net_tx: 0,
+            prev_disk_read: 0,
+            prev_disk_write: 0,
+        }
+    }
+}
+
 impl SystemMetrics {
     pub fn refresh(&mut self) {
-        self.sys.refresh_all();
-        self.networks.refresh(true);
+        self.sys.refresh_specifics(
+            RefreshKind::nothing()
+                .with_cpu(CpuRefreshKind::everything())
+                .with_memory(MemoryRefreshKind::everything())
+                .with_processes(ProcessRefreshKind::everything()),
+        );
+
+        // Refresh existing network interfaces without re-scanning the system each tick
+        if self.networks_initialized {
+            self.networks.refresh(false);
+        } else {
+            self.networks.refresh(true);
+            self.networks_initialized = true;
+        }
 
         // Update CPU info
         self.cpu = CpuInfo::from_sysinfo(&self.sys);
@@ -55,8 +116,10 @@ impl SystemMetrics {
         // Update uptime
         self.uptime = System::uptime();
 
-        // Update hostname
-        self.hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
+        // Hostname rarely changes – compute once to avoid repeated allocations
+        if self.hostname.is_empty() {
+            self.hostname = System::host_name().unwrap_or_else(|| "unknown".to_string());
+        }
 
         // Count tasks
         self.tasks_total = self.sys.processes().len();
