@@ -21,7 +21,7 @@ fn column_width(col: &SortColumn) -> Constraint {
         SortColumn::Virt => Constraint::Length(8),
         SortColumn::Res => Constraint::Length(8),
         SortColumn::Shr => Constraint::Length(8),
-        SortColumn::Status => Constraint::Length(2),
+        SortColumn::Status => Constraint::Length(3),  // Status + efficiency indicator
         SortColumn::Cpu => Constraint::Length(6),
         SortColumn::Mem => Constraint::Length(6),
         SortColumn::Time => Constraint::Length(10),
@@ -133,10 +133,18 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             format!("{:>7}", format_bytes(proc.shared_mem)),
                             if is_selected { theme.selection_fg } else { theme.memory_size_color(proc.shared_mem) }
                         ),
-                        SortColumn::Status => (
-                            format!("{}", proc.status),
-                            if is_selected { theme.selection_fg } else { theme.status_color(proc.status) }
-                        ),
+                        SortColumn::Status => {
+                            // Show status char + leaf emoji for efficiency mode
+                            let status_str = if proc.efficiency_mode {
+                                format!("{}🌿", proc.status)  // e.g., "R🌿" for Running+Efficiency
+                            } else {
+                                format!("{}  ", proc.status)
+                            };
+                            (
+                                status_str,
+                                if is_selected { theme.selection_fg } else { theme.status_color(proc.status) }
+                            )
+                        }
                         SortColumn::Cpu => (
                             format!("{:>5.1}", proc.cpu_percent),
                             if is_selected { theme.selection_fg } else { theme.cpu_color(proc.cpu_percent) }

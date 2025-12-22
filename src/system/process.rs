@@ -29,11 +29,12 @@ use windows::Win32::System::ProcessStatus::{
 use windows::Win32::System::Threading::IO_COUNTERS;
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
-    GetPriorityClass, GetProcessHandleCount, GetProcessIoCounters, GetProcessTimes, OpenProcess,
-    SetPriorityClass, TerminateProcess, ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS,
-    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_QUERY_INFORMATION,
-    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_TERMINATE,
-    REALTIME_PRIORITY_CLASS,
+    GetPriorityClass, GetProcessHandleCount, GetProcessInformation, GetProcessIoCounters,
+    GetProcessTimes, OpenProcess, ProcessPowerThrottling, SetPriorityClass, TerminateProcess,
+    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
+    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SET_INFORMATION, PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
 };
 
 // Cache for SID to username lookups
@@ -169,6 +170,7 @@ struct WinProcessInfo {
     io_read_bytes: u64,
     io_write_bytes: u64,
     shared_mem: u64,
+    efficiency_mode: bool, // Windows 11 EcoQoS
 }
 
 /// Get priority, nice, CPU time, handle count, and I/O counters with a single OpenProcess call
@@ -183,6 +185,7 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
         io_read_bytes: 0,
         io_write_bytes: 0,
         shared_mem: 0,
+        efficiency_mode: false,
     };
 
     unsafe {
@@ -274,6 +277,25 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
             0
         };
 
+        // Check for Efficiency Mode (EcoQoS) - Windows 11+
+        let efficiency_mode = {
+            let mut throttle_state = PROCESS_POWER_THROTTLING_STATE::default();
+            throttle_state.Version = 1; // PROCESS_POWER_THROTTLING_CURRENT_VERSION
+            let result = GetProcessInformation(
+                handle,
+                ProcessPowerThrottling,
+                &mut throttle_state as *mut _ as *mut _,
+                std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+            );
+            if result.is_ok() {
+                // Check if PROCESS_POWER_THROTTLING_EXECUTION_SPEED is set in StateMask
+                (throttle_state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
+                    && (throttle_state.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
+            } else {
+                false
+            }
+        };
+
         let _ = CloseHandle(handle);
 
         WinProcessInfo {
@@ -285,6 +307,7 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
             io_read_bytes,
             io_write_bytes,
             shared_mem,
+            efficiency_mode,
         }
     }
 }
@@ -299,6 +322,7 @@ struct WinProcessInfo {
     io_read_bytes: u64,
     io_write_bytes: u64,
     shared_mem: u64,
+    efficiency_mode: bool,
 }
 
 #[cfg(not(windows))]
@@ -312,6 +336,7 @@ fn get_win_process_info(_pid: u32) -> WinProcessInfo {
         io_read_bytes: 0,
         io_write_bytes: 0,
         shared_mem: 0,
+        efficiency_mode: false,
     }
 }
 
@@ -490,6 +515,8 @@ pub struct ProcessInfo {
     pub user_lower: String,
     // Pre-computed search match flag (set during filtering, used in rendering)
     pub matches_search: bool,
+    // Windows 11 Efficiency Mode (EcoQoS)
+    pub efficiency_mode: bool,
 }
 
 impl ProcessInfo {
@@ -596,6 +623,7 @@ impl ProcessInfo {
                     command_lower,
                     user_lower,
                     matches_search: false, // Set during filtering
+                    efficiency_mode: win_info.efficiency_mode,
                 }
             })
             .collect()
