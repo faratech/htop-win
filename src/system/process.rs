@@ -1,40 +1,40 @@
-use sysinfo::{ProcessStatus, System};
 use std::collections::HashMap;
+#[cfg(windows)]
 use std::sync::Mutex;
 use std::time::Duration;
+use sysinfo::{ProcessStatus, System};
 
 #[cfg(windows)]
 use std::sync::LazyLock;
 
 #[cfg(windows)]
+use windows::core::PWSTR;
+#[cfg(windows)]
 use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HLOCAL};
-#[cfg(windows)]
-use windows::Win32::System::Threading::{
-    OpenProcess, SetPriorityClass, TerminateProcess, GetPriorityClass, GetProcessTimes,
-    GetProcessHandleCount, GetProcessIoCounters,
-    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
-    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, REALTIME_PRIORITY_CLASS,
-    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_INFORMATION, PROCESS_TERMINATE,
-};
-#[cfg(windows)]
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Thread32First, Thread32Next,
-    TH32CS_SNAPTHREAD, THREADENTRY32,
-};
-#[cfg(windows)]
-use windows::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
-#[cfg(windows)]
-use windows::Win32::System::Threading::IO_COUNTERS;
-#[cfg(windows)]
-use windows::Win32::Security::{
-    GetTokenInformation, LookupAccountSidW, TokenUser, PSID, SID_NAME_USE,
-    TOKEN_QUERY, TOKEN_USER,
-};
 #[cfg(windows)]
 use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
 #[cfg(windows)]
-use windows::core::PWSTR;
+use windows::Win32::Security::{
+    GetTokenInformation, LookupAccountSidW, TokenUser, PSID, SID_NAME_USE, TOKEN_QUERY, TOKEN_USER,
+};
+#[cfg(windows)]
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+};
+#[cfg(windows)]
+use windows::Win32::System::ProcessStatus::{
+    K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+};
+#[cfg(windows)]
+use windows::Win32::System::Threading::IO_COUNTERS;
+#[cfg(windows)]
+use windows::Win32::System::Threading::{
+    GetPriorityClass, GetProcessHandleCount, GetProcessIoCounters, GetProcessTimes, OpenProcess,
+    SetPriorityClass, TerminateProcess, ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS,
+    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_QUERY_INFORMATION,
+    PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION, PROCESS_TERMINATE,
+    REALTIME_PRIORITY_CLASS,
+};
 
 // Cache for SID to username lookups
 #[cfg(windows)]
@@ -49,13 +49,13 @@ static SID_CACHE: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(|| {
 
 // Cache for PID to username lookups (persists across refreshes)
 #[cfg(windows)]
-static PID_USER_CACHE: LazyLock<Mutex<HashMap<u32, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static PID_USER_CACHE: LazyLock<Mutex<HashMap<u32, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 // Cache for thread counts (expensive to compute - only refresh every 2 seconds)
 #[cfg(windows)]
-static THREAD_COUNT_CACHE: LazyLock<Mutex<(std::time::Instant, HashMap<u32, u32>)>> = LazyLock::new(|| {
-    Mutex::new((std::time::Instant::now(), HashMap::new()))
-});
+static THREAD_COUNT_CACHE: LazyLock<Mutex<(std::time::Instant, HashMap<u32, u32>)>> =
+    LazyLock::new(|| Mutex::new((std::time::Instant::now(), HashMap::new())));
 
 #[cfg(windows)]
 const THREAD_CACHE_DURATION_MS: u128 = 2000; // Refresh thread counts every 2 seconds
@@ -164,7 +164,7 @@ struct WinProcessInfo {
     priority: i32,
     nice: i32,
     cpu_time: Duration,
-    start_time: u64,      // Unix timestamp
+    start_time: u64, // Unix timestamp
     handle_count: u32,
     io_read_bytes: u64,
     io_write_bytes: u64,
@@ -213,28 +213,31 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
         let mut kernel = FILETIME::default();
         let mut user = FILETIME::default();
 
-        let (cpu_time, start_time) = if GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user).is_ok() {
-            let kernel_100ns = ((kernel.dwHighDateTime as u64) << 32) | kernel.dwLowDateTime as u64;
-            let user_100ns = ((user.dwHighDateTime as u64) << 32) | user.dwLowDateTime as u64;
-            let total_100ns = kernel_100ns + user_100ns;
-            let secs = total_100ns / 10_000_000;
-            let nanos = ((total_100ns % 10_000_000) * 100) as u32;
+        let (cpu_time, start_time) =
+            if GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user).is_ok() {
+                let kernel_100ns =
+                    ((kernel.dwHighDateTime as u64) << 32) | kernel.dwLowDateTime as u64;
+                let user_100ns = ((user.dwHighDateTime as u64) << 32) | user.dwLowDateTime as u64;
+                let total_100ns = kernel_100ns + user_100ns;
+                let secs = total_100ns / 10_000_000;
+                let nanos = ((total_100ns % 10_000_000) * 100) as u32;
 
-            // Convert creation time (FILETIME) to Unix timestamp
-            // FILETIME is 100-nanosecond intervals since January 1, 1601
-            // Unix epoch is January 1, 1970
-            // Difference is 116444736000000000 100-ns intervals
-            let creation_100ns = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
-            let unix_time = if creation_100ns > 116444736000000000 {
-                (creation_100ns - 116444736000000000) / 10_000_000
+                // Convert creation time (FILETIME) to Unix timestamp
+                // FILETIME is 100-nanosecond intervals since January 1, 1601
+                // Unix epoch is January 1, 1970
+                // Difference is 116444736000000000 100-ns intervals
+                let creation_100ns =
+                    ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+                let unix_time = if creation_100ns > 116444736000000000 {
+                    (creation_100ns - 116444736000000000) / 10_000_000
+                } else {
+                    0
+                };
+
+                (Duration::new(secs, nanos), unix_time)
             } else {
-                0
+                (Duration::ZERO, 0)
             };
-
-            (Duration::new(secs, nanos), unix_time)
-        } else {
-            (Duration::ZERO, 0)
-        };
 
         // Get handle count
         let mut handle_count: u32 = 0;
@@ -242,11 +245,15 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
 
         // Get I/O counters
         let mut io_counters = IO_COUNTERS::default();
-        let (io_read_bytes, io_write_bytes) = if GetProcessIoCounters(handle, &mut io_counters).is_ok() {
-            (io_counters.ReadTransferCount, io_counters.WriteTransferCount)
-        } else {
-            (0, 0)
-        };
+        let (io_read_bytes, io_write_bytes) =
+            if GetProcessIoCounters(handle, &mut io_counters).is_ok() {
+                (
+                    io_counters.ReadTransferCount,
+                    io_counters.WriteTransferCount,
+                )
+            } else {
+                (0, 0)
+            };
 
         // Get memory info for shared memory calculation
         // Use PROCESS_MEMORY_COUNTERS_EX to get PrivateUsage field
@@ -257,9 +264,12 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
             handle,
             &mut mem_counters_ex as *mut _ as *mut PROCESS_MEMORY_COUNTERS,
             std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
-        ).as_bool() {
+        )
+        .as_bool()
+        {
             // Shared = WorkingSetSize - PrivateUsage
-            (mem_counters_ex.WorkingSetSize as u64).saturating_sub(mem_counters_ex.PrivateUsage as u64)
+            (mem_counters_ex.WorkingSetSize as u64)
+                .saturating_sub(mem_counters_ex.PrivateUsage as u64)
         } else {
             0
         };
@@ -383,10 +393,7 @@ fn sid_to_username(sid_str: &str) -> String {
         let sid_wide: Vec<u16> = sid_str.encode_utf16().chain(std::iter::once(0)).collect();
         let mut psid: PSID = PSID::default();
 
-        if ConvertStringSidToSidW(
-            windows::core::PCWSTR(sid_wide.as_ptr()),
-            &mut psid,
-        ).is_err() {
+        if ConvertStringSidToSidW(windows::core::PCWSTR(sid_wide.as_ptr()), &mut psid).is_err() {
             return truncate_sid(sid_str);
         }
 
@@ -455,8 +462,8 @@ pub struct ProcessInfo {
     pub pid: u32,
     pub parent_pid: u32,
     pub name: String,
-    pub exe_path: String,      // Full executable path
-    pub command: String,       // Full command line with arguments
+    pub exe_path: String, // Full executable path
+    pub command: String,  // Full command line with arguments
     pub user: String,
     pub status: char,
     pub cpu_percent: f32,
@@ -468,15 +475,15 @@ pub struct ProcessInfo {
     pub nice: i32,
     pub cpu_time: Duration,
     pub tree_depth: usize,
-    pub tree_prefix: String,   // Tree display prefix (├─, └─, │, etc.)
+    pub tree_prefix: String, // Tree display prefix (├─, └─, │, etc.)
     // New fields for extended features
-    pub has_children: bool,    // Has child processes (for tree view)
-    pub is_collapsed: bool,    // Is collapsed in tree view
-    pub thread_count: u32,     // Number of threads
-    pub start_time: u64,       // Process start time (Unix timestamp)
-    pub handle_count: u32,     // Number of handles (Windows)
-    pub io_read_bytes: u64,    // I/O bytes read
-    pub io_write_bytes: u64,   // I/O bytes written
+    pub has_children: bool,  // Has child processes (for tree view)
+    pub is_collapsed: bool,  // Is collapsed in tree view
+    pub thread_count: u32,   // Number of threads
+    pub start_time: u64,     // Process start time (Unix timestamp)
+    pub handle_count: u32,   // Number of handles (Windows)
+    pub io_read_bytes: u64,  // I/O bytes read
+    pub io_write_bytes: u64, // I/O bytes written
     // Pre-computed lowercase strings for efficient filtering (avoid per-filter allocations)
     pub name_lower: String,
     pub command_lower: String,
@@ -518,7 +525,8 @@ impl ProcessInfo {
                 };
 
                 // Get executable path
-                let exe_path = proc.exe()
+                let exe_path = proc
+                    .exe()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default();
 
@@ -541,9 +549,7 @@ impl ProcessInfo {
 
                 // Get user - try Windows API first, then fall back to sysinfo
                 let user = get_process_owner(pid_u32)
-                    .or_else(|| {
-                        proc.user_id().map(|u| sid_to_username(&u.to_string()))
-                    })
+                    .or_else(|| proc.user_id().map(|u| sid_to_username(&u.to_string())))
                     .unwrap_or_else(|| "-".to_string());
 
                 // Get parent PID
@@ -576,10 +582,10 @@ impl ProcessInfo {
                     nice: win_info.nice,
                     cpu_time: win_info.cpu_time,
                     tree_depth: 0,
-                    tree_prefix: String::new(),  // Set by tree builder
+                    tree_prefix: String::new(), // Set by tree builder
                     // New fields
-                    has_children: false,  // Set by tree builder
-                    is_collapsed: false,  // Set by tree builder
+                    has_children: false, // Set by tree builder
+                    is_collapsed: false, // Set by tree builder
                     thread_count,
                     start_time: win_info.start_time,
                     handle_count: win_info.handle_count,
@@ -589,7 +595,7 @@ impl ProcessInfo {
                     name_lower,
                     command_lower,
                     user_lower,
-                    matches_search: false,  // Set during filtering
+                    matches_search: false, // Set during filtering
                 }
             })
             .collect()
@@ -619,7 +625,10 @@ pub fn kill_process(pid: u32, _signal: u32) -> Result<(), String> {
             .map_err(|e| format!("Cannot open process: {}", e))?;
 
         if handle.is_invalid() {
-            return Err(format!("Cannot open process {} (access denied or not found)", pid));
+            return Err(format!(
+                "Cannot open process {} (access denied or not found)",
+                pid
+            ));
         }
 
         let result = TerminateProcess(handle, 1);
@@ -692,10 +701,10 @@ pub fn set_priority(pid: u32, nice: i32) -> Result<(), String> {
 /// Get process CPU affinity mask
 #[cfg(windows)]
 pub fn get_process_affinity(pid: u32) -> Result<u64, String> {
+    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
         GetProcessAffinityMask, OpenProcess, PROCESS_QUERY_INFORMATION,
     };
-    use windows::Win32::Foundation::CloseHandle;
 
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid)
@@ -718,10 +727,10 @@ pub fn get_process_affinity(_pid: u32) -> Result<u64, String> {
 /// Set process CPU affinity mask
 #[cfg(windows)]
 pub fn set_process_affinity(pid: u32, mask: u64) -> Result<(), String> {
+    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
         OpenProcess, SetProcessAffinityMask, PROCESS_SET_INFORMATION,
     };
-    use windows::Win32::Foundation::CloseHandle;
 
     unsafe {
         let handle = OpenProcess(PROCESS_SET_INFORMATION, false, pid)
@@ -738,4 +747,3 @@ pub fn set_process_affinity(_pid: u32, _mask: u64) -> Result<(), String> {
     // Not implemented for non-Windows
     Ok(())
 }
-
