@@ -1,5 +1,3 @@
-use sysinfo::System;
-
 /// Per-core CPU time breakdown (in percentages)
 #[derive(Default, Clone, Copy)]
 #[allow(dead_code)]
@@ -23,7 +21,7 @@ struct PrevCpuTimes {
 /// CPU usage information
 #[derive(Default, Clone)]
 pub struct CpuInfo {
-    /// Per-core CPU usage percentages (total usage from sysinfo)
+    /// Per-core CPU usage percentages
     pub core_usage: Vec<f32>,
     /// Per-core CPU breakdown (user/system/idle)
     pub core_breakdown: Vec<CpuBreakdown>,
@@ -37,33 +35,25 @@ use std::sync::Mutex;
 static PREV_CPU_TIMES: Mutex<Option<Vec<PrevCpuTimes>>> = Mutex::new(None);
 
 impl CpuInfo {
-    pub fn from_sysinfo(sys: &System) -> Self {
-        let core_usage: Vec<f32> = sys.cpus().iter().map(|c| c.cpu_usage()).collect();
-
-        // Get per-core breakdown using Windows API
-        #[cfg(windows)]
-        let core_breakdown = get_cpu_breakdown(core_usage.len());
-
-        #[cfg(not(windows))]
-        let core_breakdown = core_usage
-            .iter()
-            .map(|&usage| CpuBreakdown {
-                user: usage,
-                system: 0.0,
-                idle: 100.0 - usage,
-            })
-            .collect();
-
+    /// Create CpuInfo using native Windows API (NtQuerySystemInformation)
+    #[cfg(windows)]
+    pub fn from_native() -> Self {
+        let (core_usage, core_breakdown) = get_cpu_info();
         Self {
             core_usage,
             core_breakdown,
         }
     }
+
+    #[cfg(not(windows))]
+    pub fn from_native() -> Self {
+        Self::default()
+    }
 }
 
-/// Get per-core CPU breakdown using NtQuerySystemInformation
+/// Get CPU count and per-core breakdown using NtQuerySystemInformation
 #[cfg(windows)]
-fn get_cpu_breakdown(cpu_count: usize) -> Vec<CpuBreakdown> {
+fn get_cpu_info() -> (Vec<f32>, Vec<CpuBreakdown>) {
     use std::mem::size_of;
     use windows::Wdk::System::SystemInformation::{
         NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS,
@@ -74,9 +64,11 @@ fn get_cpu_breakdown(cpu_count: usize) -> Vec<CpuBreakdown> {
     const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION_CLASS: SYSTEM_INFORMATION_CLASS =
         SYSTEM_INFORMATION_CLASS(8);
 
+    // Query with a large enough buffer for up to 256 cores
+    const MAX_CORES: usize = 256;
     let mut buffer: Vec<SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION> =
-        vec![SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION::default(); cpu_count];
-    let buffer_size = (cpu_count * size_of::<SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION>()) as u32;
+        vec![SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION::default(); MAX_CORES];
+    let buffer_size = (MAX_CORES * size_of::<SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION>()) as u32;
     let mut return_length: u32 = 0;
 
     let result = unsafe {
@@ -89,23 +81,23 @@ fn get_cpu_breakdown(cpu_count: usize) -> Vec<CpuBreakdown> {
     };
 
     if result.is_err() {
-        // Fallback: return empty breakdowns if API fails
-        return vec![CpuBreakdown::default(); cpu_count];
+        return (Vec::new(), Vec::new());
     }
 
-    let actual_count =
+    let cpu_count =
         return_length as usize / size_of::<SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION>();
 
     // Get or initialize previous times
     let mut prev_guard = PREV_CPU_TIMES.lock().unwrap();
-    if prev_guard.is_none() || prev_guard.as_ref().unwrap().len() != actual_count {
-        *prev_guard = Some(vec![PrevCpuTimes::default(); actual_count]);
+    if prev_guard.is_none() || prev_guard.as_ref().unwrap().len() != cpu_count {
+        *prev_guard = Some(vec![PrevCpuTimes::default(); cpu_count]);
     }
     let prev_times = prev_guard.as_mut().unwrap();
 
-    let mut breakdowns = Vec::with_capacity(actual_count);
+    let mut core_usage = Vec::with_capacity(cpu_count);
+    let mut breakdowns = Vec::with_capacity(cpu_count);
 
-    for (i, info) in buffer.iter().take(actual_count).enumerate() {
+    for (i, info) in buffer.iter().take(cpu_count).enumerate() {
         // Note: KernelTime includes IdleTime on Windows
         let user = info.UserTime;
         let kernel = info.KernelTime;
@@ -123,20 +115,30 @@ fn get_cpu_breakdown(cpu_count: usize) -> Vec<CpuBreakdown> {
         let total = user_delta + kernel_delta;
         let system_delta = kernel_delta - idle_delta;
 
-        let breakdown = if total > 0 {
-            CpuBreakdown {
-                user: (user_delta as f64 / total as f64 * 100.0) as f32,
-                system: (system_delta as f64 / total as f64 * 100.0).max(0.0) as f32,
-                idle: (idle_delta as f64 / total as f64 * 100.0) as f32,
-            }
+        let (usage, breakdown) = if total > 0 {
+            let user_pct = (user_delta as f64 / total as f64 * 100.0) as f32;
+            let system_pct = (system_delta as f64 / total as f64 * 100.0).max(0.0) as f32;
+            let idle_pct = (idle_delta as f64 / total as f64 * 100.0) as f32;
+            (
+                user_pct + system_pct, // Total usage = user + system
+                CpuBreakdown {
+                    user: user_pct,
+                    system: system_pct,
+                    idle: idle_pct,
+                },
+            )
         } else {
-            CpuBreakdown {
-                user: 0.0,
-                system: 0.0,
-                idle: 100.0,
-            }
+            (
+                0.0,
+                CpuBreakdown {
+                    user: 0.0,
+                    system: 0.0,
+                    idle: 100.0,
+                },
+            )
         };
 
+        core_usage.push(usage);
         breakdowns.push(breakdown);
 
         // Store current values for next iteration
@@ -147,5 +149,5 @@ fn get_cpu_breakdown(cpu_count: usize) -> Vec<CpuBreakdown> {
         };
     }
 
-    breakdowns
+    (core_usage, breakdowns)
 }

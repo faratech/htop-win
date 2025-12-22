@@ -1,5 +1,3 @@
-use sysinfo::System;
-
 /// Memory usage information
 #[derive(Default, Clone)]
 pub struct MemoryInfo {
@@ -18,21 +16,67 @@ pub struct MemoryInfo {
 }
 
 impl MemoryInfo {
-    pub fn from_sysinfo(sys: &System) -> Self {
-        let total = sys.total_memory();
-        let used = total.saturating_sub(sys.available_memory());
+    /// Create MemoryInfo using native Windows API (GlobalMemoryStatusEx)
+    #[cfg(windows)]
+    pub fn from_native() -> Self {
+        use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
-        let swap_total = sys.total_swap();
-        let swap_used = sys.used_swap();
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
 
-        Self {
-            total,
-            used,
-            used_percent: if total > 0 { used as f32 / total as f32 * 100.0 } else { 0.0 },
-            swap_total,
-            swap_used,
-            swap_percent: if swap_total > 0 { swap_used as f32 / swap_total as f32 * 100.0 } else { 0.0 },
+        unsafe {
+            if GlobalMemoryStatusEx(&mut status).is_ok() {
+                let total = status.ullTotalPhys;
+                let available = status.ullAvailPhys;
+                let used = total.saturating_sub(available);
+
+                let swap_total = status.ullTotalPageFile.saturating_sub(total);
+                let swap_available = status.ullAvailPageFile.saturating_sub(available);
+                let swap_used = swap_total.saturating_sub(swap_available);
+
+                Self {
+                    total,
+                    used,
+                    used_percent: if total > 0 { used as f32 / total as f32 * 100.0 } else { 0.0 },
+                    swap_total,
+                    swap_used,
+                    swap_percent: if swap_total > 0 { swap_used as f32 / swap_total as f32 * 100.0 } else { 0.0 },
+                }
+            } else {
+                Self::default()
+            }
         }
+    }
+
+    #[cfg(not(windows))]
+    pub fn from_native() -> Self {
+        Self::default()
+    }
+
+    /// Get total memory (for ProcessInfo calculations)
+    #[cfg(windows)]
+    pub fn total_memory() -> u64 {
+        use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            ..Default::default()
+        };
+
+        unsafe {
+            if GlobalMemoryStatusEx(&mut status).is_ok() {
+                status.ullTotalPhys
+            } else {
+                0
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    pub fn total_memory() -> u64 {
+        0
     }
 }
 

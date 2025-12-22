@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::system::{ProcessInfo, SystemMetrics};
 use crate::ui::colors::Theme;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
 /// Sort column for process list
@@ -132,8 +132,8 @@ pub struct App {
     pub filter_string_lower: String,
     /// User filter (show only this user's processes)
     pub user_filter: Option<String>,
-    /// PID filter (show only these PIDs) - from CLI -p option
-    pub pid_filter: Option<Vec<u32>>,
+    /// PID filter (show only these PIDs) - from CLI -p option (HashSet for O(1) lookup)
+    pub pid_filter: Option<HashSet<u32>>,
     /// Tagged process PIDs
     pub tagged_pids: HashSet<u32>,
     /// Input buffer for dialogs
@@ -193,15 +193,18 @@ pub struct App {
     /// Selected CPU in affinity dialog
     pub affinity_selected: usize,
     /// CPU usage history for graph mode (per core, last N samples)
-    pub cpu_history: Vec<Vec<f32>>,
+    pub cpu_history: Vec<VecDeque<f32>>,
     /// Memory usage history for graph mode (last N samples)
-    pub mem_history: Vec<f32>,
+    pub mem_history: VecDeque<f32>,
+    /// Cached visible columns (updated when column config changes)
+    pub cached_visible_columns: Vec<SortColumn>,
 }
 
 impl App {
     pub fn new(config: Config) -> Self {
         let theme = config.theme();
         let tree_view = config.tree_view_default;
+        let visible_columns = Self::compute_visible_columns(&config);
         Self {
             config,
             theme,
@@ -250,8 +253,23 @@ impl App {
             affinity_mask: 0,
             affinity_selected: 0,
             cpu_history: Vec::new(),
-            mem_history: Vec::new(),
+            mem_history: VecDeque::new(),
+            cached_visible_columns: visible_columns,
         }
+    }
+
+    /// Compute visible columns based on config (used for caching)
+    fn compute_visible_columns(config: &Config) -> Vec<SortColumn> {
+        SortColumn::all()
+            .iter()
+            .filter(|col| config.is_column_visible(col.name()))
+            .copied()
+            .collect()
+    }
+
+    /// Update the cached visible columns (call when column config changes)
+    pub fn update_visible_columns_cache(&mut self) {
+        self.cached_visible_columns = Self::compute_visible_columns(&self.config);
     }
 
     /// Update the color theme from config
@@ -277,15 +295,21 @@ impl App {
     /// Enter process info mode and capture the target process
     pub fn enter_process_info_mode(&mut self) {
         if let Some(proc) = self.selected_process() {
-            self.process_info_target = Some(proc.clone());
+            let mut proc_copy = proc.clone();
+            // Query I/O counters on-demand (skipped during normal refresh for performance)
+            let (io_read, io_write) = crate::system::get_process_io_counters(proc.pid);
+            proc_copy.io_read_bytes = io_read;
+            proc_copy.io_write_bytes = io_write;
+            self.process_info_target = Some(proc_copy);
             self.view_mode = ViewMode::ProcessInfo;
         }
     }
 
     /// Refresh system data
     pub fn refresh_system(&mut self) {
+        // Use native Windows APIs for all system metrics
         self.system_metrics.refresh();
-        self.processes = self.system_metrics.get_processes();
+        self.processes = self.system_metrics.get_processes_native();
         self.update_displayed_processes();
 
         // Update history for graph mode
@@ -303,23 +327,23 @@ impl App {
 
         // Initialize CPU history if needed
         if self.cpu_history.len() != cpu_count {
-            self.cpu_history = vec![Vec::with_capacity(MAX_HISTORY); cpu_count];
+            self.cpu_history = vec![VecDeque::with_capacity(MAX_HISTORY); cpu_count];
         }
 
-        // Add current CPU usage to history
+        // Add current CPU usage to history (O(1) with VecDeque)
         for (i, &usage) in self.system_metrics.cpu.core_usage.iter().enumerate() {
             let history = &mut self.cpu_history[i];
             if history.len() >= MAX_HISTORY {
-                history.remove(0);
+                history.pop_front(); // O(1) instead of O(n)
             }
-            history.push(usage);
+            history.push_back(usage);
         }
 
-        // Add current memory usage to history
+        // Add current memory usage to history (O(1) with VecDeque)
         if self.mem_history.len() >= MAX_HISTORY {
-            self.mem_history.remove(0);
+            self.mem_history.pop_front(); // O(1) instead of O(n)
         }
-        self.mem_history.push(self.system_metrics.memory.used_percent);
+        self.mem_history.push_back(self.system_metrics.memory.used_percent);
     }
 
     /// Update displayed processes based on filter and sort
@@ -402,6 +426,21 @@ impl App {
 
         self.displayed_processes = processes;
 
+        // Enrich visible processes with additional data from Windows APIs
+        // Use a buffer zone to handle scrolling smoothly
+        const BUFFER_SIZE: usize = 10;
+        let visible_start = self.scroll_offset.saturating_sub(BUFFER_SIZE);
+        let visible_end = (self.scroll_offset + self.visible_height + BUFFER_SIZE)
+            .min(self.displayed_processes.len());
+
+        if visible_start < visible_end {
+            // Only query exe paths when show_program_path is enabled (expensive API call)
+            crate::system::enrich_processes(
+                &mut self.displayed_processes[visible_start..visible_end],
+                self.config.show_program_path,
+            );
+        }
+
         // Handle follow mode - find and select the followed PID
         if let Some(follow_pid) = self.follow_pid {
             if let Some(idx) = self.displayed_processes.iter().position(|p| p.pid == follow_pid) {
@@ -419,32 +458,72 @@ impl App {
     fn sort_processes(&self, processes: &mut [ProcessInfo]) {
         use std::cmp::Ordering;
 
-        let cmp_fn = |a: &ProcessInfo, b: &ProcessInfo| -> Ordering {
-            let ord = match self.sort_column {
-                SortColumn::Pid => a.pid.cmp(&b.pid),
-                SortColumn::PPid => a.parent_pid.cmp(&b.parent_pid),
-                SortColumn::User => a.user.cmp(&b.user),
-                SortColumn::Priority => a.priority.cmp(&b.priority),
-                SortColumn::Nice => a.nice.cmp(&b.nice),
-                SortColumn::Threads => a.thread_count.cmp(&b.thread_count),
-                SortColumn::Virt => a.virtual_mem.cmp(&b.virtual_mem),
-                SortColumn::Res => a.resident_mem.cmp(&b.resident_mem),
-                SortColumn::Shr => a.shared_mem.cmp(&b.shared_mem),
-                SortColumn::Status => a.status.cmp(&b.status),
-                SortColumn::Cpu => a.cpu_percent.partial_cmp(&b.cpu_percent).unwrap_or(Ordering::Equal),
-                SortColumn::Mem => a.mem_percent.partial_cmp(&b.mem_percent).unwrap_or(Ordering::Equal),
-                SortColumn::Time => a.cpu_time.cmp(&b.cpu_time),
-                SortColumn::StartTime => a.start_time.cmp(&b.start_time),
-                SortColumn::Command => a.command.cmp(&b.command),
-                // Windows-specific columns
-                SortColumn::Elevated => a.is_elevated.cmp(&b.is_elevated),
-                SortColumn::Arch => a.arch.as_str().cmp(b.arch.as_str()),
-                SortColumn::Efficiency => a.efficiency_mode.cmp(&b.efficiency_mode),
-            };
-            if self.sort_ascending { ord } else { ord.reverse() }
-        };
+        // Use sort_unstable_by for better performance (no stability guarantee needed)
+        // The closure still has the match, but sort_unstable is faster overall
+        let ascending = self.sort_ascending;
 
-        processes.sort_by(cmp_fn);
+        match self.sort_column {
+            // Specialize common sort columns for best performance (avoid match in hot loop)
+            SortColumn::Cpu => {
+                if ascending {
+                    processes.sort_unstable_by(|a, b| a.cpu_percent.partial_cmp(&b.cpu_percent).unwrap_or(Ordering::Equal));
+                } else {
+                    processes.sort_unstable_by(|a, b| b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(Ordering::Equal));
+                }
+            }
+            SortColumn::Mem => {
+                if ascending {
+                    processes.sort_unstable_by(|a, b| a.mem_percent.partial_cmp(&b.mem_percent).unwrap_or(Ordering::Equal));
+                } else {
+                    processes.sort_unstable_by(|a, b| b.mem_percent.partial_cmp(&a.mem_percent).unwrap_or(Ordering::Equal));
+                }
+            }
+            SortColumn::Pid => {
+                if ascending {
+                    processes.sort_unstable_by_key(|p| p.pid);
+                } else {
+                    processes.sort_unstable_by_key(|p| std::cmp::Reverse(p.pid));
+                }
+            }
+            SortColumn::Res => {
+                if ascending {
+                    processes.sort_unstable_by_key(|p| p.resident_mem);
+                } else {
+                    processes.sort_unstable_by_key(|p| std::cmp::Reverse(p.resident_mem));
+                }
+            }
+            SortColumn::Time => {
+                if ascending {
+                    processes.sort_unstable_by_key(|p| p.cpu_time);
+                } else {
+                    processes.sort_unstable_by_key(|p| std::cmp::Reverse(p.cpu_time));
+                }
+            }
+            // Less common columns - use generic approach
+            _ => {
+                let cmp_fn = |a: &ProcessInfo, b: &ProcessInfo| -> Ordering {
+                    let ord = match self.sort_column {
+                        SortColumn::PPid => a.parent_pid.cmp(&b.parent_pid),
+                        SortColumn::User => a.user.cmp(&b.user),
+                        SortColumn::Priority => a.priority.cmp(&b.priority),
+                        SortColumn::Nice => a.nice.cmp(&b.nice),
+                        SortColumn::Threads => a.thread_count.cmp(&b.thread_count),
+                        SortColumn::Virt => a.virtual_mem.cmp(&b.virtual_mem),
+                        SortColumn::Shr => a.shared_mem.cmp(&b.shared_mem),
+                        SortColumn::Status => a.status.cmp(&b.status),
+                        SortColumn::StartTime => a.start_time.cmp(&b.start_time),
+                        SortColumn::Command => a.command.cmp(&b.command),
+                        SortColumn::Elevated => a.is_elevated.cmp(&b.is_elevated),
+                        SortColumn::Arch => a.arch.as_str().cmp(b.arch.as_str()),
+                        SortColumn::Efficiency => a.efficiency_mode.cmp(&b.efficiency_mode),
+                        // Already handled above
+                        SortColumn::Cpu | SortColumn::Mem | SortColumn::Pid | SortColumn::Res | SortColumn::Time => Ordering::Equal,
+                    };
+                    if ascending { ord } else { ord.reverse() }
+                };
+                processes.sort_unstable_by(cmp_fn);
+            }
+        }
     }
 
     fn build_tree(&self, processes: Vec<ProcessInfo>) -> Vec<ProcessInfo> {

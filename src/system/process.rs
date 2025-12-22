@@ -1,9 +1,11 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 #[cfg(windows)]
-use std::sync::Mutex;
+use std::sync::RwLock;
 use std::time::Duration;
-use sysinfo::{ProcessStatus, System};
+use rayon::prelude::*;
+
+#[cfg(windows)]
+use super::native::{NativeProcessInfo, filetime_to_unix, priority_to_nice};
 
 #[cfg(windows)]
 use std::sync::LazyLock;
@@ -11,17 +13,12 @@ use std::sync::LazyLock;
 #[cfg(windows)]
 use windows::core::PWSTR;
 #[cfg(windows)]
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE, HLOCAL};
-#[cfg(windows)]
-use windows::Win32::Security::Authorization::ConvertStringSidToSidW;
+use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
 #[cfg(windows)]
 use windows::Win32::Security::{
-    GetTokenInformation, LookupAccountSidW, TokenElevation, TokenUser, PSID, SID_NAME_USE,
-    TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER,
-};
-#[cfg(windows)]
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32,
+    AdjustTokenPrivileges, GetTokenInformation, LookupAccountSidW, LookupPrivilegeValueW,
+    TokenElevation, TokenUser, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, SID_NAME_USE,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
 };
 #[cfg(windows)]
 use windows::Win32::System::ProcessStatus::{
@@ -31,10 +28,11 @@ use windows::Win32::System::ProcessStatus::{
 use windows::Win32::System::Threading::IO_COUNTERS;
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
-    GetPriorityClass, GetProcessHandleCount, GetProcessInformation, GetProcessIoCounters,
-    GetProcessTimes, IsWow64Process2, OpenProcess, OpenProcessToken, ProcessPowerThrottling,
-    SetPriorityClass, TerminateProcess, ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS,
-    HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS,
+    GetCurrentProcess, GetProcessInformation, GetProcessIoCounters, GetProcessTimes,
+    IsWow64Process2, OpenProcess, OpenProcessToken, ProcessPowerThrottling,
+    QueryFullProcessImageNameW, SetPriorityClass, TerminateProcess,
+    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
+    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_NAME_WIN32,
     PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
     PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
     PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
@@ -44,131 +42,89 @@ use windows::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386,
 };
 
-// Cache for SID to username lookups
+/// Enable SeDebugPrivilege to access process information for service accounts
+/// This allows reading tokens for NETWORK SERVICE, LOCAL SERVICE, etc.
+/// Only succeeds if running as Administrator
 #[cfg(windows)]
-static SID_CACHE: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(|| {
-    let mut map = HashMap::new();
-    // Pre-populate well-known SIDs
-    map.insert("S-1-5-18".to_string(), "SYSTEM".to_string());
-    map.insert("S-1-5-19".to_string(), "LOCAL SERVICE".to_string());
-    map.insert("S-1-5-20".to_string(), "NETWORK SERVICE".to_string());
-    Mutex::new(map)
-});
+pub fn enable_debug_privilege() -> bool {
+    use windows::core::w;
+    unsafe {
+        let mut token = HANDLE::default();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        ).is_err() {
+            return false;
+        }
+
+        let mut luid = windows::Win32::Foundation::LUID::default();
+        // SE_DEBUG_NAME = "SeDebugPrivilege"
+        if LookupPrivilegeValueW(None, w!("SeDebugPrivilege"), &mut luid).is_err() {
+            let _ = CloseHandle(token);
+            return false;
+        }
+
+        let mut tp = TOKEN_PRIVILEGES {
+            PrivilegeCount: 1,
+            Privileges: [LUID_AND_ATTRIBUTES {
+                Luid: luid,
+                Attributes: SE_PRIVILEGE_ENABLED,
+            }],
+        };
+
+        let result = AdjustTokenPrivileges(token, false, Some(&mut tp), 0, None, None).is_ok();
+        let _ = CloseHandle(token);
+        result
+    }
+}
+
+#[cfg(not(windows))]
+pub fn enable_debug_privilege() -> bool {
+    false
+}
 
 // Cache for PID to username lookups (persists across refreshes)
 #[cfg(windows)]
-static PID_USER_CACHE: LazyLock<Mutex<HashMap<u32, String>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PID_USER_CACHE: LazyLock<RwLock<HashMap<u32, String>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
-// Cache for thread counts (expensive to compute - only refresh every 2 seconds)
-// Uses Arc to avoid cloning the entire HashMap on each access
+// Cache for static process info (elevation, architecture, exe_path) - these don't change during process lifetime
 #[cfg(windows)]
-static THREAD_COUNT_CACHE: LazyLock<Mutex<(std::time::Instant, Arc<HashMap<u32, u32>>)>> =
-    LazyLock::new(|| Mutex::new((std::time::Instant::now(), Arc::new(HashMap::new()))));
+static STATIC_PROCESS_INFO_CACHE: LazyLock<RwLock<HashMap<u32, (bool, ProcessArch, String)>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+// Cache for efficiency_mode (requires Windows API call, not available from NtQuerySystemInformation)
+#[cfg(windows)]
+struct EfficiencyModeCache {
+    efficiency_mode: bool,
+    last_update: std::time::Instant,
+}
 
 #[cfg(windows)]
-const THREAD_CACHE_DURATION_MS: u128 = 2000; // Refresh thread counts every 2 seconds
+static EFFICIENCY_MODE_CACHE: LazyLock<RwLock<HashMap<u32, EfficiencyModeCache>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
-// Cache for static process info (elevation, architecture) - these don't change during process lifetime
 #[cfg(windows)]
-static STATIC_PROCESS_INFO_CACHE: LazyLock<Mutex<HashMap<u32, (bool, ProcessArch)>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+const EFFICIENCY_CACHE_TTL_MS: u128 = 30000; // Refresh efficiency mode every 30 seconds
 
-/// Get the owner of a process by PID using Windows API
+// Counter for periodic cache cleanup (every N refreshes)
 #[cfg(windows)]
-fn get_process_owner(pid: u32) -> Option<String> {
-    use windows::Win32::System::Threading::OpenProcessToken;
+static CLEANUP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(windows)]
+const CLEANUP_INTERVAL: u32 = 10; // Clean caches every 10 refreshes
 
-    // Special cases for system processes
-    if pid == 0 {
-        return Some("SYSTEM".to_string());
+/// Clean up caches by removing entries for PIDs that no longer exist
+#[cfg(windows)]
+fn cleanup_stale_caches(current_pids: &std::collections::HashSet<u32>) {
+    if let Ok(mut cache) = PID_USER_CACHE.write() {
+        cache.retain(|pid, _| current_pids.contains(pid));
     }
-    if pid == 4 {
-        return Some("SYSTEM".to_string());
+    if let Ok(mut cache) = STATIC_PROCESS_INFO_CACHE.write() {
+        cache.retain(|pid, _| current_pids.contains(pid));
     }
-
-    // Check PID cache first
-    if let Ok(cache) = PID_USER_CACHE.lock() {
-        if let Some(user) = cache.get(&pid) {
-            return Some(user.clone());
-        }
-    }
-
-    unsafe {
-        // Try PROCESS_QUERY_INFORMATION first, fall back to LIMITED
-        let process_handle = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid)
-            .or_else(|_| OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid))
-            .ok()
-            .filter(|h| !h.is_invalid())?;
-
-        // Open the process token
-        let mut token_handle = HANDLE::default();
-        let token_result = OpenProcessToken(process_handle, TOKEN_QUERY, &mut token_handle);
-
-        if token_result.is_err() {
-            let _ = CloseHandle(process_handle);
-            return None;
-        }
-
-        // Get token user info - first call to get required size
-        let mut token_info_len: u32 = 0;
-        let _ = GetTokenInformation(token_handle, TokenUser, None, 0, &mut token_info_len);
-
-        if token_info_len == 0 {
-            let _ = CloseHandle(token_handle);
-            let _ = CloseHandle(process_handle);
-            return None;
-        }
-
-        let mut token_info: Vec<u8> = vec![0; token_info_len as usize];
-        let get_info_result = GetTokenInformation(
-            token_handle,
-            TokenUser,
-            Some(token_info.as_mut_ptr() as *mut _),
-            token_info_len,
-            &mut token_info_len,
-        );
-
-        let _ = CloseHandle(token_handle);
-        let _ = CloseHandle(process_handle);
-
-        if get_info_result.is_err() {
-            return None;
-        }
-
-        // Cast to TOKEN_USER
-        let token_user = &*(token_info.as_ptr() as *const TOKEN_USER);
-        let sid = token_user.User.Sid;
-
-        // Look up the account name
-        let mut name_buf: Vec<u16> = vec![0; 256];
-        let mut domain_buf: Vec<u16> = vec![0; 256];
-        let mut name_len: u32 = name_buf.len() as u32;
-        let mut domain_len: u32 = domain_buf.len() as u32;
-        let mut sid_type = SID_NAME_USE::default();
-
-        let lookup_result = LookupAccountSidW(
-            None,
-            sid,
-            Some(PWSTR(name_buf.as_mut_ptr())),
-            &mut name_len,
-            Some(PWSTR(domain_buf.as_mut_ptr())),
-            &mut domain_len,
-            &mut sid_type,
-        );
-
-        if lookup_result.is_ok() && name_len > 0 {
-            let username = String::from_utf16_lossy(&name_buf[..name_len as usize]);
-
-            // Cache the result
-            if let Ok(mut cache) = PID_USER_CACHE.lock() {
-                cache.insert(pid, username.clone());
-            }
-
-            Some(username)
-        } else {
-            None
-        }
+    if let Ok(mut cache) = EFFICIENCY_MODE_CACHE.write() {
+        cache.retain(|pid, _| current_pids.contains(pid));
     }
 }
 
@@ -194,161 +150,251 @@ impl ProcessArch {
     }
 }
 
-/// Extended process info from Windows API (combined for efficiency)
+// ============================================================================
+// Helper functions to reduce code duplication
+// ============================================================================
+
+/// Open a process handle with fallback from full to limited query access
 #[cfg(windows)]
-struct WinProcessInfo {
-    priority: i32,
-    nice: i32,
-    cpu_time: Duration,
-    start_time: u64, // Unix timestamp
-    handle_count: u32,
-    io_read_bytes: u64,
-    io_write_bytes: u64,
-    shared_mem: u64,
-    efficiency_mode: bool, // Windows 11 EcoQoS
-    is_elevated: bool,     // Running as admin
-    arch: ProcessArch,     // Process architecture
+#[inline]
+fn open_process_query(pid: u32) -> Option<HANDLE> {
+    unsafe {
+        match OpenProcess(PROCESS_QUERY_INFORMATION, false, pid) {
+            Ok(h) if !h.is_invalid() => Some(h),
+            _ => match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                Ok(h) if !h.is_invalid() => Some(h),
+                _ => None,
+            },
+        }
+    }
 }
 
-/// Get priority, nice, CPU time, handle count, and I/O counters with a single OpenProcess call
+/// Query CPU time and start time from a process handle
 #[cfg(windows)]
-fn get_win_process_info(pid: u32) -> WinProcessInfo {
-    let default = WinProcessInfo {
-        priority: 20,
-        nice: 0,
-        cpu_time: Duration::ZERO,
-        start_time: 0,
-        handle_count: 0,
-        io_read_bytes: 0,
-        io_write_bytes: 0,
-        shared_mem: 0,
-        efficiency_mode: false,
-        is_elevated: false,
-        arch: ProcessArch::Native,
-    };
-
-    // Check cache for static info (elevation, architecture)
-    let cached_static = STATIC_PROCESS_INFO_CACHE
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&pid).copied());
-
+#[inline]
+fn query_process_times(handle: HANDLE) -> (Duration, u64) {
     unsafe {
-        // Try full access first, fall back to limited
-        let handle = match OpenProcess(PROCESS_QUERY_INFORMATION, false, pid) {
-            Ok(h) if !h.is_invalid() => h,
-            _ => match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
-                Ok(h) if !h.is_invalid() => h,
-                _ => return default,
-            },
-        };
-
-        // Get priority class
-        let priority_class = GetPriorityClass(handle);
-        let (priority, nice) = match priority_class {
-            x if x == IDLE_PRIORITY_CLASS.0 => (39, 19),
-            x if x == BELOW_NORMAL_PRIORITY_CLASS.0 => (30, 10),
-            x if x == NORMAL_PRIORITY_CLASS.0 => (20, 0),
-            x if x == ABOVE_NORMAL_PRIORITY_CLASS.0 => (10, -5),
-            x if x == HIGH_PRIORITY_CLASS.0 => (5, -10),
-            x if x == REALTIME_PRIORITY_CLASS.0 => (0, -20),
-            _ => (20, 0),
-        };
-
-        // Get CPU time and start time
         let mut creation = FILETIME::default();
         let mut exit = FILETIME::default();
         let mut kernel = FILETIME::default();
         let mut user = FILETIME::default();
 
-        let (cpu_time, start_time) =
-            if GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user).is_ok() {
-                let kernel_100ns =
-                    ((kernel.dwHighDateTime as u64) << 32) | kernel.dwLowDateTime as u64;
-                let user_100ns = ((user.dwHighDateTime as u64) << 32) | user.dwLowDateTime as u64;
-                let total_100ns = kernel_100ns + user_100ns;
-                let secs = total_100ns / 10_000_000;
-                let nanos = ((total_100ns % 10_000_000) * 100) as u32;
+        if GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user).is_ok() {
+            let kernel_100ns = ((kernel.dwHighDateTime as u64) << 32) | kernel.dwLowDateTime as u64;
+            let user_100ns = ((user.dwHighDateTime as u64) << 32) | user.dwLowDateTime as u64;
+            let total_100ns = kernel_100ns + user_100ns;
+            let cpu_time = Duration::new(total_100ns / 10_000_000, ((total_100ns % 10_000_000) * 100) as u32);
 
-                // Convert creation time (FILETIME) to Unix timestamp
-                // FILETIME is 100-nanosecond intervals since January 1, 1601
-                // Unix epoch is January 1, 1970
-                // Difference is 116444736000000000 100-ns intervals
-                let creation_100ns =
-                    ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
-                let unix_time = if creation_100ns > 116444736000000000 {
-                    (creation_100ns - 116444736000000000) / 10_000_000
-                } else {
-                    0
-                };
+            // Convert FILETIME to Unix timestamp (116444736000000000 = difference between 1601 and 1970)
+            let creation_100ns = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+            let start_time = creation_100ns.saturating_sub(116444736000000000) / 10_000_000;
 
-                (Duration::new(secs, nanos), unix_time)
-            } else {
-                (Duration::ZERO, 0)
-            };
+            (cpu_time, start_time)
+        } else {
+            (Duration::ZERO, 0)
+        }
+    }
+}
 
-        // Get handle count
-        let mut handle_count: u32 = 0;
-        let _ = GetProcessHandleCount(handle, &mut handle_count);
-
-        // Get I/O counters
-        let mut io_counters = IO_COUNTERS::default();
-        let (io_read_bytes, io_write_bytes) =
-            if GetProcessIoCounters(handle, &mut io_counters).is_ok() {
-                (
-                    io_counters.ReadTransferCount,
-                    io_counters.WriteTransferCount,
-                )
-            } else {
-                (0, 0)
-            };
-
-        // Get memory info for shared memory calculation
-        // Use PROCESS_MEMORY_COUNTERS_EX to get PrivateUsage field
-        // Shared memory = WorkingSetSize - PrivateUsage
-        let mut mem_counters_ex = PROCESS_MEMORY_COUNTERS_EX::default();
-        mem_counters_ex.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        let shared_mem = if K32GetProcessMemoryInfo(
-            handle,
-            &mut mem_counters_ex as *mut _ as *mut PROCESS_MEMORY_COUNTERS,
-            std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32,
-        )
-        .as_bool()
-        {
-            // Shared = WorkingSetSize - PrivateUsage
-            (mem_counters_ex.WorkingSetSize as u64)
-                .saturating_sub(mem_counters_ex.PrivateUsage as u64)
+/// Query shared memory (WorkingSetSize - PrivateUsage) from a process handle
+#[cfg(windows)]
+#[inline]
+fn query_shared_mem(handle: HANDLE) -> u64 {
+    unsafe {
+        let mut mem = PROCESS_MEMORY_COUNTERS_EX::default();
+        mem.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        if K32GetProcessMemoryInfo(handle, &mut mem as *mut _ as *mut PROCESS_MEMORY_COUNTERS, mem.cb).as_bool() {
+            (mem.WorkingSetSize as u64).saturating_sub(mem.PrivateUsage as u64)
         } else {
             0
-        };
+        }
+    }
+}
 
-        // Check for Efficiency Mode (EcoQoS) - Windows 11+ (dynamic, can change)
-        let efficiency_mode = {
-            let mut throttle_state = PROCESS_POWER_THROTTLING_STATE::default();
-            throttle_state.Version = 1; // PROCESS_POWER_THROTTLING_CURRENT_VERSION
-            let result = GetProcessInformation(
-                handle,
-                ProcessPowerThrottling,
-                &mut throttle_state as *mut _ as *mut _,
-                std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
-            );
-            if result.is_ok() {
-                // Check if PROCESS_POWER_THROTTLING_EXECUTION_SPEED is set in StateMask
-                (throttle_state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
-                    && (throttle_state.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
-            } else {
-                false
-            }
-        };
-
-        // Use cached static info if available, otherwise query and cache
-        let (is_elevated, arch) = if let Some((elevated, arch)) = cached_static {
-            (elevated, arch)
+/// Query the full executable path from a process handle
+#[cfg(windows)]
+#[inline]
+fn query_exe_path(handle: HANDLE) -> String {
+    unsafe {
+        let mut buffer = [0u16; 1024];
+        let mut size = buffer.len() as u32;
+        if QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut size).is_ok() {
+            String::from_utf16_lossy(&buffer[..size as usize])
         } else {
-            // Query elevation (static - doesn't change during process lifetime)
-            let is_elevated = {
+            String::new()
+        }
+    }
+}
+
+/// Extract username from an already-opened token handle (avoids duplicate OpenProcess)
+#[cfg(windows)]
+fn get_user_from_token(token_handle: HANDLE, pid: u32) -> Option<String> {
+    unsafe {
+        // Get token user info - first call to get required size
+        let mut token_info_len: u32 = 0;
+        let _ = GetTokenInformation(token_handle, TokenUser, None, 0, &mut token_info_len);
+
+        if token_info_len == 0 {
+            return None;
+        }
+
+        // Allocate buffer and get token info
+        let mut token_info: Vec<u8> = vec![0; token_info_len as usize];
+        if GetTokenInformation(
+            token_handle,
+            TokenUser,
+            Some(token_info.as_mut_ptr() as *mut _),
+            token_info_len,
+            &mut token_info_len,
+        )
+        .is_err()
+        {
+            return None;
+        }
+
+        let token_user = &*(token_info.as_ptr() as *const TOKEN_USER);
+
+        // Look up the account name from the SID
+        let mut name_len: u32 = 256;
+        let mut domain_len: u32 = 256;
+        let mut name: Vec<u16> = vec![0; name_len as usize];
+        let mut domain: Vec<u16> = vec![0; domain_len as usize];
+        let mut sid_type = SID_NAME_USE::default();
+
+        if LookupAccountSidW(
+            None,
+            token_user.User.Sid,
+            Some(PWSTR(name.as_mut_ptr())),
+            &mut name_len,
+            Some(PWSTR(domain.as_mut_ptr())),
+            &mut domain_len,
+            &mut sid_type,
+        )
+        .is_ok()
+        {
+            let username = String::from_utf16_lossy(&name[..name_len as usize]);
+
+            // Cache the result
+            if let Ok(mut cache) = PID_USER_CACHE.write() {
+                cache.insert(pid, username.clone());
+            }
+
+            Some(username)
+        } else {
+            None
+        }
+    }
+}
+
+/// Get I/O counters for a specific process (on-demand, for ProcessInfo dialog)
+#[cfg(windows)]
+pub fn get_process_io_counters(pid: u32) -> (u64, u64) {
+    let handle = match open_process_query(pid) {
+        Some(h) => h,
+        None => return (0, 0),
+    };
+    unsafe {
+        let mut io = IO_COUNTERS::default();
+        let result = if GetProcessIoCounters(handle, &mut io).is_ok() {
+            (io.ReadTransferCount, io.WriteTransferCount)
+        } else { (0, 0) };
+        let _ = CloseHandle(handle);
+        result
+    }
+}
+
+#[cfg(not(windows))]
+pub fn get_process_io_counters(_pid: u32) -> (u64, u64) {
+    (0, 0)
+}
+
+/// Enriched data from Windows API for visible processes
+#[cfg(windows)]
+struct EnrichedProcessData {
+    pid: u32,
+    cpu_time: Duration,
+    start_time: u64,
+    shared_mem: u64,
+    efficiency_mode: bool,
+    is_elevated: bool,
+    arch: ProcessArch,
+    user: Option<String>,
+    exe_path: String,
+}
+
+/// Enrich processes with data not available from NtQuerySystemInformation
+/// (cpu_time, start_time, shared_mem, efficiency_mode, is_elevated, arch, user, exe_path)
+/// Call this for visible processes only to minimize Windows API calls
+/// Set fetch_exe_path=true only when show_program_path setting is enabled
+#[cfg(windows)]
+pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
+    use rayon::prelude::*;
+    use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
+
+    // Query data in parallel
+    let enriched_data: Vec<EnrichedProcessData> = processes
+        .par_iter()
+        .map(|p| {
+            let pid = p.pid;
+            if pid == 0 || pid == 4 {
+                return EnrichedProcessData {
+                    pid,
+                    cpu_time: Duration::ZERO,
+                    start_time: 0,
+                    shared_mem: 0,
+                    efficiency_mode: false,
+                    is_elevated: pid == 4,  // System process is elevated
+                    arch: ProcessArch::Native,
+                    user: Some("SYSTEM".to_string()),
+                    exe_path: String::new(),
+                };
+            }
+
+            let handle = match open_process_query(pid) {
+                Some(h) => h,
+                None => return EnrichedProcessData {
+                    pid,
+                    cpu_time: Duration::ZERO,
+                    start_time: 0,
+                    shared_mem: 0,
+                    efficiency_mode: false,
+                    is_elevated: false,
+                    arch: ProcessArch::Native,
+                    user: None,
+                    exe_path: String::new(),
+                },
+            };
+
+            // Query times and memory
+            let (cpu_time, start_time) = query_process_times(handle);
+            let shared_mem = query_shared_mem(handle);
+
+            // Query exe path only when needed (expensive API call)
+            let exe_path = if fetch_exe_path {
+                query_exe_path(handle)
+            } else {
+                String::new()
+            };
+
+            // Query efficiency mode
+            let efficiency_mode = unsafe {
+                let mut throttle_state = PROCESS_POWER_THROTTLING_STATE::default();
+                throttle_state.Version = 1;
+                let result = GetProcessInformation(
+                    handle, ProcessPowerThrottling,
+                    &mut throttle_state as *mut _ as *mut _,
+                    std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+                );
+                result.is_ok()
+                    && (throttle_state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
+                    && (throttle_state.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
+            };
+
+            // Query elevation and user from token
+            let (is_elevated, user) = unsafe {
                 let mut token_handle = HANDLE::default();
                 if OpenProcessToken(handle, TOKEN_QUERY, &mut token_handle).is_ok() {
+                    // Check elevation
                     let mut elevation = TOKEN_ELEVATION::default();
                     let mut return_length: u32 = 0;
                     let elevated = GetTokenInformation(
@@ -357,35 +403,27 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
                         Some(&mut elevation as *mut _ as *mut _),
                         std::mem::size_of::<TOKEN_ELEVATION>() as u32,
                         &mut return_length,
-                    )
-                    .is_ok()
-                        && elevation.TokenIsElevated != 0;
+                    ).is_ok() && elevation.TokenIsElevated != 0;
+
+                    // Get user from token
+                    let user = get_user_from_token(token_handle, pid);
                     let _ = CloseHandle(token_handle);
-                    elevated
+                    (elevated, user)
                 } else {
-                    false
+                    (false, None)
                 }
             };
 
-            // Query architecture (static - doesn't change during process lifetime)
-            let arch = {
-                use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
+            // Query architecture
+            let arch = unsafe {
                 let mut process_machine = IMAGE_FILE_MACHINE::default();
                 let mut native_machine = IMAGE_FILE_MACHINE::default();
-                if IsWow64Process2(
-                    handle,
-                    &mut process_machine,
-                    Some(&mut native_machine),
-                )
-                .is_ok()
-                {
+                if IsWow64Process2(handle, &mut process_machine, Some(&mut native_machine)).is_ok() {
                     if process_machine.0 == 0 {
-                        // Not running under WoW64, native process
                         ProcessArch::Native
                     } else if process_machine == IMAGE_FILE_MACHINE_I386 {
                         ProcessArch::X86
                     } else if process_machine == IMAGE_FILE_MACHINE_AMD64 {
-                        // x64 process on ARM64 (via emulation)
                         ProcessArch::X64
                     } else if process_machine == IMAGE_FILE_MACHINE_ARM64 {
                         ProcessArch::ARM64
@@ -397,30 +435,80 @@ fn get_win_process_info(pid: u32) -> WinProcessInfo {
                 }
             };
 
-            // Cache the static info
-            if let Ok(mut cache) = STATIC_PROCESS_INFO_CACHE.lock() {
-                cache.insert(pid, (is_elevated, arch));
+            unsafe { let _ = CloseHandle(handle); }
+
+            EnrichedProcessData {
+                pid,
+                cpu_time,
+                start_time,
+                shared_mem,
+                efficiency_mode,
+                is_elevated,
+                arch,
+                user,
+                exe_path,
             }
+        })
+        .collect();
 
-            (is_elevated, arch)
-        };
-
-        let _ = CloseHandle(handle);
-
-        WinProcessInfo {
-            priority,
-            nice,
-            cpu_time,
-            start_time,
-            handle_count,
-            io_read_bytes,
-            io_write_bytes,
-            shared_mem,
-            efficiency_mode,
-            is_elevated,
-            arch,
+    // Update caches
+    if let Ok(mut cache) = STATIC_PROCESS_INFO_CACHE.write() {
+        for data in &enriched_data {
+            cache.insert(data.pid, (data.is_elevated, data.arch, data.exe_path.clone()));
         }
     }
+
+    // Cache efficiency_mode (requires Windows API call, not available from NtQuerySystemInformation)
+    if let Ok(mut cache) = EFFICIENCY_MODE_CACHE.write() {
+        let now = std::time::Instant::now();
+        for data in &enriched_data {
+            cache.insert(data.pid, EfficiencyModeCache {
+                efficiency_mode: data.efficiency_mode,
+                last_update: now,
+            });
+        }
+    }
+
+    // Build lookup map
+    let data_map: HashMap<u32, &EnrichedProcessData> = enriched_data
+        .iter()
+        .map(|d| (d.pid, d))
+        .collect();
+
+    // Update process structs
+    // IMPORTANT: Only overwrite fields if enrichment got valid data.
+    // cpu_time and start_time are already populated from NtQuerySystemInformation in from_native.
+    // Don't overwrite them with zeros when OpenProcess fails (access denied).
+    for proc in processes.iter_mut() {
+        if let Some(data) = data_map.get(&proc.pid) {
+            // Only update cpu_time/start_time if we got actual data (not defaults from failed OpenProcess)
+            if !data.cpu_time.is_zero() {
+                proc.cpu_time = data.cpu_time;
+            }
+            if data.start_time != 0 {
+                proc.start_time = data.start_time;
+            }
+            proc.shared_mem = data.shared_mem;
+            proc.efficiency_mode = data.efficiency_mode;
+            proc.is_elevated = data.is_elevated;
+            proc.arch = data.arch;
+            if let Some(ref user) = data.user {
+                proc.user = user.clone();
+                proc.user_lower = user.to_lowercase();
+            }
+            // Update exe_path and command if we got a valid path
+            if !data.exe_path.is_empty() {
+                proc.exe_path = data.exe_path.clone();
+                proc.command = data.exe_path.clone();
+                proc.command_lower = data.exe_path.to_lowercase();
+            }
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn enrich_processes(_processes: &mut [ProcessInfo], _fetch_exe_path: bool) {
+    // No-op on non-Windows
 }
 
 #[cfg(not(windows))]
@@ -436,6 +524,7 @@ struct WinProcessInfo {
     efficiency_mode: bool,
     is_elevated: bool,
     arch: ProcessArch,
+    user: Option<String>,
 }
 
 #[cfg(not(windows))]
@@ -452,149 +541,8 @@ fn get_win_process_info(_pid: u32) -> WinProcessInfo {
         efficiency_mode: false,
         is_elevated: false,
         arch: ProcessArch::Native,
+        user: None,
     }
-}
-
-#[cfg(not(windows))]
-fn get_process_owner(_pid: u32) -> Option<String> {
-    None
-}
-
-/// Get thread counts for all processes in one efficient call (cached)
-#[cfg(windows)]
-fn get_all_thread_counts() -> Arc<HashMap<u32, u32>> {
-    // Check if we can use cached thread counts
-    if let Ok(mut cache) = THREAD_COUNT_CACHE.lock() {
-        let elapsed = cache.0.elapsed().as_millis();
-        if elapsed < THREAD_CACHE_DURATION_MS && !cache.1.is_empty() {
-            return Arc::clone(&cache.1);
-        }
-
-        // Need to refresh - compute new counts
-        let mut counts: HashMap<u32, u32> = HashMap::new();
-
-        unsafe {
-            // Create a snapshot of all threads in the system
-            if let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) {
-                if !snapshot.is_invalid() {
-                    let mut entry = THREADENTRY32 {
-                        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-                        ..Default::default()
-                    };
-
-                    // Get the first thread
-                    if Thread32First(snapshot, &mut entry).is_ok() {
-                        loop {
-                            // Increment count for this process
-                            *counts.entry(entry.th32OwnerProcessID).or_insert(0) += 1;
-
-                            // Reset dwSize before next call
-                            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
-
-                            if Thread32Next(snapshot, &mut entry).is_err() {
-                                break;
-                            }
-                        }
-                    }
-
-                    let _ = CloseHandle(snapshot);
-                }
-            }
-        }
-
-        // Update cache with Arc-wrapped counts
-        let counts_arc = Arc::new(counts);
-        cache.0 = std::time::Instant::now();
-        cache.1 = Arc::clone(&counts_arc);
-        counts_arc
-    } else {
-        // Fallback if lock fails
-        Arc::new(HashMap::new())
-    }
-}
-
-#[cfg(not(windows))]
-fn get_all_thread_counts() -> Arc<HashMap<u32, u32>> {
-    Arc::new(HashMap::new())
-}
-
-/// Convert a Windows SID string to a username
-#[cfg(windows)]
-fn sid_to_username(sid_str: &str) -> String {
-    // Check cache first
-    if let Ok(cache) = SID_CACHE.lock() {
-        if let Some(cached) = cache.get(sid_str) {
-            return cached.clone();
-        }
-    }
-
-    // Try to look up the SID using Windows API
-    let result = unsafe {
-        // Convert string SID to binary SID
-        let sid_wide: Vec<u16> = sid_str.encode_utf16().chain(std::iter::once(0)).collect();
-        let mut psid: PSID = PSID::default();
-
-        if ConvertStringSidToSidW(windows::core::PCWSTR(sid_wide.as_ptr()), &mut psid).is_err() {
-            return truncate_sid(sid_str);
-        }
-
-        // Buffers for account name and domain
-        let mut name_buf: Vec<u16> = vec![0; 256];
-        let mut domain_buf: Vec<u16> = vec![0; 256];
-        let mut name_len: u32 = name_buf.len() as u32;
-        let mut domain_len: u32 = domain_buf.len() as u32;
-        let mut sid_type = SID_NAME_USE::default();
-
-        let lookup_result = LookupAccountSidW(
-            None,
-            psid,
-            Some(PWSTR(name_buf.as_mut_ptr())),
-            &mut name_len,
-            Some(PWSTR(domain_buf.as_mut_ptr())),
-            &mut domain_len,
-            &mut sid_type,
-        );
-
-        // Free the SID
-        let _ = windows::Win32::Foundation::LocalFree(Some(HLOCAL(psid.0)));
-
-        if lookup_result.is_ok() && name_len > 0 {
-            let name = String::from_utf16_lossy(&name_buf[..name_len as usize]);
-            Some(name)
-        } else {
-            None
-        }
-    };
-
-    let username = result.unwrap_or_else(|| truncate_sid(sid_str));
-
-    // Cache the result
-    if let Ok(mut cache) = SID_CACHE.lock() {
-        cache.insert(sid_str.to_string(), username.clone());
-    }
-
-    username
-}
-
-/// Truncate long SID strings for display
-#[cfg(windows)]
-fn truncate_sid(sid: &str) -> String {
-    if sid.len() > 12 {
-        if let Some(last_dash) = sid.rfind('-') {
-            let suffix = &sid[last_dash..];
-            if suffix.len() < 8 {
-                return format!("S-1-..{}", suffix);
-            }
-        }
-        format!("{}...", &sid[..9])
-    } else {
-        sid.to_string()
-    }
-}
-
-#[cfg(not(windows))]
-fn sid_to_username(sid_str: &str) -> String {
-    sid_str.to_string()
 }
 
 /// Process information
@@ -640,117 +588,6 @@ pub struct ProcessInfo {
 }
 
 impl ProcessInfo {
-    pub fn from_sysinfo(sys: &System) -> Vec<ProcessInfo> {
-        let total_mem = sys.total_memory();
-
-        // Note: We intentionally don't clear PID_USER_CACHE every refresh.
-        // The cache grows but user lookups are expensive Windows API calls.
-        // Stale entries (from reused PIDs) are rare and only affect display.
-
-        // Get thread counts for all processes in one efficient call
-        let thread_counts = get_all_thread_counts();
-
-        sys.processes()
-            .iter()
-            .map(|(pid, proc)| {
-                let pid_u32 = pid.as_u32();
-                let thread_count = thread_counts.get(&pid_u32).copied().unwrap_or(0);
-                let memory = proc.memory();
-                let mem_percent = if total_mem > 0 {
-                    (memory as f64 / total_mem as f64 * 100.0) as f32
-                } else {
-                    0.0
-                };
-
-                let status = match proc.status() {
-                    ProcessStatus::Run => 'R',
-                    ProcessStatus::Sleep => 'S',
-                    ProcessStatus::Idle => 'I',
-                    ProcessStatus::Zombie => 'Z',
-                    ProcessStatus::Stop => 'T',
-                    _ => '?',
-                };
-
-                // Get executable path
-                let exe_path = proc
-                    .exe()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default();
-
-                // Get command line arguments
-                let cmd = proc.cmd();
-                let command = if cmd.is_empty() {
-                    // If no command line, use exe path or name
-                    if !exe_path.is_empty() {
-                        exe_path.clone()
-                    } else {
-                        proc.name().to_string_lossy().to_string()
-                    }
-                } else {
-                    // Join command line arguments
-                    cmd.iter()
-                        .map(|s| s.to_string_lossy().to_string())
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                };
-
-                // Get user - try Windows API first, then fall back to sysinfo
-                let user = get_process_owner(pid_u32)
-                    .or_else(|| proc.user_id().map(|u| sid_to_username(&u.to_string())))
-                    .unwrap_or_else(|| "-".to_string());
-
-                // Get parent PID
-                let parent_pid = proc.parent().map(|p| p.as_u32()).unwrap_or(0);
-
-                // Get priority, nice, and CPU time in one optimized call
-                let win_info = get_win_process_info(pid_u32);
-
-                let name = proc.name().to_string_lossy().to_string();
-
-                // Pre-compute lowercase strings once at creation time
-                let name_lower = name.to_lowercase();
-                let command_lower = command.to_lowercase();
-                let user_lower = user.to_lowercase();
-
-                ProcessInfo {
-                    pid: pid_u32,
-                    parent_pid,
-                    name,
-                    exe_path,
-                    command,
-                    user,
-                    status,
-                    cpu_percent: proc.cpu_usage(),
-                    mem_percent,
-                    virtual_mem: proc.virtual_memory(),
-                    resident_mem: memory,
-                    shared_mem: win_info.shared_mem,
-                    priority: win_info.priority,
-                    nice: win_info.nice,
-                    cpu_time: win_info.cpu_time,
-                    tree_depth: 0,
-                    tree_prefix: String::new(), // Set by tree builder
-                    // New fields
-                    has_children: false, // Set by tree builder
-                    is_collapsed: false, // Set by tree builder
-                    thread_count,
-                    start_time: win_info.start_time,
-                    handle_count: win_info.handle_count,
-                    io_read_bytes: win_info.io_read_bytes,
-                    io_write_bytes: win_info.io_write_bytes,
-                    // Pre-computed for efficient filtering
-                    name_lower,
-                    command_lower,
-                    user_lower,
-                    matches_search: false, // Set during filtering
-                    efficiency_mode: win_info.efficiency_mode,
-                    is_elevated: win_info.is_elevated,
-                    arch: win_info.arch,
-                }
-            })
-            .collect()
-    }
-
     /// Format CPU time as HH:MM:SS or MM:SS.ms
     pub fn format_cpu_time(&self) -> String {
         let secs = self.cpu_time.as_secs();
@@ -764,6 +601,151 @@ impl ProcessInfo {
         } else {
             format!("{:02}:{:02}.{:02}", mins, secs, centis)
         }
+    }
+
+    /// Create ProcessInfo from native NtQuerySystemInformation data
+    /// This is significantly faster than sysinfo as it uses a single syscall for all processes.
+    /// Fields not available from NT API (exe_path, command, user, efficiency_mode, is_elevated, arch)
+    /// use cached values or defaults - call enrich_processes() for visible processes to fill them.
+    #[cfg(windows)]
+    pub fn from_native(
+        native_procs: &[NativeProcessInfo],
+        cpu_percentages: &HashMap<u32, f32>,
+        total_mem: u64,
+    ) -> Vec<ProcessInfo> {
+        // Periodically clean up stale PIDs from caches to prevent unbounded growth
+        {
+            use std::sync::atomic::Ordering;
+            if CLEANUP_COUNTER.fetch_add(1, Ordering::Relaxed) % CLEANUP_INTERVAL == 0 {
+                let current_pids: std::collections::HashSet<u32> =
+                    native_procs.iter().map(|p| p.pid).collect();
+                cleanup_stale_caches(&current_pids);
+            }
+        }
+
+        native_procs
+            .par_iter()
+            .map(|proc| {
+                let pid = proc.pid;
+
+                // Get cached static info (is_elevated, arch, exe_path) if available
+                let (is_elevated, arch, cached_exe_path) = STATIC_PROCESS_INFO_CACHE
+                    .read()
+                    .ok()
+                    .and_then(|cache| cache.get(&pid).cloned())
+                    .unwrap_or((false, ProcessArch::Native, String::new()));
+
+                // Always use native data for priority/nice/handle_count
+                // These come directly from NtQuerySystemInformation
+                let nice = priority_to_nice(proc.base_priority);
+                let priority = match proc.base_priority {
+                    0..=4 => 0,      // Realtime
+                    5..=8 => 5,      // High
+                    9..=12 => 20,    // Normal
+                    13..=15 => 30,   // Below normal
+                    _ => 39,         // Idle
+                };
+                let handle_count = proc.handle_count;
+
+                // Get cached efficiency_mode if available (requires Windows API call to query)
+                let now = std::time::Instant::now();
+                let efficiency_mode = EFFICIENCY_MODE_CACHE
+                    .read()
+                    .ok()
+                    .and_then(|cache| {
+                        cache.get(&pid).and_then(|info| {
+                            if now.duration_since(info.last_update).as_millis() < EFFICIENCY_CACHE_TTL_MS {
+                                Some(info.efficiency_mode)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .unwrap_or(false);
+
+                // Get cached user if available
+                let user = PID_USER_CACHE
+                    .read()
+                    .ok()
+                    .and_then(|cache| cache.get(&pid).cloned())
+                    .unwrap_or_else(|| {
+                        // Special cases
+                        if pid == 0 {
+                            "SYSTEM".to_string()
+                        } else if pid == 4 {
+                            "SYSTEM".to_string()
+                        } else {
+                            "-".to_string()
+                        }
+                    });
+
+                // CPU percentage from pre-calculated delta
+                let cpu_percent = cpu_percentages.get(&pid).copied().unwrap_or(0.0);
+
+                // Memory percentage
+                let mem_percent = if total_mem > 0 {
+                    (proc.working_set as f64 / total_mem as f64 * 100.0) as f32
+                } else {
+                    0.0
+                };
+
+                // Convert kernel+user time to Duration
+                let total_100ns = proc.kernel_time + proc.user_time;
+                let cpu_time = Duration::new(
+                    total_100ns / 10_000_000,
+                    ((total_100ns % 10_000_000) * 100) as u32,
+                );
+
+                // Convert create_time to Unix timestamp
+                let start_time = filetime_to_unix(proc.create_time);
+
+                // Use cached exe_path if available, otherwise fall back to name
+                let (exe_path, command, command_lower) = if !cached_exe_path.is_empty() {
+                    let lower = cached_exe_path.to_lowercase();
+                    (cached_exe_path.clone(), cached_exe_path, lower)
+                } else {
+                    (String::new(), proc.name.clone(), proc.name.to_lowercase())
+                };
+
+                // Pre-compute lowercase strings for filtering
+                let name_lower = proc.name.to_lowercase();
+                let user_lower = user.to_lowercase();
+
+                ProcessInfo {
+                    pid,
+                    parent_pid: proc.parent_pid,
+                    name: proc.name.clone(),
+                    exe_path,
+                    command,
+                    user,
+                    status: 'R', // NT API doesn't give us detailed status
+                    cpu_percent,
+                    mem_percent,
+                    virtual_mem: proc.virtual_size,
+                    resident_mem: proc.working_set,
+                    shared_mem: proc.working_set.saturating_sub(proc.private_bytes),
+                    priority,
+                    nice,
+                    cpu_time,
+                    tree_depth: 0,
+                    tree_prefix: String::new(),
+                    has_children: false,
+                    is_collapsed: false,
+                    thread_count: proc.thread_count,
+                    start_time,
+                    handle_count,
+                    io_read_bytes: proc.read_bytes,
+                    io_write_bytes: proc.write_bytes,
+                    name_lower,
+                    command_lower,
+                    user_lower,
+                    matches_search: false,
+                    efficiency_mode,
+                    is_elevated,
+                    arch,
+                }
+            })
+            .collect()
     }
 }
 

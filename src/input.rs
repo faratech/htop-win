@@ -716,6 +716,7 @@ fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
             if let Some(col) = all_columns.get(app.column_config_index) {
                 let col_name = col.name().to_string();
                 app.config.toggle_column(&col_name);
+                app.update_visible_columns_cache();
                 app.save_config();
             }
         }

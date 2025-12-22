@@ -5,10 +5,33 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph},
     Frame,
 };
+use std::collections::VecDeque;
 
 use crate::app::App;
 use crate::config::MeterMode;
 use crate::system::format_bytes;
+
+/// Pre-computed bar strings to avoid repeated String::repeat() allocations.
+/// Maximum bar width is 128 characters which covers most terminal widths.
+const MAX_BAR_WIDTH: usize = 128;
+
+/// Pre-computed string of '|' characters for bar fills
+static BAR_FILL: &str = "||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||";
+
+/// Pre-computed string of ' ' characters for bar empty space
+static BAR_EMPTY: &str = "                                                                                                                                ";
+
+/// Get a slice of bar fill characters (more efficient than String::repeat)
+#[inline]
+fn bar_fill(width: usize) -> &'static str {
+    &BAR_FILL[..width.min(MAX_BAR_WIDTH)]
+}
+
+/// Get a slice of bar empty characters (more efficient than String::repeat)
+#[inline]
+fn bar_empty(width: usize) -> &'static str {
+    &BAR_EMPTY[..width.min(MAX_BAR_WIDTH)]
+}
 
 /// Braille characters for sparkline graph - htop style
 /// Each character encodes TWO data points (left column, right column)
@@ -170,7 +193,7 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
             let graph_str = if let Some(hist) = history {
                 render_sparkline(hist, graph_width)
             } else {
-                " ".repeat(graph_width)
+                bar_empty(graph_width).to_string()
             };
 
             Line::from(vec![
@@ -201,9 +224,9 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
 
                 Line::from(vec![
                     Span::styled(format!("{}[", label), Style::default().fg(theme.meter_label)),
-                    Span::styled("|".repeat(user_width), Style::default().fg(theme.cpu_normal)),
-                    Span::styled("|".repeat(system_width), Style::default().fg(theme.cpu_system)),
-                    Span::raw(" ".repeat(empty_width)),
+                    Span::styled(bar_fill(user_width), Style::default().fg(theme.cpu_normal)),
+                    Span::styled(bar_fill(system_width), Style::default().fg(theme.cpu_system)),
+                    Span::raw(bar_empty(empty_width)),
                     Span::styled(percent, Style::default().fg(theme.text)),
                 ])
             } else {
@@ -213,8 +236,8 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
 
                 Line::from(vec![
                     Span::styled(format!("{}[", label), Style::default().fg(theme.meter_label)),
-                    Span::styled("|".repeat(filled), Style::default().fg(bar_color)),
-                    Span::raw(" ".repeat(empty)),
+                    Span::styled(bar_fill(filled), Style::default().fg(bar_color)),
+                    Span::raw(bar_empty(empty)),
                     Span::styled(percent, Style::default().fg(theme.text)),
                 ])
             }
@@ -228,26 +251,36 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
 /// Render a sparkline graph from history data - htop style
 /// Each character encodes TWO consecutive values (left and right halves)
 /// This doubles the effective horizontal resolution
-fn render_sparkline(history: &[f32], width: usize) -> String {
+fn render_sparkline(history: &VecDeque<f32>, width: usize) -> String {
     if history.is_empty() || width == 0 {
-        return " ".repeat(width);
+        return bar_empty(width).to_string();
     }
 
     // We need width*2 samples since each char shows 2 values
     let samples_needed = width * 2;
-    let start = history.len().saturating_sub(samples_needed);
-    let samples = &history[start..];
+    let available_samples = history.len();
+    let start = available_samples.saturating_sub(samples_needed);
+
+    // Calculate how many graph chars we can generate and how many spaces we need
+    let graph_chars = ((available_samples - start) + 1) / 2;
+    let graph_chars = graph_chars.min(width);
+    let padding_chars = width.saturating_sub(graph_chars);
 
     let mut result = String::with_capacity(width * 3); // UTF-8 braille is 3 bytes
-    let mut char_count = 0;
 
-    // Process samples in pairs
-    let mut i = 0;
-    while i < samples.len() && char_count < width {
+    // Pre-add padding spaces (O(n) instead of O(n²) from repeated insert(0))
+    for _ in 0..padding_chars {
+        result.push(' ');
+    }
+
+    // Process samples in pairs using index-based access
+    let mut i = start;
+    let mut char_count = 0;
+    while i < available_samples && char_count < graph_chars {
         // Left value (older)
-        let v1 = samples[i];
+        let v1 = history[i];
         // Right value (newer) - use same as left if at end
-        let v2 = if i + 1 < samples.len() { samples[i + 1] } else { v1 };
+        let v2 = if i + 1 < available_samples { history[i + 1] } else { v1 };
 
         // Map 0-100% to 0-4 (5 levels for braille dots)
         let left = ((v1 / 100.0 * 4.0).round() as usize).min(4);
@@ -258,12 +291,6 @@ fn render_sparkline(history: &[f32], width: usize) -> String {
         result.push_str(GRAPH_DOTS_UTF8[idx]);
         char_count += 1;
         i += 2;
-    }
-
-    // Pad with spaces if not enough history
-    while char_count < width {
-        result.insert(0, ' ');
-        char_count += 1;
     }
 
     result
@@ -313,8 +340,8 @@ fn draw_memory_bar(frame: &mut Frame, app: &App, area: Rect) {
 
             Line::from(vec![
                 Span::styled("Mem[", Style::default().fg(theme.meter_label)),
-                Span::styled("|".repeat(filled), Style::default().fg(theme.memory_used)),
-                Span::raw(" ".repeat(empty)),
+                Span::styled(bar_fill(filled), Style::default().fg(theme.memory_used)),
+                Span::raw(bar_empty(empty)),
                 Span::styled(format!("{}]", mem_info), Style::default().fg(theme.text)),
             ])
         }
@@ -336,16 +363,13 @@ fn draw_swap_bar(frame: &mut Frame, app: &App, area: Rect) {
     let filled = ((usage as usize) * bar_width / 100).min(bar_width);
     let empty = bar_width - filled;
 
-    let bar_filled: String = "|".repeat(filled);
-    let bar_empty: String = " ".repeat(empty);
-
     // Use theme color for swap bar (htop uses red for swap)
     let bar_color = theme.swap;
 
     let line = Line::from(vec![
         Span::styled("Swp[", Style::default().fg(theme.meter_label)),
-        Span::styled(bar_filled, Style::default().fg(bar_color)),
-        Span::raw(bar_empty),
+        Span::styled(bar_fill(filled), Style::default().fg(bar_color)),
+        Span::raw(bar_empty(empty)),
         Span::styled(format!("{}]", swap_info), Style::default().fg(theme.text)),
     ]);
 

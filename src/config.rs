@@ -88,7 +88,7 @@ impl Default for Config {
 
             show_kernel_threads: true,
             show_user_threads: true,
-            show_program_path: true,
+            show_program_path: false,
             highlight_running: true,
             highlight_large_numbers: true,
             highlight_new_processes: true,

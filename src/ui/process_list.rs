@@ -37,12 +37,8 @@ fn column_width(col: &SortColumn) -> Constraint {
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
 
-    // Get visible columns
-    let visible_columns: Vec<SortColumn> = SortColumn::all()
-        .iter()
-        .filter(|col| app.config.is_column_visible(col.name()))
-        .copied()
-        .collect();
+    // Use cached visible columns (updated when config changes)
+    let visible_columns = &app.cached_visible_columns;
 
     // htop header style: black text on green background
     let header_style = Style::default()
@@ -68,6 +64,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
     // Column widths for visible columns only
     let widths: Vec<Constraint> = visible_columns.iter().map(column_width).collect();
+
+    // Cache current time for start_time formatting (avoid syscall per process)
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
 
     // Build rows
     let rows: Vec<Row> = app
@@ -202,7 +204,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             if is_selected { theme.selection_fg } else { theme.time_color }
                         ),
                         SortColumn::StartTime => (
-                            format!("{:>7}", format_start_time(proc.start_time)),
+                            format!("{:>7}", format_start_time(proc.start_time, now_secs)),
                             if is_selected { theme.selection_fg } else { theme.text_dim }
                         ),
                         SortColumn::Command => unreachable!(), // Handled above
@@ -272,17 +274,11 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 }
 
 /// Format a Unix timestamp as elapsed time or time of day
-fn format_start_time(start_time: u64) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
+/// Takes pre-computed `now` to avoid syscall per process
+fn format_start_time(start_time: u64, now: u64) -> String {
     if start_time == 0 {
         return "-".to_string();
     }
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
 
     if start_time > now {
         return "-".to_string();

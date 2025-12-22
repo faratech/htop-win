@@ -34,6 +34,17 @@ struct Args {
     highlight_changes: Option<u64>,
     help: bool,
     version: bool,
+    benchmark: Option<u64>,
+    inefficient: bool,
+}
+
+/// Benchmark statistics for performance measurement
+#[derive(Default)]
+struct BenchmarkStats {
+    refresh_times: Vec<Duration>,
+    draw_times: Vec<Duration>,
+    total_start: Option<Instant>,
+    process_cpu_start: Duration,
 }
 
 fn parse_args() -> Result<Args, lexopt::Error> {
@@ -91,6 +102,12 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Short('V') | Long("version") => {
                 args.version = true;
             }
+            Long("benchmark") => {
+                args.benchmark = Some(parser.value().ok().and_then(|v| v.parse().ok()).unwrap_or(20));
+            }
+            Long("inefficient") => {
+                args.inefficient = true;
+            }
             _ => return Err(arg.unexpected()),
         }
     }
@@ -112,10 +129,151 @@ fn print_help() {
     println!("  -F, --filter <FILTER>        Initial filter string");
     println!("  -n, --max-iterations <N>     Exit after N updates");
     println!("      --no-meters              Hide header meters");
+    println!("      --benchmark [N]          Run N iterations (default 20) and print timing stats");
     println!("      --readonly               Disable kill/nice operations");
+    println!("      --inefficient            Disable Efficiency Mode (run at normal priority)");
     println!("  -H, --highlight-changes <S>  Highlight process changes (seconds)");
     println!("  -h, --help                   Print help");
     println!("  -V, --version                Print version");
+}
+
+/// Get current process CPU time (user + kernel) on Windows
+#[cfg(windows)]
+fn get_process_cpu_time() -> Duration {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    unsafe {
+        let handle = GetCurrentProcess();
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+
+        if GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user).is_ok() {
+            let kernel_100ns = ((kernel.dwHighDateTime as u64) << 32) | kernel.dwLowDateTime as u64;
+            let user_100ns = ((user.dwHighDateTime as u64) << 32) | user.dwLowDateTime as u64;
+            let total_100ns = kernel_100ns + user_100ns;
+            Duration::from_nanos(total_100ns * 100)
+        } else {
+            Duration::ZERO
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn get_process_cpu_time() -> Duration {
+    Duration::ZERO
+}
+
+/// Enable Windows Efficiency Mode (EcoQoS) for the current process
+/// This reduces CPU usage by lowering priority and enabling power throttling
+#[cfg(windows)]
+fn enable_efficiency_mode() {
+    use windows::Win32::System::Threading::{
+        GetCurrentProcess, SetPriorityClass, SetProcessInformation,
+        ProcessPowerThrottling, IDLE_PRIORITY_CLASS,
+        PROCESS_POWER_THROTTLING_STATE, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+    };
+
+    unsafe {
+        let handle = GetCurrentProcess();
+
+        // Set to idle priority class (lowest scheduling priority)
+        let _ = SetPriorityClass(handle, IDLE_PRIORITY_CLASS);
+
+        // Enable EcoQoS power throttling
+        let mut throttle_state = PROCESS_POWER_THROTTLING_STATE {
+            Version: 1, // PROCESS_POWER_THROTTLING_CURRENT_VERSION
+            ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+            StateMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+                | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        };
+
+        let _ = SetProcessInformation(
+            handle,
+            ProcessPowerThrottling,
+            &mut throttle_state as *mut _ as *mut _,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_efficiency_mode() {
+    // No-op on non-Windows platforms
+}
+
+impl BenchmarkStats {
+    fn new() -> Self {
+        Self {
+            refresh_times: Vec::new(),
+            draw_times: Vec::new(),
+            total_start: Some(Instant::now()),
+            process_cpu_start: get_process_cpu_time(),
+        }
+    }
+
+    fn record_refresh(&mut self, duration: Duration) {
+        self.refresh_times.push(duration);
+    }
+
+    fn record_draw(&mut self, duration: Duration) {
+        self.draw_times.push(duration);
+    }
+
+    fn print_report(&self, process_count: usize) {
+        let total_elapsed = self.total_start.map(|s| s.elapsed()).unwrap_or_default();
+        let process_cpu_end = get_process_cpu_time();
+        let process_cpu_used = process_cpu_end.saturating_sub(self.process_cpu_start);
+
+        // Calculate CPU percentage (CPU time / wall time * 100)
+        let cpu_percent = if total_elapsed.as_nanos() > 0 {
+            (process_cpu_used.as_nanos() as f64 / total_elapsed.as_nanos() as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        println!("\n╔══════════════════════════════════════════════════════════════╗");
+        println!("║                    BENCHMARK RESULTS                         ║");
+        println!("╠══════════════════════════════════════════════════════════════╣");
+        println!("║ Iterations: {:>6}    Processes: {:>6}                       ║",
+                 self.refresh_times.len(), process_count);
+        println!("╠══════════════════════════════════════════════════════════════╣");
+
+        // Refresh stats
+        if !self.refresh_times.is_empty() {
+            let avg = self.refresh_times.iter().sum::<Duration>() / self.refresh_times.len() as u32;
+            let min = self.refresh_times.iter().min().copied().unwrap_or_default();
+            let max = self.refresh_times.iter().max().copied().unwrap_or_default();
+            let total: Duration = self.refresh_times.iter().sum();
+            println!("║ REFRESH (system data collection)                             ║");
+            println!("║   Total: {:>10.2?}  Avg: {:>10.2?}                       ║", total, avg);
+            println!("║   Min:   {:>10.2?}  Max: {:>10.2?}                       ║", min, max);
+        }
+
+        // Draw stats
+        if !self.draw_times.is_empty() {
+            let avg = self.draw_times.iter().sum::<Duration>() / self.draw_times.len() as u32;
+            let min = self.draw_times.iter().min().copied().unwrap_or_default();
+            let max = self.draw_times.iter().max().copied().unwrap_or_default();
+            let total: Duration = self.draw_times.iter().sum();
+            println!("╠══════════════════════════════════════════════════════════════╣");
+            println!("║ DRAW (UI rendering)                                          ║");
+            println!("║   Total: {:>10.2?}  Avg: {:>10.2?}                       ║", total, avg);
+            println!("║   Min:   {:>10.2?}  Max: {:>10.2?}                       ║", min, max);
+        }
+
+        // Overall stats
+        println!("╠══════════════════════════════════════════════════════════════╣");
+        println!("║ OVERALL                                                      ║");
+        println!("║   Wall time:    {:>10.2?}                                  ║", total_elapsed);
+        println!("║   CPU time:     {:>10.2?}                                  ║", process_cpu_used);
+        println!("║   CPU usage:    {:>10.1}%                                  ║", cpu_percent);
+        println!("╚══════════════════════════════════════════════════════════════╝");
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -136,6 +294,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("htop-win {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+
+    // Enable Efficiency Mode by default (reduces CPU usage via EcoQoS)
+    if !args.inefficient {
+        enable_efficiency_mode();
+    }
+
+    // Enable SeDebugPrivilege to access service account info (NETWORK SERVICE, LOCAL SERVICE)
+    // Only succeeds when running as Administrator
+    system::enable_debug_privilege();
 
     // Setup terminal
     enable_raw_mode()?;
@@ -202,9 +369,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.filter_string_lower = filter.to_lowercase();
     }
 
-    // Apply PID filter from CLI
+    // Apply PID filter from CLI (convert Vec to HashSet for O(1) lookup)
     if let Some(ref pids) = args.pids {
-        app.pid_filter = Some(pids.clone());
+        app.pid_filter = Some(pids.iter().copied().collect());
     }
 
     // Apply max iterations from CLI
@@ -217,11 +384,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.show_header = false;
     }
 
+    // Setup benchmark mode if requested
+    let benchmark_mode = args.benchmark;
+    if let Some(n) = benchmark_mode {
+        app.max_iterations = Some(n);
+        // Use minimal delay in benchmark mode for faster iteration
+        app.config.refresh_rate_ms = 10;
+    }
+
     // Initial system refresh
     app.refresh_system();
+    let process_count = app.processes.len();
+
+    // Create benchmark stats if in benchmark mode
+    let mut bench_stats = benchmark_mode.map(|_| BenchmarkStats::new());
 
     // Run the main loop
-    let result = run_app(&mut terminal, &mut app, &config);
+    let result = run_app(&mut terminal, &mut app, &config, bench_stats.as_mut());
 
     // Restore terminal
     disable_raw_mode()?;
@@ -232,8 +411,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     terminal.show_cursor()?;
 
-    if let Err(err) = result {
+    if let Err(err) = &result {
         eprintln!("Error: {err:?}");
+    }
+
+    // Print benchmark report if in benchmark mode
+    if let Some(stats) = bench_stats {
+        stats.print_report(process_count);
     }
 
     Ok(())
@@ -243,15 +427,24 @@ fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     _config: &Config,
+    mut bench_stats: Option<&mut BenchmarkStats>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_tick = Instant::now();
+    let mut needs_redraw = true;
 
     loop {
         // Read tick rate from app.config so it updates dynamically
         let tick_rate = Duration::from_millis(app.config.refresh_rate_ms);
 
-        // Draw UI
-        terminal.draw(|f| ui::draw(f, app))?;
+        // Draw UI only when needed (state changed)
+        if needs_redraw {
+            let draw_start = Instant::now();
+            terminal.draw(|f| ui::draw(f, app))?;
+            if let Some(stats) = bench_stats.as_mut() {
+                stats.record_draw(draw_start.elapsed());
+            }
+            needs_redraw = false;
+        }
 
         // Handle events with timeout
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
@@ -261,12 +454,15 @@ fn run_app<B: ratatui::backend::Backend>(
                     if input::handle_key_event(app, key) {
                         return Ok(());
                     }
+                    needs_redraw = true;
                 }
                 Event::Mouse(mouse) => {
                     input::handle_mouse_event(app, mouse);
+                    needs_redraw = true;
                 }
                 Event::Resize(_, _) => {
                     // Terminal will handle resize automatically
+                    needs_redraw = true;
                 }
                 _ => {}
             }
@@ -275,8 +471,13 @@ fn run_app<B: ratatui::backend::Backend>(
         // Refresh system data at tick rate (unless paused)
         if last_tick.elapsed() >= tick_rate {
             if !app.paused {
+                let refresh_start = Instant::now();
                 app.refresh_system();
+                if let Some(stats) = bench_stats.as_mut() {
+                    stats.record_refresh(refresh_start.elapsed());
+                }
                 app.iteration_count += 1;
+                needs_redraw = true;
 
                 // Check if we've reached max iterations
                 if let Some(max) = app.max_iterations {
