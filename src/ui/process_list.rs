@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::Span,
     widgets::{Block, Borders, Row, Table},
     Frame,
@@ -11,12 +11,14 @@ use crate::system::format_bytes;
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
+
+    // htop header style: black text on green background
     let header_style = Style::default()
-        .fg(theme.header_key_fg)
-        .bg(Color::Green)
+        .fg(theme.header_fg)
+        .bg(theme.header_bg)
         .add_modifier(Modifier::BOLD);
 
-    // Build header with sort indicator
+    // Build header with sort indicator - htop style
     let header_cells: Vec<Span> = SortColumn::all()
         .iter()
         .map(|col| {
@@ -61,93 +63,71 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .map(|(idx, proc)| {
             let is_selected = idx == app.selected_index;
             let is_tagged = app.tagged_pids.contains(&proc.pid);
+            let matches_search = proc.matches_search;
 
-            // Search highlighting
-            let matches_search = !app.search_string.is_empty() && {
-                let search_lower = app.search_string.to_lowercase();
-                proc.name.to_lowercase().contains(&search_lower)
-                    || proc.command.to_lowercase().contains(&search_lower)
-            };
-
-            // Process status color using theme
-            let status_color = theme.status_color(proc.status);
-
-            // CPU color based on usage using theme
-            let cpu_color = theme.cpu_color(proc.cpu_percent);
-
-            // Memory color based on usage using theme
-            let mem_color = theme.mem_color(proc.mem_percent);
-
-            // Tree prefix - use pre-computed tree_prefix for proper tree lines
+            // Tree prefix for tree view
             let tree_prefix = if app.tree_view {
-                // Add collapse/expand indicator for processes with children
                 if proc.has_children {
-                    if proc.is_collapsed {
-                        format!("{}[+]", proc.tree_prefix)
-                    } else {
-                        format!("{}[-]", proc.tree_prefix)
-                    }
-                } else {
-                    proc.tree_prefix.clone()
-                }
-            } else {
-                String::new()
-            };
+                    if proc.is_collapsed { format!("{}[+]", proc.tree_prefix) }
+                    else { format!("{}[-]", proc.tree_prefix) }
+                } else { proc.tree_prefix.clone() }
+            } else { String::new() };
 
-            let command_display = format!("{}{}", tree_prefix, proc.command);
-
-            // Format start time as elapsed time or time of day
-            let start_time_str = format_start_time(proc.start_time);
-
-            let cells = vec![
-                Span::styled(format!("{:>6}", proc.pid), Style::default().fg(Color::Cyan)),
-                Span::styled(format!("{:>6}", proc.parent_pid), Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{:10}", truncate_str(&proc.user, 10)),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(format!("{:>3}", proc.priority), Style::default().fg(Color::White)),
-                Span::styled(format!("{:>3}", proc.nice), Style::default().fg(Color::White)),
-                Span::styled(format!("{:>3}", proc.thread_count), Style::default().fg(Color::White)),
-                Span::styled(
-                    format!("{:>7}", format_bytes(proc.virtual_mem)),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(
-                    format!("{:>7}", format_bytes(proc.resident_mem)),
-                    Style::default().fg(Color::Green),
-                ),
-                Span::styled(
-                    format!("{:>7}", format_bytes(proc.shared_mem)),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(format!("{}", proc.status), Style::default().fg(status_color)),
-                Span::styled(format!("{:>5.1}", proc.cpu_percent), Style::default().fg(cpu_color)),
-                Span::styled(format!("{:>5.1}", proc.mem_percent), Style::default().fg(mem_color)),
-                Span::styled(
-                    format!("{:>9}", proc.format_cpu_time()),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(format!("{:>7}", start_time_str), Style::default().fg(Color::DarkGray)),
-                Span::styled(command_display, Style::default().fg(Color::White)),
+            // Pre-format all cell text once (avoid duplication)
+            let texts: [String; 15] = [
+                if is_selected { format!("▶{:>5}", proc.pid) } else { format!("{:>6}", proc.pid) },
+                format!("{:>6}", proc.parent_pid),
+                format!("{:10}", truncate_str(&proc.user, 10)),
+                format!("{:>3}", proc.priority),
+                format!("{:>3}", proc.nice),
+                format!("{:>3}", proc.thread_count),
+                format!("{:>7}", format_bytes(proc.virtual_mem)),
+                format!("{:>7}", format_bytes(proc.resident_mem)),
+                format!("{:>7}", format_bytes(proc.shared_mem)),
+                format!("{}", proc.status),
+                format!("{:>5.1}", proc.cpu_percent),
+                format!("{:>5.1}", proc.mem_percent),
+                format!("{:>9}", proc.format_cpu_time()),
+                format!("{:>7}", format_start_time(proc.start_time)),
+                format!("{}{}", tree_prefix, proc.command),
             ];
 
-            let mut row_style = Style::default().fg(theme.text);
+            // Build cells - uniform color when selected, varied colors otherwise
+            let cells: Vec<Span> = if is_selected {
+                let s = Style::default().fg(theme.selection_fg);
+                texts.into_iter().map(|t| Span::styled(t, s)).collect()
+            } else {
+                let pri_color = theme.priority_color_for_nice(proc.nice);
+                let cmd_color = if app.tree_view && !tree_prefix.is_empty() { theme.process_tree } else { theme.text };
+                vec![
+                    Span::styled(texts[0].clone(), Style::default().fg(theme.pid_color)),
+                    Span::styled(texts[1].clone(), Style::default().fg(theme.text_dim)),
+                    Span::styled(texts[2].clone(), Style::default().fg(theme.user_color)),
+                    Span::styled(texts[3].clone(), Style::default().fg(pri_color)),
+                    Span::styled(texts[4].clone(), Style::default().fg(pri_color)),
+                    Span::styled(texts[5].clone(), Style::default().fg(theme.threads_color)),
+                    Span::styled(texts[6].clone(), Style::default().fg(theme.memory_size_color(proc.virtual_mem))),
+                    Span::styled(texts[7].clone(), Style::default().fg(theme.memory_size_color(proc.resident_mem))),
+                    Span::styled(texts[8].clone(), Style::default().fg(theme.memory_size_color(proc.shared_mem))),
+                    Span::styled(texts[9].clone(), Style::default().fg(theme.status_color(proc.status))),
+                    Span::styled(texts[10].clone(), Style::default().fg(theme.cpu_color(proc.cpu_percent))),
+                    Span::styled(texts[11].clone(), Style::default().fg(theme.mem_low)),
+                    Span::styled(texts[12].clone(), Style::default().fg(theme.time_color)),
+                    Span::styled(texts[13].clone(), Style::default().fg(theme.text_dim)),
+                    Span::styled(texts[14].clone(), Style::default().fg(cmd_color)),
+                ]
+            };
 
-            if is_selected {
-                row_style = row_style
-                    .bg(theme.selection_bg)
-                    .fg(theme.selection_fg)
-                    .add_modifier(Modifier::BOLD);
-            }
-
-            if is_tagged {
-                row_style = row_style.fg(theme.tagged);
-            }
-
-            if matches_search {
-                row_style = row_style.bg(theme.search_match);
-            }
+            // Row styling - always set background from theme
+            let row_style = if is_selected {
+                Style::default().bg(theme.selection_bg).add_modifier(Modifier::BOLD)
+            } else if matches_search {
+                Style::default().bg(theme.search_match)
+            } else if is_tagged {
+                Style::default().fg(theme.process_tag).bg(theme.background)
+            } else {
+                Style::default().bg(theme.background)
+            };
 
             Row::new(cells).style(row_style)
         })

@@ -113,8 +113,12 @@ pub struct App {
     pub tree_view: bool,
     /// Search string
     pub search_string: String,
+    /// Cached lowercase search string (updated when search_string changes)
+    pub search_string_lower: String,
     /// Filter string
     pub filter_string: String,
+    /// Cached lowercase filter string (updated when filter_string changes)
+    pub filter_string_lower: String,
     /// User filter (show only this user's processes)
     pub user_filter: Option<String>,
     /// PID filter (show only these PIDs) - from CLI -p option
@@ -204,7 +208,9 @@ impl App {
             sort_ascending: false,
             tree_view,
             search_string: String::new(),
+            search_string_lower: String::new(),
             filter_string: String::new(),
+            filter_string_lower: String::new(),
             user_filter: None,
             pid_filter: None,
             tagged_pids: HashSet::new(),
@@ -280,14 +286,12 @@ impl App {
 
     /// Update displayed processes based on filter and sort
     pub fn update_displayed_processes(&mut self) {
-        // Pre-compute lowercase filter string once
-        let filter_lower = if self.filter_string.is_empty() {
-            None
-        } else {
-            Some(self.filter_string.to_lowercase())
-        };
+        // Use cached lowercase filter string
+        let has_filter = !self.filter_string_lower.is_empty();
+        let has_search = !self.search_string_lower.is_empty();
 
         // Filter-then-clone: only clone processes that pass all filters
+        // Also set matches_search flag during this pass to avoid recomputing in render
         let mut processes: Vec<ProcessInfo> = self.processes
             .iter()
             .filter(|p| {
@@ -303,12 +307,12 @@ impl App {
                         return false;
                     }
                 }
-                // Text filter
-                if let Some(ref filter) = filter_lower {
-                    if !(p.name.to_lowercase().contains(filter)
-                        || p.command.to_lowercase().contains(filter)
-                        || p.pid.to_string().contains(filter)
-                        || p.user.to_lowercase().contains(filter))
+                // Text filter - use pre-computed lowercase strings
+                if has_filter {
+                    if !(p.name_lower.contains(&self.filter_string_lower)
+                        || p.command_lower.contains(&self.filter_string_lower)
+                        || p.pid.to_string().contains(&self.filter_string_lower)
+                        || p.user_lower.contains(&self.filter_string_lower))
                     {
                         return false;
                     }
@@ -317,6 +321,18 @@ impl App {
             })
             .cloned()
             .collect();
+
+        // Set matches_search flag on each process (for render-time highlighting)
+        if has_search {
+            for proc in &mut processes {
+                proc.matches_search = proc.name_lower.contains(&self.search_string_lower)
+                    || proc.command_lower.contains(&self.search_string_lower);
+            }
+        } else {
+            for proc in &mut processes {
+                proc.matches_search = false;
+            }
+        }
 
         // Sort processes
         self.sort_processes(&mut processes);
@@ -598,37 +614,40 @@ impl App {
     /// Apply filter from input buffer
     pub fn apply_filter(&mut self) {
         self.filter_string = self.input_buffer.clone();
+        self.filter_string_lower = self.filter_string.to_lowercase();
         self.update_displayed_processes();
     }
 
     /// Apply search from input buffer
     pub fn apply_search(&mut self) {
         self.search_string = self.input_buffer.clone();
-        // Find first matching process
-        if !self.search_string.is_empty() {
-            let search_lower = self.search_string.to_lowercase();
+        self.search_string_lower = self.search_string.to_lowercase();
+        // Find first matching process using pre-computed lowercase strings
+        if !self.search_string_lower.is_empty() {
             if let Some(idx) = self.displayed_processes.iter().position(|p| {
-                p.name.to_lowercase().contains(&search_lower)
-                    || p.command.to_lowercase().contains(&search_lower)
+                p.name_lower.contains(&self.search_string_lower)
+                    || p.command_lower.contains(&self.search_string_lower)
             }) {
                 self.selected_index = idx;
                 self.ensure_visible();
             }
         }
+        // Update matches_search flags for highlighting
+        self.update_displayed_processes();
     }
 
     /// Find next search match
     pub fn find_next(&mut self) {
-        if self.search_string.is_empty() {
+        if self.search_string_lower.is_empty() {
             return;
         }
-        let search_lower = self.search_string.to_lowercase();
         let start = self.selected_index + 1;
         for i in 0..self.displayed_processes.len() {
             let idx = (start + i) % self.displayed_processes.len();
             let p = &self.displayed_processes[idx];
-            if p.name.to_lowercase().contains(&search_lower)
-                || p.command.to_lowercase().contains(&search_lower)
+            // Use pre-computed lowercase strings
+            if p.name_lower.contains(&self.search_string_lower)
+                || p.command_lower.contains(&self.search_string_lower)
             {
                 self.selected_index = idx;
                 self.ensure_visible();
@@ -639,16 +658,16 @@ impl App {
 
     /// Find previous search match
     pub fn find_prev(&mut self) {
-        if self.search_string.is_empty() {
+        if self.search_string_lower.is_empty() {
             return;
         }
-        let search_lower = self.search_string.to_lowercase();
         let start = self.selected_index + self.displayed_processes.len() - 1;
         for i in 0..self.displayed_processes.len() {
             let idx = (start - i) % self.displayed_processes.len();
             let p = &self.displayed_processes[idx];
-            if p.name.to_lowercase().contains(&search_lower)
-                || p.command.to_lowercase().contains(&search_lower)
+            // Use pre-computed lowercase strings
+            if p.name_lower.contains(&self.search_string_lower)
+                || p.command_lower.contains(&self.search_string_lower)
             {
                 self.selected_index = idx;
                 self.ensure_visible();

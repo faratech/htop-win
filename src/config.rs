@@ -163,7 +163,7 @@ impl Config {
     }
 
     /// Save configuration to file
-    pub fn save(&self) -> anyhow::Result<()> {
+    pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(path) = Self::config_path() {
             // Ensure directory exists
             if let Some(parent) = path.parent() {

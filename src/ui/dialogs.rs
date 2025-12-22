@@ -10,22 +10,24 @@ use crate::system::format_bytes;
 use crate::ui::{centered_rect, centered_rect_fixed};
 use crate::ui::colors::ColorScheme;
 
-/// Style for selected item in lists
-fn selected_style() -> Style {
+use crate::ui::colors::Theme;
+
+/// Style for selected item in lists (uses theme colors)
+fn selected_style(theme: &Theme) -> Style {
     Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
+        .fg(theme.selection_fg)
+        .bg(theme.selection_bg)
         .add_modifier(Modifier::BOLD)
 }
 
-/// Style for unselected item in lists
-fn normal_style() -> Style {
-    Style::default().fg(Color::White)
+/// Style for unselected item in lists (uses theme colors)
+fn normal_style(theme: &Theme) -> Style {
+    Style::default().fg(theme.text)
 }
 
 /// Get style based on selection state
-fn item_style(is_selected: bool) -> Style {
-    if is_selected { selected_style() } else { normal_style() }
+fn item_style(is_selected: bool, theme: &Theme) -> Style {
+    if is_selected { selected_style(theme) } else { normal_style(theme) }
 }
 
 /// Windows signal names and values
@@ -210,6 +212,7 @@ pub fn draw_filter(frame: &mut Frame, app: &App) {
 
 /// Draw sort selection dialog
 pub fn draw_sort_select(frame: &mut Frame, app: &App) {
+    let theme = &app.theme;
     let columns = SortColumn::all();
     let area = centered_rect_fixed(30, (columns.len() + 2) as u16, frame.area());
 
@@ -224,17 +227,20 @@ pub fn draw_sort_select(frame: &mut Frame, app: &App) {
             };
 
             ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:<12}{}", col.name(), indicator), item_style(idx == app.sort_select_index)),
+                Span::styled(format!(" {:<12}{}", col.name(), indicator), item_style(idx == app.sort_select_index, theme)),
             ]))
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Sort by ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green)),
-    );
+    let block = Block::default()
+        .title(" Sort by ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .style(Style::default().bg(theme.background));
+
+    let list = List::new(items)
+        .block(block)
+        .style(Style::default().fg(theme.text).bg(theme.background));
 
     frame.render_widget(Clear, area);
     frame.render_widget(list, area);
@@ -312,6 +318,7 @@ pub fn draw_nice(frame: &mut Frame, app: &App) {
 
 /// Draw setup menu
 pub fn draw_setup(frame: &mut Frame, app: &App) {
+    let theme = &app.theme;
     let area = centered_rect(60, 60, frame.area());
 
     // Build setup items with actual config values
@@ -331,18 +338,21 @@ pub fn draw_setup(frame: &mut Frame, app: &App) {
         .enumerate()
         .map(|(idx, (label, value))| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:<30} ", label), item_style(idx == app.setup_selected)),
+                Span::styled(format!(" {:<30} ", label), item_style(idx == app.setup_selected, theme)),
                 Span::styled(value.to_string(), Style::default().fg(Color::Green)),
             ]))
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Setup (Enter to toggle, Esc to close) ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
+    let block = Block::default()
+        .title(" Setup (Enter to toggle, Esc to close) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(theme.background));
+
+    let list = List::new(items)
+        .block(block)
+        .style(Style::default().fg(theme.text).bg(theme.background));
 
     frame.render_widget(Clear, area);
     frame.render_widget(list, area);
@@ -467,13 +477,14 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
 /// Draw signal selection dialog
 pub fn draw_signal_select(frame: &mut Frame, app: &App) {
+    let theme = &app.theme;
     let area = centered_rect_fixed(40, (SIGNALS.len() + 4) as u16, frame.area());
 
     let items: Vec<ListItem> = SIGNALS
         .iter()
         .enumerate()
         .map(|(idx, (num, name, desc))| {
-            let style = item_style(idx == app.signal_select_index);
+            let style = item_style(idx == app.signal_select_index, theme);
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {:2} ", num), style),
                 Span::styled(format!("{:<10}", name), style),
@@ -488,12 +499,15 @@ pub fn draw_signal_select(frame: &mut Frame, app: &App) {
         " Send Signal ".to_string()
     };
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(title)
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Red)),
-    );
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Red))
+        .style(Style::default().bg(theme.background));
+
+    let list = List::new(items)
+        .block(block)
+        .style(Style::default().fg(theme.text).bg(theme.background));
 
     frame.render_widget(Clear, area);
     frame.render_widget(list, area);
@@ -501,6 +515,7 @@ pub fn draw_signal_select(frame: &mut Frame, app: &App) {
 
 /// Draw user selection dialog
 pub fn draw_user_select(frame: &mut Frame, app: &App) {
+    let theme = &app.theme;
     let num_items = app.user_list.len() + 1; // +1 for "All users"
     let area = centered_rect_fixed(35, (num_items + 2).min(20) as u16, frame.area());
 
@@ -509,23 +524,26 @@ pub fn draw_user_select(frame: &mut Frame, app: &App) {
     // "All users" option
     items.push(ListItem::new(Line::from(Span::styled(
         " [All users]",
-        item_style(app.user_select_index == 0),
+        item_style(app.user_select_index == 0, theme),
     ))));
 
     // Individual users
     for (idx, user) in app.user_list.iter().enumerate() {
         items.push(ListItem::new(Line::from(Span::styled(
             format!(" {}", user),
-            item_style(idx + 1 == app.user_select_index),
+            item_style(idx + 1 == app.user_select_index, theme),
         ))));
     }
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Filter by User ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
-    );
+    let block = Block::default()
+        .title(" Filter by User ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(theme.background));
+
+    let list = List::new(items)
+        .block(block)
+        .style(Style::default().fg(theme.text).bg(theme.background));
 
     frame.render_widget(Clear, area);
     frame.render_widget(list, area);
@@ -535,31 +553,17 @@ pub fn draw_user_select(frame: &mut Frame, app: &App) {
 pub fn draw_environment(frame: &mut Frame, app: &App) {
     let area = centered_rect(80, 80, frame.area());
 
-    let content = if let Some(ref proc) = app.process_info_target {
-        format!(
+    let content = app.process_info_target.as_ref()
+        .or_else(|| app.selected_process())
+        .map(|proc| format!(
             "Environment Variables for {} (PID: {})\n\n\
              Note: Environment variables cannot be read from \n\
              other processes on Windows without elevated privileges.\n\n\
              Command line:\n{}\n\n\
              Press Esc to close",
-            proc.name,
-            proc.pid,
-            proc.command
-        )
-    } else if let Some(proc) = app.selected_process() {
-        format!(
-            "Environment Variables for {} (PID: {})\n\n\
-             Note: Environment variables cannot be read from \n\
-             other processes on Windows without elevated privileges.\n\n\
-             Command line:\n{}\n\n\
-             Press Esc to close",
-            proc.name,
-            proc.pid,
-            proc.command
-        )
-    } else {
-        "No process selected".to_string()
-    };
+            proc.name, proc.pid, proc.command
+        ))
+        .unwrap_or_else(|| "No process selected".to_string());
 
     let dialog = Paragraph::new(content)
         .block(
@@ -577,6 +581,7 @@ pub fn draw_environment(frame: &mut Frame, app: &App) {
 
 /// Draw color scheme selection dialog
 pub fn draw_color_scheme(frame: &mut Frame, app: &App) {
+    let theme = &app.theme;
     let schemes = ColorScheme::all();
     let area = centered_rect_fixed(30, (schemes.len() + 2) as u16, frame.area());
 
@@ -586,17 +591,20 @@ pub fn draw_color_scheme(frame: &mut Frame, app: &App) {
         .map(|(idx, scheme)| {
             let indicator = if *scheme == app.config.color_scheme { " ●" } else { "  " };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{} {}", indicator, scheme.name()), item_style(idx == app.color_scheme_index)),
+                Span::styled(format!("{} {}", indicator, scheme.name()), item_style(idx == app.color_scheme_index, theme)),
             ]))
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Color Scheme ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Green)),
-    );
+    let block = Block::default()
+        .title(" Color Scheme ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .style(Style::default().bg(theme.background));
+
+    let list = List::new(items)
+        .block(block)
+        .style(Style::default().fg(theme.text).bg(theme.background));
 
     frame.render_widget(Clear, area);
     frame.render_widget(list, area);
@@ -673,6 +681,7 @@ pub fn draw_command_wrap(frame: &mut Frame, app: &App) {
 
 /// Draw column configuration dialog
 pub fn draw_column_config(frame: &mut Frame, app: &App) {
+    let theme = &app.theme;
     let columns = SortColumn::all();
     let area = centered_rect_fixed(40, (columns.len() + 2) as u16, frame.area());
 
@@ -684,22 +693,25 @@ pub fn draw_column_config(frame: &mut Frame, app: &App) {
             let is_visible = app.config.is_column_visible(col_name);
             let checkbox = if is_visible { "[✓]" } else { "[ ]" };
             let style = if idx == app.column_config_index {
-                selected_style()
+                selected_style(theme)
             } else if is_visible {
-                Style::default().fg(Color::Green)
+                Style::default().fg(Color::Green).bg(theme.background)
             } else {
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(theme.text_dim).bg(theme.background)
             };
             ListItem::new(Line::from(vec![Span::styled(format!("{} {}", checkbox, col_name), style)]))
         })
         .collect();
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Columns (Space to toggle) ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow)),
-    );
+    let block = Block::default()
+        .title(" Columns (Space to toggle) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(theme.background));
+
+    let list = List::new(items)
+        .block(block)
+        .style(Style::default().fg(theme.text).bg(theme.background));
 
     frame.render_widget(Clear, area);
     frame.render_widget(list, area);
@@ -707,6 +719,7 @@ pub fn draw_column_config(frame: &mut Frame, app: &App) {
 
 /// Draw CPU affinity dialog
 pub fn draw_affinity(frame: &mut Frame, app: &App) {
+    let theme = &app.theme;
     let cpu_count = app.system_metrics.cpu.core_usage.len();
     let height = (cpu_count + 4).min(20) as u16;
     let area = centered_rect_fixed(35, height, frame.area());
@@ -717,7 +730,7 @@ pub fn draw_affinity(frame: &mut Frame, app: &App) {
         .unwrap_or_else(|| "Unknown".to_string());
 
     let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(vec![
-        Span::styled(proc_name, Style::default().fg(Color::Cyan)),
+        Span::styled(proc_name, Style::default().fg(theme.meter_label).bg(theme.background)),
     ]))];
 
     items.push(ListItem::new(Line::from("")));
@@ -726,11 +739,11 @@ pub fn draw_affinity(frame: &mut Frame, app: &App) {
         let is_set = (app.affinity_mask & (1u64 << cpu_idx)) != 0;
         let checkbox = if is_set { "[✓]" } else { "[ ]" };
         let style = if cpu_idx == app.affinity_selected {
-            selected_style()
+            selected_style(theme)
         } else if is_set {
-            Style::default().fg(Color::Green)
+            Style::default().fg(Color::Green).bg(theme.background)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(theme.text_dim).bg(theme.background)
         };
         items.push(ListItem::new(Line::from(vec![Span::styled(
             format!("{} CPU {}", checkbox, cpu_idx),
@@ -738,12 +751,15 @@ pub fn draw_affinity(frame: &mut Frame, app: &App) {
         )])));
     }
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(" CPU Affinity ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Magenta)),
-    );
+    let block = Block::default()
+        .title(" CPU Affinity ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta))
+        .style(Style::default().bg(theme.background));
+
+    let list = List::new(items)
+        .block(block)
+        .style(Style::default().fg(theme.text).bg(theme.background));
 
     frame.render_widget(Clear, area);
     frame.render_widget(list, area);

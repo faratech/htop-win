@@ -6,6 +6,8 @@ mod process_list;
 
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
+    style::Style,
+    widgets::Block,
     Frame,
 };
 
@@ -14,6 +16,11 @@ use crate::app::{App, ViewMode};
 /// Draw the entire UI
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
+    let theme = &app.theme;
+
+    // Fill entire screen with theme background color
+    let bg_block = Block::default().style(Style::default().bg(theme.background));
+    frame.render_widget(bg_block, size);
 
     // Main layout: header, process list, footer
     // Header is hidden if app.show_header is false

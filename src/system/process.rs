@@ -1,4 +1,3 @@
-use anyhow::Result;
 use sysinfo::{ProcessStatus, System};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -48,9 +47,18 @@ static SID_CACHE: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(|| {
     Mutex::new(map)
 });
 
-// Cache for PID to username lookups (refreshed each cycle)
+// Cache for PID to username lookups (persists across refreshes)
 #[cfg(windows)]
 static PID_USER_CACHE: LazyLock<Mutex<HashMap<u32, String>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// Cache for thread counts (expensive to compute - only refresh every 2 seconds)
+#[cfg(windows)]
+static THREAD_COUNT_CACHE: LazyLock<Mutex<(std::time::Instant, HashMap<u32, u32>)>> = LazyLock::new(|| {
+    Mutex::new((std::time::Instant::now(), HashMap::new()))
+});
+
+#[cfg(windows)]
+const THREAD_CACHE_DURATION_MS: u128 = 2000; // Refresh thread counts every 2 seconds
 
 /// Get the owner of a process by PID using Windows API
 #[cfg(windows)]
@@ -302,43 +310,56 @@ fn get_process_owner(_pid: u32) -> Option<String> {
     None
 }
 
-/// Get thread counts for all processes in one efficient call
+/// Get thread counts for all processes in one efficient call (cached)
 #[cfg(windows)]
 fn get_all_thread_counts() -> HashMap<u32, u32> {
-    let mut counts: HashMap<u32, u32> = HashMap::new();
+    // Check if we can use cached thread counts
+    if let Ok(mut cache) = THREAD_COUNT_CACHE.lock() {
+        let elapsed = cache.0.elapsed().as_millis();
+        if elapsed < THREAD_CACHE_DURATION_MS && !cache.1.is_empty() {
+            return cache.1.clone();
+        }
 
-    unsafe {
-        // Create a snapshot of all threads in the system
-        if let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) {
-            if snapshot.is_invalid() {
-                return counts;
-            }
+        // Need to refresh - compute new counts
+        let mut counts: HashMap<u32, u32> = HashMap::new();
 
-            let mut entry = THREADENTRY32 {
-                dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-                ..Default::default()
-            };
+        unsafe {
+            // Create a snapshot of all threads in the system
+            if let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) {
+                if !snapshot.is_invalid() {
+                    let mut entry = THREADENTRY32 {
+                        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+                        ..Default::default()
+                    };
 
-            // Get the first thread
-            if Thread32First(snapshot, &mut entry).is_ok() {
-                loop {
-                    // Increment count for this process
-                    *counts.entry(entry.th32OwnerProcessID).or_insert(0) += 1;
+                    // Get the first thread
+                    if Thread32First(snapshot, &mut entry).is_ok() {
+                        loop {
+                            // Increment count for this process
+                            *counts.entry(entry.th32OwnerProcessID).or_insert(0) += 1;
 
-                    // Reset dwSize before next call
-                    entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+                            // Reset dwSize before next call
+                            entry.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
 
-                    if Thread32Next(snapshot, &mut entry).is_err() {
-                        break;
+                            if Thread32Next(snapshot, &mut entry).is_err() {
+                                break;
+                            }
+                        }
                     }
+
+                    let _ = CloseHandle(snapshot);
                 }
             }
-
-            let _ = CloseHandle(snapshot);
         }
-    }
 
-    counts
+        // Update cache
+        cache.0 = std::time::Instant::now();
+        cache.1 = counts.clone();
+        counts
+    } else {
+        // Fallback if lock fails
+        HashMap::new()
+    }
 }
 
 #[cfg(not(windows))]
@@ -456,17 +477,21 @@ pub struct ProcessInfo {
     pub handle_count: u32,     // Number of handles (Windows)
     pub io_read_bytes: u64,    // I/O bytes read
     pub io_write_bytes: u64,   // I/O bytes written
+    // Pre-computed lowercase strings for efficient filtering (avoid per-filter allocations)
+    pub name_lower: String,
+    pub command_lower: String,
+    pub user_lower: String,
+    // Pre-computed search match flag (set during filtering, used in rendering)
+    pub matches_search: bool,
 }
 
 impl ProcessInfo {
     pub fn from_sysinfo(sys: &System) -> Vec<ProcessInfo> {
         let total_mem = sys.total_memory();
 
-        // Clear the PID user cache on each refresh
-        #[cfg(windows)]
-        if let Ok(mut cache) = PID_USER_CACHE.lock() {
-            cache.clear();
-        }
+        // Note: We intentionally don't clear PID_USER_CACHE every refresh.
+        // The cache grows but user lookups are expensive Windows API calls.
+        // Stale entries (from reused PIDs) are rare and only affect display.
 
         // Get thread counts for all processes in one efficient call
         let thread_counts = get_all_thread_counts();
@@ -527,10 +552,17 @@ impl ProcessInfo {
                 // Get priority, nice, and CPU time in one optimized call
                 let win_info = get_win_process_info(pid_u32);
 
+                let name = proc.name().to_string_lossy().to_string();
+
+                // Pre-compute lowercase strings once at creation time
+                let name_lower = name.to_lowercase();
+                let command_lower = command.to_lowercase();
+                let user_lower = user.to_lowercase();
+
                 ProcessInfo {
                     pid: pid_u32,
                     parent_pid,
-                    name: proc.name().to_string_lossy().to_string(),
+                    name,
                     exe_path,
                     command,
                     user,
@@ -553,6 +585,11 @@ impl ProcessInfo {
                     handle_count: win_info.handle_count,
                     io_read_bytes: win_info.io_read_bytes,
                     io_write_bytes: win_info.io_write_bytes,
+                    // Pre-computed for efficient filtering
+                    name_lower,
+                    command_lower,
+                    user_lower,
+                    matches_search: false,  // Set during filtering
                 }
             })
             .collect()
@@ -576,25 +613,25 @@ impl ProcessInfo {
 
 /// Kill a process by PID
 #[cfg(windows)]
-pub fn kill_process(pid: u32, _signal: u32) -> Result<()> {
+pub fn kill_process(pid: u32, _signal: u32) -> Result<(), String> {
     unsafe {
         let handle = OpenProcess(PROCESS_TERMINATE, false, pid)
-            .map_err(|e| anyhow::anyhow!("Cannot open process: {}", e))?;
+            .map_err(|e| format!("Cannot open process: {}", e))?;
 
         if handle.is_invalid() {
-            anyhow::bail!("Cannot open process {} (access denied or not found)", pid);
+            return Err(format!("Cannot open process {} (access denied or not found)", pid));
         }
 
         let result = TerminateProcess(handle, 1);
         let _ = CloseHandle(handle);
 
-        result.map_err(|e| anyhow::anyhow!("Cannot terminate: {}", e))?;
+        result.map_err(|e| format!("Cannot terminate: {}", e))?;
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
-pub fn kill_process(pid: u32, signal: u32) -> Result<()> {
+pub fn kill_process(pid: u32, signal: u32) -> Result<(), String> {
     use std::process::Command;
     let sig = match signal {
         9 => "KILL",
@@ -603,19 +640,20 @@ pub fn kill_process(pid: u32, signal: u32) -> Result<()> {
     };
     Command::new("kill")
         .args(["-s", sig, &pid.to_string()])
-        .output()?;
+        .output()
+        .map_err(|e| format!("Failed to kill process: {}", e))?;
     Ok(())
 }
 
 /// Set process priority (nice value)
 #[cfg(windows)]
-pub fn set_priority(pid: u32, nice: i32) -> Result<()> {
+pub fn set_priority(pid: u32, nice: i32) -> Result<(), String> {
     unsafe {
         let handle = OpenProcess(PROCESS_SET_INFORMATION, false, pid)
-            .map_err(|e| anyhow::anyhow!("Cannot open process: {}", e))?;
+            .map_err(|e| format!("Cannot open process: {}", e))?;
 
         if handle.is_invalid() {
-            anyhow::bail!("Cannot open process {} (access denied)", pid);
+            return Err(format!("Cannot open process {} (access denied)", pid));
         }
 
         // Map nice value to Windows priority class
@@ -636,64 +674,67 @@ pub fn set_priority(pid: u32, nice: i32) -> Result<()> {
         let result = SetPriorityClass(handle, priority_class);
         let _ = CloseHandle(handle);
 
-        result.map_err(|e| anyhow::anyhow!("Cannot set priority: {}", e))?;
+        result.map_err(|e| format!("Cannot set priority: {}", e))?;
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
-pub fn set_priority(pid: u32, nice: i32) -> Result<()> {
+pub fn set_priority(pid: u32, nice: i32) -> Result<(), String> {
     use std::process::Command;
     Command::new("renice")
         .args([&nice.to_string(), "-p", &pid.to_string()])
-        .output()?;
+        .output()
+        .map_err(|e| format!("Failed to set priority: {}", e))?;
     Ok(())
 }
 
 /// Get process CPU affinity mask
 #[cfg(windows)]
-pub fn get_process_affinity(pid: u32) -> Result<u64> {
+pub fn get_process_affinity(pid: u32) -> Result<u64, String> {
     use windows::Win32::System::Threading::{
         GetProcessAffinityMask, OpenProcess, PROCESS_QUERY_INFORMATION,
     };
     use windows::Win32::Foundation::CloseHandle;
 
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid)?;
+        let handle = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid)
+            .map_err(|e| format!("Cannot open process: {}", e))?;
         let mut process_mask: usize = 0;
         let mut system_mask: usize = 0;
         let result = GetProcessAffinityMask(handle, &mut process_mask, &mut system_mask);
         let _ = CloseHandle(handle);
-        result?;
+        result.map_err(|e| format!("Cannot get affinity: {}", e))?;
         Ok(process_mask as u64)
     }
 }
 
 #[cfg(not(windows))]
-pub fn get_process_affinity(_pid: u32) -> Result<u64> {
+pub fn get_process_affinity(_pid: u32) -> Result<u64, String> {
     // Not implemented for non-Windows
     Ok(u64::MAX)
 }
 
 /// Set process CPU affinity mask
 #[cfg(windows)]
-pub fn set_process_affinity(pid: u32, mask: u64) -> Result<()> {
+pub fn set_process_affinity(pid: u32, mask: u64) -> Result<(), String> {
     use windows::Win32::System::Threading::{
         OpenProcess, SetProcessAffinityMask, PROCESS_SET_INFORMATION,
     };
     use windows::Win32::Foundation::CloseHandle;
 
     unsafe {
-        let handle = OpenProcess(PROCESS_SET_INFORMATION, false, pid)?;
+        let handle = OpenProcess(PROCESS_SET_INFORMATION, false, pid)
+            .map_err(|e| format!("Cannot open process: {}", e))?;
         let result = SetProcessAffinityMask(handle, mask as usize);
         let _ = CloseHandle(handle);
-        result?;
+        result.map_err(|e| format!("Cannot set affinity: {}", e))?;
         Ok(())
     }
 }
 
 #[cfg(not(windows))]
-pub fn set_process_affinity(_pid: u32, _mask: u64) -> Result<()> {
+pub fn set_process_affinity(_pid: u32, _mask: u64) -> Result<(), String> {
     // Not implemented for non-Windows
     Ok(())
 }

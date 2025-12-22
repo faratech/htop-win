@@ -10,28 +10,34 @@ use crate::app::{App, ViewMode};
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let function_keys = get_function_keys(app);
+    let theme = &app.theme;
 
+    // htop style: F1Help  F2Setup (key is black on cyan, label is white, no space between)
     let spans: Vec<Span> = function_keys
         .iter()
         .flat_map(|(key, label)| {
-            vec![
-                Span::styled(
-                    format!("{}", key),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{} ", label),
-                    Style::default().fg(Color::White),
-                ),
-            ]
+            if key.is_empty() {
+                // Empty key/label pair - just add spacing
+                vec![Span::styled("       ", Style::default().bg(theme.background))]
+            } else {
+                vec![
+                    Span::styled(
+                        key.to_string(),
+                        Style::default()
+                            .fg(theme.header_key_fg)
+                            .bg(theme.header_key_bg),
+                    ),
+                    Span::styled(
+                        format!("{:<6}", label), // htop uses fixed-width labels with trailing space
+                        Style::default().fg(theme.text).bg(theme.background),
+                    ),
+                ]
+            }
         })
         .collect();
 
     let line = Line::from(spans);
-    let paragraph = Paragraph::new(line);
+    let paragraph = Paragraph::new(line).style(Style::default().bg(theme.background));
     frame.render_widget(paragraph, area);
 
     // Second line: filter/search status
@@ -39,7 +45,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         let status_area = Rect::new(area.x, area.y + 1, area.width, 1);
         let status_spans = build_status_line(app);
         let status_line = Line::from(status_spans);
-        let status_para = Paragraph::new(status_line);
+        let status_para = Paragraph::new(status_line).style(Style::default().bg(theme.background));
         frame.render_widget(status_para, status_area);
     }
 }

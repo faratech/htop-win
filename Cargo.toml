@@ -13,11 +13,10 @@ categories = ["command-line-utilities", "os::windows-apis"]
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = "0.28"  # Match ratatui's crossterm version
 sysinfo = { version = "0.37", features = ["disk", "network"] }
-anyhow = "1"
 unicode-width = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-clap = { version = "4", features = ["derive"] }
+lexopt = "0.3"  # Lightweight arg parsing (replaces clap ~300KB savings)
 directories = "5"
 
 [target.'cfg(windows)'.dependencies]
@@ -28,7 +27,7 @@ windows = { version = "0.61", features = [  # Match sysinfo's windows version
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_System_Power",
-    "Win32_NetworkManagement_IpHelper",
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 [profile.release]

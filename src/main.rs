@@ -7,8 +7,6 @@ mod ui;
 use std::io;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
-use clap::Parser;
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
@@ -19,61 +17,125 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use app::App;
 use config::Config;
 
-/// htop-win: Interactive process viewer for Windows
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+/// Command-line arguments (parsed with lightweight lexopt)
+#[derive(Debug, Default)]
 struct Args {
-    /// Refresh rate in milliseconds (default: 1000)
-    #[arg(short = 'd', long = "delay", value_name = "MS")]
     delay: Option<u64>,
-
-    /// Show only processes owned by the specified user
-    #[arg(short, long, value_name = "USER")]
     user: Option<String>,
-
-    /// Start in tree view mode
-    #[arg(short, long)]
     tree: bool,
-
-    /// Initial sort column (pid, cpu, mem, time, command)
-    #[arg(short, long, value_name = "COLUMN")]
     sort: Option<String>,
-
-    /// Disable mouse support
-    #[arg(long = "no-mouse")]
     no_mouse: bool,
-
-    /// Use monochrome (no colors)
-    #[arg(long = "no-color")]
     no_color: bool,
-
-    /// Show only specific PIDs (comma-separated)
-    #[arg(short = 'p', long = "pid", value_name = "PID", value_delimiter = ',')]
     pids: Option<Vec<u32>>,
-
-    /// Initial filter string
-    #[arg(short = 'F', long = "filter", value_name = "FILTER")]
     filter: Option<String>,
-
-    /// Exit after N updates
-    #[arg(short = 'n', long = "max-iterations", value_name = "N")]
     max_iterations: Option<u64>,
-
-    /// Hide header meters
-    #[arg(long = "no-meters")]
     no_meters: bool,
-
-    /// Readonly mode (disable kill/nice)
-    #[arg(long = "readonly")]
     readonly: bool,
-
-    /// Highlight process changes with delay in seconds
-    #[arg(short = 'H', long = "highlight-changes", value_name = "DELAY")]
     highlight_changes: Option<u64>,
+    help: bool,
+    version: bool,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+fn parse_args() -> Result<Args, lexopt::Error> {
+    use lexopt::prelude::*;
+
+    let mut args = Args::default();
+    let mut parser = lexopt::Parser::from_env();
+
+    while let Some(arg) = parser.next()? {
+        match arg {
+            Short('d') | Long("delay") => {
+                args.delay = Some(parser.value()?.parse()?);
+            }
+            Short('u') | Long("user") => {
+                args.user = Some(parser.value()?.parse()?);
+            }
+            Short('t') | Long("tree") => {
+                args.tree = true;
+            }
+            Short('s') | Long("sort") => {
+                args.sort = Some(parser.value()?.parse()?);
+            }
+            Long("no-mouse") => {
+                args.no_mouse = true;
+            }
+            Long("no-color") => {
+                args.no_color = true;
+            }
+            Short('p') | Long("pid") => {
+                let val: String = parser.value()?.parse()?;
+                let pids: Vec<u32> = val
+                    .split(',')
+                    .filter_map(|s| s.trim().parse().ok())
+                    .collect();
+                args.pids = Some(pids);
+            }
+            Short('F') | Long("filter") => {
+                args.filter = Some(parser.value()?.parse()?);
+            }
+            Short('n') | Long("max-iterations") => {
+                args.max_iterations = Some(parser.value()?.parse()?);
+            }
+            Long("no-meters") => {
+                args.no_meters = true;
+            }
+            Long("readonly") => {
+                args.readonly = true;
+            }
+            Short('H') | Long("highlight-changes") => {
+                args.highlight_changes = Some(parser.value()?.parse()?);
+            }
+            Short('h') | Long("help") => {
+                args.help = true;
+            }
+            Short('V') | Long("version") => {
+                args.version = true;
+            }
+            _ => return Err(arg.unexpected()),
+        }
+    }
+    Ok(args)
+}
+
+fn print_help() {
+    println!("htop-win {}", env!("CARGO_PKG_VERSION"));
+    println!("Interactive process viewer for Windows\n");
+    println!("USAGE: htop-win [OPTIONS]\n");
+    println!("OPTIONS:");
+    println!("  -d, --delay <MS>             Refresh rate in milliseconds (default: 1000)");
+    println!("  -u, --user <USER>            Show only processes owned by USER");
+    println!("  -t, --tree                   Start in tree view mode");
+    println!("  -s, --sort <COLUMN>          Sort by: pid, cpu, mem, time, command, user");
+    println!("      --no-mouse               Disable mouse support");
+    println!("      --no-color               Use monochrome mode");
+    println!("  -p, --pid <PID,...>          Show only specific PIDs (comma-separated)");
+    println!("  -F, --filter <FILTER>        Initial filter string");
+    println!("  -n, --max-iterations <N>     Exit after N updates");
+    println!("      --no-meters              Hide header meters");
+    println!("      --readonly               Disable kill/nice operations");
+    println!("  -H, --highlight-changes <S>  Highlight process changes (seconds)");
+    println!("  -h, --help                   Print help");
+    println!("  -V, --version                Print version");
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = match parse_args() {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if args.help {
+        print_help();
+        return Ok(());
+    }
+
+    if args.version {
+        println!("htop-win {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
     // Setup terminal
     enable_raw_mode()?;
@@ -137,6 +199,7 @@ fn main() -> Result<()> {
     // Apply filter from CLI
     if let Some(ref filter) = args.filter {
         app.filter_string = filter.clone();
+        app.filter_string_lower = filter.to_lowercase();
     }
 
     // Apply PID filter from CLI
@@ -180,7 +243,7 @@ fn run_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     _config: &Config,
-) -> Result<()> {
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_tick = Instant::now();
 
     loop {

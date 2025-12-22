@@ -21,8 +21,10 @@ pub fn calculate_header_height(app: &App) -> u16 {
 }
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
     let block = Block::default()
-        .borders(Borders::NONE);
+        .borders(Borders::NONE)
+        .style(Style::default().bg(theme.background));
 
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -127,22 +129,25 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
     let usage_clamped = usage.clamp(0.0, 100.0);
     let theme = &app.theme;
 
-    // Color based on usage
+    // Color based on usage - htop uses green for user CPU (normal)
+    // For now we use threshold-based coloring since we don't have per-mode CPU breakdown
     let bar_color = theme.cpu_color(usage_clamped);
 
-    // Create the bar characters manually for htop-style look
-    let bar_width = area.width.saturating_sub(10) as usize;
-    let filled = (usage_clamped as usize * bar_width / 100).min(bar_width);
+    // htop format: "  N[||||...     XX.X%]"
+    // Label is 4 chars (2 for number + "["), percentage is 6 chars (5.1f + "]")
+    let bar_width = area.width.saturating_sub(11) as usize; // 4 label + 7 percent = 11
+    let filled = ((usage_clamped as usize) * bar_width / 100).min(bar_width);
     let empty = bar_width - filled;
 
     let bar_filled: String = "|".repeat(filled);
     let bar_empty: String = " ".repeat(empty);
 
-    let label = format!("{:3}[", cpu_idx);
+    // htop uses right-aligned 2-char CPU number
+    let label = format!("{:>2}[", cpu_idx);
     let percent = format!("{:5.1}%]", usage_clamped);
 
     let line = Line::from(vec![
-        Span::styled(label, Style::default().fg(theme.label)),
+        Span::styled(label, Style::default().fg(theme.meter_label)),
         Span::styled(bar_filled, Style::default().fg(bar_color)),
         Span::raw(bar_empty),
         Span::styled(percent, Style::default().fg(theme.text)),
@@ -157,29 +162,24 @@ fn draw_memory_bar(frame: &mut Frame, app: &App, area: Rect) {
     let usage = mem.used_percent.clamp(0.0, 100.0);
     let theme = &app.theme;
 
-    let bar_width = area.width.saturating_sub(18) as usize;
-    let filled = (usage as usize * bar_width / 100).min(bar_width);
+    // htop format: "Mem[||||...    X.XXG/X.XXG]"
+    let mem_info = format!("{}/{}", format_bytes(mem.used), format_bytes(mem.total));
+    let info_len = mem_info.len() + 1; // +1 for the closing bracket
+    let bar_width = area.width.saturating_sub(4 + info_len as u16) as usize; // 4 for "Mem["
+    let filled = ((usage as usize) * bar_width / 100).min(bar_width);
     let empty = bar_width - filled;
 
     let bar_filled: String = "|".repeat(filled);
     let bar_empty: String = " ".repeat(empty);
 
-    let label = "Mem[";
-    let mem_info = format!(
-        "{:5.1}%] {}/{}",
-        usage,
-        format_bytes(mem.used),
-        format_bytes(mem.total)
-    );
-
-    // Use theme color for memory bar
-    let bar_color = theme.mem_color(usage);
+    // Use theme color for memory bar (htop uses green for used memory)
+    let bar_color = theme.memory_used;
 
     let line = Line::from(vec![
-        Span::styled(label, Style::default().fg(theme.label)),
+        Span::styled("Mem[", Style::default().fg(theme.meter_label)),
         Span::styled(bar_filled, Style::default().fg(bar_color)),
         Span::raw(bar_empty),
-        Span::styled(mem_info, Style::default().fg(theme.text)),
+        Span::styled(format!("{}]", mem_info), Style::default().fg(theme.text)),
     ]);
 
     let paragraph = Paragraph::new(line);
@@ -191,29 +191,24 @@ fn draw_swap_bar(frame: &mut Frame, app: &App, area: Rect) {
     let usage = mem.swap_percent.clamp(0.0, 100.0);
     let theme = &app.theme;
 
-    let bar_width = area.width.saturating_sub(18) as usize;
-    let filled = (usage as usize * bar_width / 100).min(bar_width);
+    // htop format: "Swp[||||...    X.XXG/X.XXG]"
+    let swap_info = format!("{}/{}", format_bytes(mem.swap_used), format_bytes(mem.swap_total));
+    let info_len = swap_info.len() + 1; // +1 for the closing bracket
+    let bar_width = area.width.saturating_sub(4 + info_len as u16) as usize; // 4 for "Swp["
+    let filled = ((usage as usize) * bar_width / 100).min(bar_width);
     let empty = bar_width - filled;
 
     let bar_filled: String = "|".repeat(filled);
     let bar_empty: String = " ".repeat(empty);
 
-    let label = "Swp[";
-    let swap_info = format!(
-        "{:5.1}%] {}/{}",
-        usage,
-        format_bytes(mem.swap_used),
-        format_bytes(mem.swap_total)
-    );
-
-    // Use theme color for swap bar
-    let bar_color = theme.swap_color(usage);
+    // Use theme color for swap bar (htop uses red for swap)
+    let bar_color = theme.swap;
 
     let line = Line::from(vec![
-        Span::styled(label, Style::default().fg(theme.label)),
+        Span::styled("Swp[", Style::default().fg(theme.meter_label)),
         Span::styled(bar_filled, Style::default().fg(bar_color)),
         Span::raw(bar_empty),
-        Span::styled(swap_info, Style::default().fg(theme.text)),
+        Span::styled(format!("{}]", swap_info), Style::default().fg(theme.text)),
     ]);
 
     let paragraph = Paragraph::new(line);
@@ -224,17 +219,27 @@ fn draw_tasks_info(frame: &mut Frame, app: &App, area: Rect) {
     let metrics = &app.system_metrics;
     let theme = &app.theme;
 
+    // htop format: "Tasks: N, M thr; K running"
+    // Count total threads from all processes
+    let total_threads: u32 = app.processes.iter().map(|p| p.thread_count).sum();
+
     let line = Line::from(vec![
-        Span::styled("Tasks: ", Style::default().fg(theme.label)),
+        Span::styled("Tasks: ", Style::default().fg(theme.meter_label)),
         Span::styled(
             format!("{}", metrics.tasks_total),
             Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
-        Span::raw(", "),
+        Span::styled(", ", Style::default().fg(theme.text)),
         Span::styled(
-            format!("{} running", metrics.tasks_running),
-            Style::default().fg(theme.status_running),
+            format!("{}", total_threads),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         ),
+        Span::styled(" thr; ", Style::default().fg(theme.text)),
+        Span::styled(
+            format!("{}", metrics.tasks_running),
+            Style::default().fg(theme.status_running).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" running", Style::default().fg(theme.status_running)),
     ]);
 
     let paragraph = Paragraph::new(line);
@@ -247,40 +252,33 @@ fn draw_uptime_info(frame: &mut Frame, app: &App, area: Rect) {
     let days = uptime / 86400;
     let hours = (uptime % 86400) / 3600;
     let mins = (uptime % 3600) / 60;
+    let secs = uptime % 60;
 
+    // htop format: "Uptime: HH:MM:SS" or "D day(s), HH:MM:SS"
     let uptime_str = if days > 0 {
-        format!("{}d {:02}:{:02}", days, hours, mins)
+        let day_word = if days == 1 { "day" } else { "days" };
+        format!("{} {}, {:02}:{:02}:{:02}", days, day_word, hours, mins, secs)
     } else {
-        format!("{:02}:{:02}:{:02}", hours, mins, uptime % 60)
+        format!("{:02}:{:02}:{:02}", hours, mins, secs)
     };
 
-    // Calculate load average (simulated on Windows)
-    // Using running tasks / CPU count as an approximation
-    let cpu_count = app.system_metrics.cpu.core_usage.len().max(1);
-    let running = app.system_metrics.tasks_running;
-    let load = running as f32 / cpu_count as f32;
-
-    // Get current time
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // Simple time formatting (UTC-based, will be local on most systems)
-    let secs_in_day = now % 86400;
-    let clock_hours = secs_in_day / 3600;
-    let clock_mins = (secs_in_day % 3600) / 60;
-    let clock_secs = secs_in_day % 60;
-    let clock_str = format!("{:02}:{:02}:{:02}", clock_hours, clock_mins, clock_secs);
+    // Calculate overall CPU percentage
+    let core_usage = &app.system_metrics.cpu.core_usage;
+    let cpu_percent: f32 = if core_usage.is_empty() {
+        0.0
+    } else {
+        core_usage.iter().sum::<f32>() / core_usage.len() as f32
+    };
 
     let line = Line::from(vec![
-        Span::styled("Load: ", Style::default().fg(theme.label)),
-        Span::styled(format!("{:.2}", load), Style::default().fg(theme.text)),
+        Span::styled("CPU: ", Style::default().fg(theme.meter_label)),
+        Span::styled(
+            format!("{:5.1}%", cpu_percent),
+            Style::default().fg(theme.cpu_color(cpu_percent)),
+        ),
         Span::raw("  "),
-        Span::styled("Uptime: ", Style::default().fg(theme.label)),
+        Span::styled("Uptime: ", Style::default().fg(theme.meter_label)),
         Span::styled(uptime_str, Style::default().fg(theme.text)),
-        Span::raw("  "),
-        Span::styled(clock_str, Style::default().fg(theme.text_dim)),
     ]);
 
     let paragraph = Paragraph::new(line);
