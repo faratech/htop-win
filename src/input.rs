@@ -439,12 +439,15 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
             // Toggle selected setting or open submenu
             match app.setup_selected {
                 0 => {
-                    // Cycle refresh rate: 500 -> 1000 -> 2000 -> 5000 -> 500
+                    // Cycle refresh rate: 100 -> 250 -> 500 -> 1000 -> 1500 -> 2000 -> 5000 -> 100
                     app.config.refresh_rate_ms = match app.config.refresh_rate_ms {
+                        100 => 250,
+                        250 => 500,
                         500 => 1000,
-                        1000 => 2000,
+                        1000 => 1500,
+                        1500 => 2000,
                         2000 => 5000,
-                        _ => 500,
+                        _ => 100,
                     };
                 }
                 1 => {
@@ -490,16 +493,22 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     // Adjust refresh rate
                     if key.code == KeyCode::Right {
                         app.config.refresh_rate_ms = match app.config.refresh_rate_ms {
+                            100 => 250,
+                            250 => 500,
                             500 => 1000,
-                            1000 => 2000,
+                            1000 => 1500,
+                            1500 => 2000,
                             2000 => 5000,
-                            _ => 500,
+                            _ => 100,
                         };
                     } else {
                         app.config.refresh_rate_ms = match app.config.refresh_rate_ms {
                             5000 => 2000,
-                            2000 => 1000,
+                            2000 => 1500,
+                            1500 => 1000,
                             1000 => 500,
+                            500 => 250,
+                            250 => 100,
                             _ => 5000,
                         };
                     }

@@ -82,7 +82,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            refresh_rate_ms: 1000,
+            refresh_rate_ms: 1500,  // htop default: 15 tenths of a second
             tree_view_default: false,
             color_scheme: ColorScheme::Default,
 
@@ -203,7 +203,7 @@ mod tests {
     #[test]
     fn test_default_config() {
         let config = Config::default();
-        assert_eq!(config.refresh_rate_ms, 1000);
+        assert_eq!(config.refresh_rate_ms, 1500);
         assert!(!config.tree_view_default);
         assert!(config.show_cpu_meters);
     }
