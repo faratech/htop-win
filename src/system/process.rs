@@ -2,7 +2,6 @@ use std::collections::HashMap;
 #[cfg(windows)]
 use std::sync::RwLock;
 use std::time::Duration;
-use rayon::prelude::*;
 
 #[cfg(windows)]
 use super::native::{NativeProcessInfo, filetime_to_unix, priority_to_nice};
@@ -365,10 +364,9 @@ struct EnrichedProcessData {
 /// Set fetch_exe_path=true only when show_program_path setting is enabled
 #[cfg(windows)]
 pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
-    use rayon::prelude::*;
     use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
 
-    // Pre-read caches to avoid lock contention in parallel loop
+    // Pre-read caches to minimize lock contention
     let static_cache_snapshot: HashMap<u32, (bool, ProcessArch, String)> = STATIC_PROCESS_INFO_CACHE
         .read()
         .map(|c| c.clone())
@@ -386,9 +384,9 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
         .unwrap_or_default();
     let now = std::time::Instant::now();
 
-    // Query data in parallel
+    // Query data sequentially - parallel overhead exceeds benefit for this workload
     let enriched_data: Vec<EnrichedProcessData> = processes
-        .par_iter()
+        .iter()
         .map(|p| {
             let pid = p.pid;
             if pid == 0 || pid == 4 {
@@ -759,8 +757,10 @@ impl ProcessInfo {
             }
         }
 
+        // Use sequential iteration - the per-item work (cache reads, struct creation) is too
+        // lightweight for parallelization to help
         native_procs
-            .par_iter()
+            .iter()
             .map(|proc| {
                 let pid = proc.pid;
 
