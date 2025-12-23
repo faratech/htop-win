@@ -7,7 +7,74 @@ use ratatui::{
 };
 
 use crate::app::{App, SortColumn};
-use crate::system::format_bytes;
+use crate::ui::colors::Theme;
+
+/// Format bytes with multi-colored output like htop's Row_printKBytes
+/// Returns spans with different colors for different magnitude parts
+fn format_bytes_colored<'a>(bytes: u64, theme: &Theme, is_selected: bool) -> Vec<Span<'a>> {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    const TB: u64 = GB * 1024;
+
+    // htop color scheme:
+    // - Default: PROCESS (white)
+    // - MB range: PROCESS_MEGABYTES (cyan)
+    // - GB range: PROCESS_GIGABYTES (green)
+    // - TB+ range: LARGE_NUMBER (red)
+    let (color_default, color_mb, color_gb, color_tb) = if is_selected {
+        (theme.selection_fg, theme.selection_fg, theme.selection_fg, theme.selection_fg)
+    } else {
+        (theme.process, theme.process_megabytes, theme.process_gigabytes, theme.large_number)
+    };
+
+    if bytes >= TB {
+        // TB range: show in red/large_number color
+        let tb = bytes as f64 / TB as f64;
+        if tb < 10.0 {
+            vec![
+                Span::styled(format!("{:.1}", tb), Style::default().fg(color_tb)),
+                Span::styled("T".to_string(), Style::default().fg(color_tb)),
+            ]
+        } else {
+            vec![Span::styled(format!("{:.0}T", tb), Style::default().fg(color_tb))]
+        }
+    } else if bytes >= GB {
+        // GB range: integer part in green, decimal in cyan
+        let gb = bytes as f64 / GB as f64;
+        if gb < 10.0 {
+            let int_part = gb as u64;
+            let dec_part = ((gb - int_part as f64) * 10.0) as u64;
+            vec![
+                Span::styled(format!("{}", int_part), Style::default().fg(color_gb)),
+                Span::styled(format!(".{}G", dec_part), Style::default().fg(color_mb)),
+            ]
+        } else {
+            vec![
+                Span::styled(format!("{:.0}", gb), Style::default().fg(color_gb)),
+                Span::styled("G".to_string(), Style::default().fg(color_mb)),
+            ]
+        }
+    } else if bytes >= MB {
+        // MB range: show in cyan
+        let mb = bytes as f64 / MB as f64;
+        if mb < 10.0 {
+            let int_part = mb as u64;
+            let dec_part = ((mb - int_part as f64) * 10.0) as u64;
+            vec![
+                Span::styled(format!("{}", int_part), Style::default().fg(color_mb)),
+                Span::styled(format!(".{}M", dec_part), Style::default().fg(color_default)),
+            ]
+        } else {
+            vec![Span::styled(format!("{:.0}M", mb), Style::default().fg(color_mb))]
+        }
+    } else if bytes >= KB {
+        // KB range: show in default
+        vec![Span::styled(format!("{:.0}K", bytes as f64 / KB as f64), Style::default().fg(color_default))]
+    } else {
+        vec![Span::styled(format!("{}B", bytes), Style::default().fg(color_default))]
+    }
+}
 
 /// Get column width constraint for a given column
 fn column_width(col: &SortColumn) -> Constraint {
@@ -197,22 +264,32 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             format!("{:>3}", proc.nice),
                             if is_selected { theme.selection_fg } else { theme.priority_color_for_nice(proc.nice) }
                         ),
-                        SortColumn::Threads => (
-                            format!("{:>3}", proc.thread_count),
-                            if is_selected { theme.selection_fg } else { theme.threads_color }
-                        ),
-                        SortColumn::Virt => (
-                            format!("{:>7}", format_bytes(proc.virtual_mem)),
-                            if is_selected { theme.selection_fg } else { theme.memory_size_color(proc.virtual_mem) }
-                        ),
-                        SortColumn::Res => (
-                            format!("{:>7}", format_bytes(proc.resident_mem)),
-                            if is_selected { theme.selection_fg } else { theme.memory_size_color(proc.resident_mem) }
-                        ),
-                        SortColumn::Shr => (
-                            format!("{:>7}", format_bytes(proc.shared_mem)),
-                            if is_selected { theme.selection_fg } else { theme.memory_size_color(proc.shared_mem) }
-                        ),
+                        SortColumn::Threads => {
+                            // htop: If nlwp == 1, use PROCESS_SHADOW (dimmed)
+                            let color = if is_selected {
+                                theme.selection_fg
+                            } else if proc.thread_count == 1 {
+                                theme.process_shadow
+                            } else {
+                                theme.threads_color
+                            };
+                            (format!("{:>3}", proc.thread_count), color)
+                        }
+                        SortColumn::Virt => {
+                            // htop: Multi-colored memory values
+                            let spans = format_bytes_colored(proc.virtual_mem, theme, is_selected);
+                            return Cell::from(Line::from(spans));
+                        }
+                        SortColumn::Res => {
+                            // htop: Multi-colored memory values
+                            let spans = format_bytes_colored(proc.resident_mem, theme, is_selected);
+                            return Cell::from(Line::from(spans));
+                        }
+                        SortColumn::Shr => {
+                            // htop: Multi-colored memory values
+                            let spans = format_bytes_colored(proc.shared_mem, theme, is_selected);
+                            return Cell::from(Line::from(spans));
+                        }
                         SortColumn::Status => {
                             // Show status char + leaf emoji for efficiency mode
                             // htop: Running processes are green and bold
@@ -226,14 +303,32 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                                 if is_selected { theme.selection_fg } else { theme.status_color(proc.status) }
                             )
                         }
-                        SortColumn::Cpu => (
-                            format!("{:>5.1}", proc.cpu_percent),
-                            if is_selected { theme.selection_fg } else { theme.cpu_color(proc.cpu_percent) }
-                        ),
-                        SortColumn::Mem => (
-                            format!("{:>5.1}", proc.mem_percent),
-                            if is_selected { theme.selection_fg } else { theme.mem_color(proc.mem_percent) }
-                        ),
+                        SortColumn::Cpu => {
+                            // htop Row_printPercentage: < 0.05 → shadow, >= 99.9 → megabytes
+                            let color = if is_selected {
+                                theme.selection_fg
+                            } else if proc.cpu_percent < 0.05 {
+                                theme.process_shadow
+                            } else if proc.cpu_percent >= 99.9 {
+                                theme.process_megabytes
+                            } else {
+                                theme.cpu_color(proc.cpu_percent)
+                            };
+                            (format!("{:>5.1}", proc.cpu_percent), color)
+                        }
+                        SortColumn::Mem => {
+                            // htop Row_printPercentage: < 0.05 → shadow, >= 99.9 → megabytes
+                            let color = if is_selected {
+                                theme.selection_fg
+                            } else if proc.mem_percent < 0.05 {
+                                theme.process_shadow
+                            } else if proc.mem_percent >= 99.9 {
+                                theme.process_megabytes
+                            } else {
+                                theme.mem_color(proc.mem_percent)
+                            };
+                            (format!("{:>5.1}", proc.mem_percent), color)
+                        }
                         SortColumn::Time => (
                             format!("{:>9}", proc.format_cpu_time()),
                             if is_selected { theme.selection_fg } else { theme.time_color }

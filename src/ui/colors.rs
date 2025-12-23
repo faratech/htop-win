@@ -892,6 +892,7 @@ impl Theme {
     }
 
     /// Get color for memory size display (htop uses different colors for MB vs GB)
+    #[allow(dead_code)]
     pub fn memory_size_color(&self, bytes: u64) -> Color {
         if bytes >= 1_073_741_824 {
             // >= 1GB
