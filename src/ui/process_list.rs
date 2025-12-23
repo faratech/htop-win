@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Rect},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Row, Table},
     Frame,
@@ -15,14 +15,17 @@ use crate::ui::colors::Theme;
 /// - Hours: hours in cyan, rest in base
 /// - Days: days in green, hours in cyan
 /// - Years: years in red, days in green
-fn format_time_colored<'a>(duration: std::time::Duration, theme: &Theme, is_selected: bool) -> Vec<Span<'a>> {
+/// When highlight_large_numbers is false, uses default color for everything (except shadow for zero)
+fn format_time_colored<'a>(duration: std::time::Duration, theme: &Theme, is_selected: bool, highlight_large_numbers: bool) -> Vec<Span<'a>> {
     let total_secs = duration.as_secs();
     let centis = duration.subsec_millis() / 10;
 
     let (base, hour_color, day_color, year_color, shadow) = if is_selected {
         (theme.selection_fg, theme.selection_fg, theme.selection_fg, theme.selection_fg, theme.selection_fg)
-    } else {
+    } else if highlight_large_numbers {
         (theme.process, theme.process_megabytes, theme.process_gigabytes, theme.large_number, theme.process_shadow)
+    } else {
+        (theme.process, theme.process, theme.process, theme.process, theme.process_shadow)
     };
 
     // Zero time - show in shadow
@@ -66,21 +69,24 @@ fn format_time_colored<'a>(duration: std::time::Duration, theme: &Theme, is_sele
 
 /// Format bytes with multi-colored output like htop's Row_printKBytes
 /// Returns spans with different colors for different magnitude parts
-fn format_bytes_colored<'a>(bytes: u64, theme: &Theme, is_selected: bool) -> Vec<Span<'a>> {
+/// When highlight_large_numbers is false, uses default color for everything
+fn format_bytes_colored<'a>(bytes: u64, theme: &Theme, is_selected: bool, highlight_large_numbers: bool) -> Vec<Span<'a>> {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
     const TB: u64 = GB * 1024;
 
-    // htop color scheme:
+    // htop color scheme (when highlight_large_numbers is enabled):
     // - Default: PROCESS (white)
     // - MB range: PROCESS_MEGABYTES (cyan)
     // - GB range: PROCESS_GIGABYTES (green)
     // - TB+ range: LARGE_NUMBER (red)
     let (color_default, color_mb, color_gb, color_tb) = if is_selected {
         (theme.selection_fg, theme.selection_fg, theme.selection_fg, theme.selection_fg)
-    } else {
+    } else if highlight_large_numbers {
         (theme.process, theme.process_megabytes, theme.process_gigabytes, theme.large_number)
+    } else {
+        (theme.process, theme.process, theme.process, theme.process)
     };
 
     if bytes >= TB {
@@ -129,6 +135,31 @@ fn format_bytes_colored<'a>(bytes: u64, theme: &Theme, is_selected: bool) -> Vec
     } else {
         vec![Span::styled(format!("{}B", bytes), Style::default().fg(color_default))]
     }
+}
+
+/// Check if path starts with a common Windows system path prefix
+/// Returns the length of the prefix if found, or 0 if not a system path
+/// Like htop's shadowDistPathPrefix feature for /usr/bin/, /lib/, etc.
+fn get_shadow_prefix_len(path: &str) -> usize {
+    // Case-insensitive check for common Windows system paths
+    let path_lower = path.to_lowercase();
+
+    // Check common Windows system path prefixes (order matters - check longer prefixes first)
+    const SHADOW_PREFIXES: &[&str] = &[
+        "c:\\windows\\system32\\",
+        "c:\\windows\\syswow64\\",
+        "c:\\windows\\",
+        "c:\\program files (x86)\\",
+        "c:\\program files\\",
+        "c:\\programdata\\",
+    ];
+
+    for prefix in SHADOW_PREFIXES {
+        if path_lower.starts_with(prefix) {
+            return prefix.len();
+        }
+    }
+    0
 }
 
 /// Get column width constraint for a given column
@@ -254,35 +285,88 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             ));
                         }
 
-                        // htop style: path in dim color, basename in bold/bright color
-                        if app.config.show_program_path {
-                            // Split into path and basename
-                            if let Some(last_sep) = display_command.rfind(|c| c == '\\' || c == '/') {
-                                let path = &display_command[..=last_sep];
-                                let basename = &display_command[last_sep + 1..];
-                                // Path in dimmer color
+                        // htop style command coloring:
+                        // 1. Shadow common system path prefixes (grey) - like htop's shadowDistPathPrefix
+                        // 2. If highlight_basename: path in PROCESS (white), basename in PROCESS_BASENAME (bold cyan)
+                        // 3. If !highlight_basename: everything in PROCESS (white)
+                        // 4. Bold red for updated/deleted executables (FAILED_READ) overrides above
+
+                        // Check for shadow path prefix (C:\Windows\, C:\Program Files\, etc.)
+                        let shadow_prefix_len = if app.config.show_program_path {
+                            get_shadow_prefix_len(display_command)
+                        } else {
+                            0
+                        };
+
+                        // Find basename position (after last path separator)
+                        let basename_start = display_command.rfind(|c| c == '\\' || c == '/')
+                            .map(|i| i + 1)
+                            .unwrap_or(0);
+
+                        // Determine colors based on state
+                        let is_deleted_or_updated = proc.exe_updated || proc.exe_deleted;
+
+                        if app.config.show_program_path && basename_start > 0 {
+                            // Showing full path - split into parts
+                            let path_end = basename_start;
+
+                            // Part 1: Shadow prefix (if any) in grey
+                            if shadow_prefix_len > 0 && shadow_prefix_len <= path_end {
                                 spans.push(Span::styled(
-                                    path.to_string(),
-                                    Style::default().fg(if is_selected { theme.selection_fg } else { theme.text_dim })
+                                    display_command[..shadow_prefix_len].to_string(),
+                                    Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_shadow })
                                 ));
-                                // Basename in bright color (htop: PROCESS_BASENAME = bold cyan)
-                                spans.push(Span::styled(
-                                    basename.to_string(),
-                                    Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_basename }).add_modifier(Modifier::BOLD)
-                                ));
+                                // Part 2: Rest of path (after shadow, before basename) in normal color
+                                if shadow_prefix_len < path_end {
+                                    spans.push(Span::styled(
+                                        display_command[shadow_prefix_len..path_end].to_string(),
+                                        Style::default().fg(if is_selected { theme.selection_fg } else { theme.process })
+                                    ));
+                                }
                             } else {
-                                // No path separator, just show as basename
+                                // No shadow prefix, just path in normal color
                                 spans.push(Span::styled(
-                                    display_command.to_string(),
-                                    Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_basename }).add_modifier(Modifier::BOLD)
+                                    display_command[..path_end].to_string(),
+                                    Style::default().fg(if is_selected { theme.selection_fg } else { theme.process })
                                 ));
                             }
+
+                            // Part 3: Basename - color depends on state and highlight_basename setting
+                            let basename = &display_command[basename_start..];
+                            let (basename_color, basename_bold) = if is_selected {
+                                (theme.selection_fg, false)
+                            } else if is_deleted_or_updated {
+                                (theme.failed_read, true)  // htop: FAILED_READ = A_BOLD | Red
+                            } else if app.config.highlight_basename {
+                                (theme.process_basename, true)  // htop: PROCESS_BASENAME = A_BOLD | Cyan
+                            } else {
+                                (theme.process, false)  // htop default: PROCESS = A_NORMAL
+                            };
+
+                            let basename_style = if basename_bold {
+                                Style::default().fg(basename_color).add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(basename_color)
+                            };
+                            spans.push(Span::styled(basename.to_string(), basename_style));
                         } else {
-                            // Just show name (already is the basename)
-                            spans.push(Span::styled(
-                                display_command.to_string(),
-                                Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_basename }).add_modifier(Modifier::BOLD)
-                            ));
+                            // Not showing path, or no path separator - show as single span
+                            let (color, bold) = if is_selected {
+                                (theme.selection_fg, false)
+                            } else if is_deleted_or_updated {
+                                (theme.failed_read, true)
+                            } else if app.config.highlight_basename {
+                                (theme.process_basename, true)
+                            } else {
+                                (theme.process, false)
+                            };
+
+                            let style = if bold {
+                                Style::default().fg(color).add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(color)
+                            };
+                            spans.push(Span::styled(display_command.to_string(), style));
                         }
 
                         return Cell::from(Line::from(spans));
@@ -340,18 +424,18 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             (format!("{:>3}", proc.thread_count), color)
                         }
                         SortColumn::Virt => {
-                            // htop: Multi-colored memory values
-                            let spans = format_bytes_colored(proc.virtual_mem, theme, is_selected);
+                            // htop: Multi-colored memory values (when highlight_large_numbers enabled)
+                            let spans = format_bytes_colored(proc.virtual_mem, theme, is_selected, app.config.highlight_large_numbers);
                             return Cell::from(Line::from(spans));
                         }
                         SortColumn::Res => {
-                            // htop: Multi-colored memory values
-                            let spans = format_bytes_colored(proc.resident_mem, theme, is_selected);
+                            // htop: Multi-colored memory values (when highlight_large_numbers enabled)
+                            let spans = format_bytes_colored(proc.resident_mem, theme, is_selected, app.config.highlight_large_numbers);
                             return Cell::from(Line::from(spans));
                         }
                         SortColumn::Shr => {
-                            // htop: Multi-colored memory values
-                            let spans = format_bytes_colored(proc.shared_mem, theme, is_selected);
+                            // htop: Multi-colored memory values (when highlight_large_numbers enabled)
+                            let spans = format_bytes_colored(proc.shared_mem, theme, is_selected, app.config.highlight_large_numbers);
                             return Cell::from(Line::from(spans));
                         }
                         SortColumn::Status => {
@@ -368,10 +452,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             )
                         }
                         SortColumn::Cpu => {
-                            // htop Row_printPercentage: default color, only >= 99.9% is cyan
+                            // htop Row_printPercentage: default color, >= 99.9% is cyan (when highlight_large_numbers)
                             let color = if is_selected {
                                 theme.selection_fg
-                            } else if proc.cpu_percent >= 99.9 {
+                            } else if app.config.highlight_large_numbers && proc.cpu_percent >= 99.9 {
                                 theme.process_megabytes
                             } else {
                                 theme.process  // htop uses default/white for normal values
@@ -379,10 +463,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             (format!("{:>5.1}", proc.cpu_percent), color)
                         }
                         SortColumn::Mem => {
-                            // htop Row_printPercentage: default color, only >= 99.9% is cyan
+                            // htop Row_printPercentage: default color, >= 99.9% is cyan (when highlight_large_numbers)
                             let color = if is_selected {
                                 theme.selection_fg
-                            } else if proc.mem_percent >= 99.9 {
+                            } else if app.config.highlight_large_numbers && proc.mem_percent >= 99.9 {
                                 theme.process_megabytes
                             } else {
                                 theme.process  // htop uses default/white for normal values
@@ -390,8 +474,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             (format!("{:>5.1}", proc.mem_percent), color)
                         }
                         SortColumn::Time => {
-                            // htop: Multi-colored time display
-                            let spans = format_time_colored(proc.cpu_time, theme, is_selected);
+                            // htop: Multi-colored time display (when highlight_large_numbers enabled)
+                            let spans = format_time_colored(proc.cpu_time, theme, is_selected, app.config.highlight_large_numbers);
                             return Cell::from(Line::from(spans));
                         }
                         SortColumn::StartTime => (
@@ -436,8 +520,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 })
                 .collect();
 
+            // Check if process is "new" (started within highlight_duration)
+            // htop: PROCESS_NEW = ColorPair(Black, Green) - black text on green background
+            let highlight_duration_secs = app.config.highlight_duration_ms / 1000;
+            let is_new_process = app.config.highlight_new_processes
+                && proc.start_time > 0
+                && now_secs.saturating_sub(proc.start_time) < highlight_duration_secs;
+
             // Row styling - always set background from theme
             // htop uses A_BOLD for selected and tagged processes
+            // Priority: selected > search match > tagged > new process > normal
             let row_style = if is_selected {
                 Style::default().bg(theme.selection_bg).add_modifier(Modifier::BOLD)
             } else if matches_search {
@@ -445,6 +537,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             } else if is_tagged {
                 // htop: PROCESS_TAG = A_BOLD | ColorPair(Yellow, Black)
                 Style::default().fg(theme.process_tag).bg(theme.background).add_modifier(Modifier::BOLD)
+            } else if is_new_process {
+                // htop: PROCESS_NEW = ColorPair(Black, Green) - black text on green bg
+                Style::default().fg(Color::Black).bg(theme.new_process)
             } else {
                 Style::default().bg(theme.background)
             };

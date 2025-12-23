@@ -93,7 +93,7 @@ impl Default for Config {
             highlight_large_numbers: true,
             highlight_new_processes: true,
             highlight_duration_ms: 3000,
-            highlight_basename: true,
+            highlight_basename: false,  // htop default: highlightBaseName = false
 
             show_cpu_meters: true,
             show_memory_meter: true,

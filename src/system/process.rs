@@ -83,6 +83,42 @@ pub fn enable_debug_privilege() -> bool {
     false
 }
 
+/// Check if an executable has been modified or deleted since a process started.
+/// Returns (exe_updated, exe_deleted) like htop's red basename highlighting.
+/// - exe_updated: true if file's mtime is newer than process start time
+/// - exe_deleted: true if file no longer exists at the path
+#[cfg(windows)]
+fn check_exe_status(exe_path: &str, start_time: u64) -> (bool, bool) {
+    use std::fs;
+    use std::time::UNIX_EPOCH;
+
+    if exe_path.is_empty() {
+        return (false, false);
+    }
+
+    match fs::metadata(exe_path) {
+        Ok(metadata) => {
+            // File exists, check if modified after process started
+            let exe_updated = metadata
+                .modified()
+                .ok()
+                .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+                .map(|mtime_unix| mtime_unix.as_secs() > start_time)
+                .unwrap_or(false);
+            (exe_updated, false)
+        }
+        Err(_) => {
+            // File doesn't exist (or can't be accessed) - mark as deleted
+            (false, true)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn check_exe_status(_exe_path: &str, _start_time: u64) -> (bool, bool) {
+    (false, false)
+}
+
 // Cache for PID to username lookups (persists across refreshes)
 #[cfg(windows)]
 static PID_USER_CACHE: LazyLock<RwLock<HashMap<u32, String>>> =
@@ -719,6 +755,10 @@ pub struct ProcessInfo {
     pub is_elevated: bool,
     // Process architecture (x86/x64/ARM64)
     pub arch: ProcessArch,
+    // Executable was modified after process started (like htop's red basename)
+    pub exe_updated: bool,
+    // Executable no longer exists at the original path
+    pub exe_deleted: bool,
 }
 
 impl ProcessInfo {
@@ -841,6 +881,9 @@ impl ProcessInfo {
                     (String::new(), proc.name.clone(), proc.name.to_lowercase())
                 };
 
+                // Check if executable was modified or deleted (htop-style red highlighting)
+                let (exe_updated, exe_deleted) = check_exe_status(&exe_path, start_time);
+
                 // Pre-compute lowercase strings for filtering
                 let name_lower = proc.name.to_lowercase();
                 let user_lower = user.to_lowercase();
@@ -877,6 +920,8 @@ impl ProcessInfo {
                     efficiency_mode,
                     is_elevated,
                     arch,
+                    exe_updated,
+                    exe_deleted,
                 }
             })
             .collect()

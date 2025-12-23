@@ -394,7 +394,7 @@ impl Theme {
 
             // Highlight colors
             tagged: Color::Yellow,
-            new_process: Color::Green,
+            new_process: Color::LightGreen,  // Brighter green for better contrast
             dying_process: Color::Red,
             basename_highlight: Color::Cyan,
         }
