@@ -10,54 +10,63 @@ use crate::app::{App, SortColumn};
 use crate::ui::colors::Theme;
 
 /// Format CPU time with multi-colored output like htop's Row_printTime
-/// - 0:00.00 = shadow (gray)
-/// - < 60 min: base color
-/// - Hours: hours in cyan, rest in base
-/// - Days: days in green, hours in cyan
-/// - Years: years in red, days in green
-/// When highlight_large_numbers is false, uses default color for everything (except shadow for zero)
+/// Optimized: returns single span when colors are uniform (selected or !highlight_large_numbers)
+#[inline]
 fn format_time_colored<'a>(duration: std::time::Duration, theme: &Theme, is_selected: bool, highlight_large_numbers: bool) -> Vec<Span<'a>> {
     let total_secs = duration.as_secs();
     let centis = duration.subsec_millis() / 10;
 
-    let (base, hour_color, day_color, year_color, shadow) = if is_selected {
-        (theme.selection_fg, theme.selection_fg, theme.selection_fg, theme.selection_fg, theme.selection_fg)
-    } else if highlight_large_numbers {
-        (theme.process, theme.process_megabytes, theme.process_gigabytes, theme.large_number, theme.process_shadow)
-    } else {
-        (theme.process, theme.process, theme.process, theme.process, theme.process_shadow)
-    };
-
-    // Zero time - show in shadow
+    // Zero time - always show in shadow
     if total_secs == 0 && centis == 0 {
+        let shadow = if is_selected { theme.selection_fg } else { theme.process_shadow };
         return vec![Span::styled(" 0:00.00 ".to_string(), Style::default().fg(shadow))];
     }
 
     let total_mins = total_secs / 60;
     let total_hours = total_mins / 60;
     let total_days = total_hours / 24;
-
     let secs = total_secs % 60;
     let mins = total_mins % 60;
     let hours = total_hours % 24;
 
+    // Fast path: uniform color (selected or no highlighting)
+    let use_uniform = is_selected || !highlight_large_numbers;
+    let base_color = if is_selected { theme.selection_fg } else { theme.process };
+
+    if use_uniform {
+        // Single span - no multi-color needed
+        let text = if total_mins < 60 {
+            format!("{:2}:{:02}.{:02}", total_mins, secs, centis)
+        } else if total_hours < 24 {
+            format!("{:2}h{:02}:{:02}", total_hours, mins, secs)
+        } else if total_days < 365 {
+            format!("{:3}d{:02}h", total_days, hours)
+        } else {
+            let years = total_days / 365;
+            let days = total_days % 365;
+            format!("{:3}y{:03}d", years, days)
+        };
+        return vec![Span::styled(text, Style::default().fg(base_color))];
+    }
+
+    // Multi-color path (highlight_large_numbers enabled, not selected)
+    let hour_color = theme.process_megabytes;
+    let day_color = theme.process_gigabytes;
+    let year_color = theme.large_number;
+
     if total_mins < 60 {
-        // Minutes:seconds.centis
-        vec![Span::styled(format!("{:2}:{:02}.{:02}", total_mins, secs, centis), Style::default().fg(base))]
+        vec![Span::styled(format!("{:2}:{:02}.{:02}", total_mins, secs, centis), Style::default().fg(base_color))]
     } else if total_hours < 24 {
-        // Hours in cyan, rest in base: Xh:MM:SS
         vec![
             Span::styled(format!("{:2}h", total_hours), Style::default().fg(hour_color)),
-            Span::styled(format!("{:02}:{:02}", mins, secs), Style::default().fg(base)),
+            Span::styled(format!("{:02}:{:02}", mins, secs), Style::default().fg(base_color)),
         ]
     } else if total_days < 365 {
-        // Days in green, hours in cyan: Xd:XXh
         vec![
             Span::styled(format!("{:3}d", total_days), Style::default().fg(day_color)),
             Span::styled(format!("{:02}h", hours), Style::default().fg(hour_color)),
         ]
     } else {
-        // Years in red, days in green
         let years = total_days / 365;
         let days = total_days % 365;
         vec![
@@ -68,40 +77,41 @@ fn format_time_colored<'a>(duration: std::time::Duration, theme: &Theme, is_sele
 }
 
 /// Format bytes with multi-colored output like htop's Row_printKBytes
-/// Returns spans with different colors for different magnitude parts
-/// When highlight_large_numbers is false, uses default color for everything
+/// Optimized: returns single span when colors are uniform (selected or !highlight_large_numbers)
+#[inline]
 fn format_bytes_colored<'a>(bytes: u64, theme: &Theme, is_selected: bool, highlight_large_numbers: bool) -> Vec<Span<'a>> {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
     const TB: u64 = GB * 1024;
 
-    // htop color scheme (when highlight_large_numbers is enabled):
-    // - Default: PROCESS (white)
-    // - MB range: PROCESS_MEGABYTES (cyan)
-    // - GB range: PROCESS_GIGABYTES (green)
-    // - TB+ range: LARGE_NUMBER (red)
-    let (color_default, color_mb, color_gb, color_tb) = if is_selected {
-        (theme.selection_fg, theme.selection_fg, theme.selection_fg, theme.selection_fg)
-    } else if highlight_large_numbers {
-        (theme.process, theme.process_megabytes, theme.process_gigabytes, theme.large_number)
-    } else {
-        (theme.process, theme.process, theme.process, theme.process)
-    };
+    let base_color = if is_selected { theme.selection_fg } else { theme.process };
+
+    // Fast path: uniform color (selected or no highlighting)
+    if is_selected || !highlight_large_numbers {
+        let text = if bytes >= TB {
+            format!("{:.1}T", bytes as f64 / TB as f64)
+        } else if bytes >= GB {
+            format!("{:.1}G", bytes as f64 / GB as f64)
+        } else if bytes >= MB {
+            format!("{:.0}M", bytes as f64 / MB as f64)
+        } else if bytes >= KB {
+            format!("{:.0}K", bytes as f64 / KB as f64)
+        } else {
+            format!("{}B", bytes)
+        };
+        return vec![Span::styled(text, Style::default().fg(base_color))];
+    }
+
+    // Multi-color path (highlight_large_numbers enabled, not selected)
+    let color_mb = theme.process_megabytes;
+    let color_gb = theme.process_gigabytes;
+    let color_tb = theme.large_number;
 
     if bytes >= TB {
-        // TB range: show in red/large_number color
         let tb = bytes as f64 / TB as f64;
-        if tb < 10.0 {
-            vec![
-                Span::styled(format!("{:.1}", tb), Style::default().fg(color_tb)),
-                Span::styled("T".to_string(), Style::default().fg(color_tb)),
-            ]
-        } else {
-            vec![Span::styled(format!("{:.0}T", tb), Style::default().fg(color_tb))]
-        }
+        vec![Span::styled(format!("{:.1}T", tb), Style::default().fg(color_tb))]
     } else if bytes >= GB {
-        // GB range: integer part in green, decimal in cyan
         let gb = bytes as f64 / GB as f64;
         if gb < 10.0 {
             let int_part = gb as u64;
@@ -117,45 +127,46 @@ fn format_bytes_colored<'a>(bytes: u64, theme: &Theme, is_selected: bool, highli
             ]
         }
     } else if bytes >= MB {
-        // MB range: show in cyan
         let mb = bytes as f64 / MB as f64;
         if mb < 10.0 {
             let int_part = mb as u64;
             let dec_part = ((mb - int_part as f64) * 10.0) as u64;
             vec![
                 Span::styled(format!("{}", int_part), Style::default().fg(color_mb)),
-                Span::styled(format!(".{}M", dec_part), Style::default().fg(color_default)),
+                Span::styled(format!(".{}M", dec_part), Style::default().fg(base_color)),
             ]
         } else {
             vec![Span::styled(format!("{:.0}M", mb), Style::default().fg(color_mb))]
         }
     } else if bytes >= KB {
-        // KB range: show in default
-        vec![Span::styled(format!("{:.0}K", bytes as f64 / KB as f64), Style::default().fg(color_default))]
+        vec![Span::styled(format!("{:.0}K", bytes as f64 / KB as f64), Style::default().fg(base_color))]
     } else {
-        vec![Span::styled(format!("{}B", bytes), Style::default().fg(color_default))]
+        vec![Span::styled(format!("{}B", bytes), Style::default().fg(base_color))]
     }
 }
 
 /// Check if path starts with a common Windows system path prefix
 /// Returns the length of the prefix if found, or 0 if not a system path
 /// Like htop's shadowDistPathPrefix feature for /usr/bin/, /lib/, etc.
+/// Optimized: uses case-insensitive byte comparison without allocation
+#[inline]
 fn get_shadow_prefix_len(path: &str) -> usize {
-    // Case-insensitive check for common Windows system paths
-    let path_lower = path.to_lowercase();
-
-    // Check common Windows system path prefixes (order matters - check longer prefixes first)
-    const SHADOW_PREFIXES: &[&str] = &[
-        "c:\\windows\\system32\\",
-        "c:\\windows\\syswow64\\",
-        "c:\\windows\\",
-        "c:\\program files (x86)\\",
-        "c:\\program files\\",
-        "c:\\programdata\\",
+    // Check common Windows system path prefixes (order: longer prefixes first)
+    // Using byte-level case-insensitive comparison to avoid allocation
+    const SHADOW_PREFIXES: &[&[u8]] = &[
+        b"c:\\windows\\system32\\",
+        b"c:\\windows\\syswow64\\",
+        b"c:\\windows\\",
+        b"c:\\program files (x86)\\",
+        b"c:\\program files\\",
+        b"c:\\programdata\\",
     ];
 
+    let path_bytes = path.as_bytes();
     for prefix in SHADOW_PREFIXES {
-        if path_lower.starts_with(prefix) {
+        if path_bytes.len() >= prefix.len()
+            && path_bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
+        {
             return prefix.len();
         }
     }

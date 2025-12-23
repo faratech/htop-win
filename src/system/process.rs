@@ -83,10 +83,19 @@ pub fn enable_debug_privilege() -> bool {
     false
 }
 
+/// Cache for exe status checks to avoid filesystem calls on every refresh
+/// Key: (exe_path, start_time), Value: (exe_updated, exe_deleted, check_timestamp)
+#[cfg(windows)]
+static EXE_STATUS_CACHE: LazyLock<RwLock<HashMap<(String, u64), (bool, bool, u64)>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// How often to re-check exe status (in seconds) - filesystem check is expensive
+#[cfg(windows)]
+const EXE_STATUS_CHECK_INTERVAL: u64 = 10;
+
 /// Check if an executable has been modified or deleted since a process started.
 /// Returns (exe_updated, exe_deleted) like htop's red basename highlighting.
-/// - exe_updated: true if file's mtime is newer than process start time
-/// - exe_deleted: true if file no longer exists at the path
+/// Cached to avoid expensive filesystem calls on every refresh.
 #[cfg(windows)]
 fn check_exe_status(exe_path: &str, start_time: u64) -> (bool, bool) {
     use std::fs;
@@ -96,9 +105,24 @@ fn check_exe_status(exe_path: &str, start_time: u64) -> (bool, bool) {
         return (false, false);
     }
 
-    match fs::metadata(exe_path) {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // Check cache first
+    let cache_key = (exe_path.to_string(), start_time);
+    if let Ok(cache) = EXE_STATUS_CACHE.read() {
+        if let Some(&(updated, deleted, check_time)) = cache.get(&cache_key) {
+            if now.saturating_sub(check_time) < EXE_STATUS_CHECK_INTERVAL {
+                return (updated, deleted);
+            }
+        }
+    }
+
+    // Cache miss or stale - do the actual check
+    let result = match fs::metadata(exe_path) {
         Ok(metadata) => {
-            // File exists, check if modified after process started
             let exe_updated = metadata
                 .modified()
                 .ok()
@@ -107,11 +131,19 @@ fn check_exe_status(exe_path: &str, start_time: u64) -> (bool, bool) {
                 .unwrap_or(false);
             (exe_updated, false)
         }
-        Err(_) => {
-            // File doesn't exist (or can't be accessed) - mark as deleted
-            (false, true)
+        Err(_) => (false, true),
+    };
+
+    // Update cache (with size limit to prevent unbounded growth)
+    if let Ok(mut cache) = EXE_STATUS_CACHE.write() {
+        // Clear cache if it grows too large (stale entries from terminated processes)
+        if cache.len() > 1000 {
+            cache.clear();
         }
+        cache.insert(cache_key, (result.0, result.1, now));
     }
+
+    result
 }
 
 #[cfg(not(windows))]
