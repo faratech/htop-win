@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
     Frame,
@@ -177,11 +177,11 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
         MeterMode::Text => {
             // Text mode: just show "N: XX.X%"
             Line::from(vec![
-                Span::styled(label, Style::default().fg(theme.meter_label)),
+                Span::styled(label, Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
                 Span::styled(": ", Style::default().fg(theme.text)),
                 Span::styled(
                     format!("{:5.1}%", usage_clamped),
-                    Style::default().fg(theme.cpu_color(usage_clamped)),
+                    Style::default().fg(theme.cpu_color(usage_clamped)).add_modifier(Modifier::BOLD),
                 ),
             ])
         }
@@ -197,13 +197,14 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
             };
 
             Line::from(vec![
-                Span::styled(format!("{}[", label), Style::default().fg(theme.meter_label)),
-                Span::styled(graph_str, Style::default().fg(theme.cpu_color(usage_clamped))),
+                Span::styled(format!("{}[", label), Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+                Span::styled(graph_str, Style::default().fg(theme.cpu_color(usage_clamped)).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("{:5.1}%]", usage_clamped), Style::default().fg(theme.text)),
             ])
         }
         MeterMode::Bar | MeterMode::Hidden => {
-            // Bar mode (default): multi-segment bar with user/system breakdown
+            // Bar mode (default): multi-segment bar with user/system breakdown (htop style)
+            // htop uses: nice(blue) + user(green) + system(red) + iowait(gray)
             let bar_width = area.width.saturating_sub(11) as usize;
             let percent = format!("{:5.1}%]", usage_clamped);
 
@@ -215,29 +216,42 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
                 .copied();
 
             if let Some(bd) = breakdown {
+                // Calculate widths for each segment
                 let user_pct = bd.user.clamp(0.0, 100.0);
                 let system_pct = bd.system.clamp(0.0, 100.0);
+                let idle_pct = bd.idle.clamp(0.0, 100.0);
 
-                let user_width = ((user_pct as usize) * bar_width / 100).min(bar_width);
-                let system_width = ((system_pct as usize) * bar_width / 100).min(bar_width - user_width);
-                let empty_width = bar_width.saturating_sub(user_width + system_width);
+                // htop draws in order: nice, normal(user), system, iowait, irq, softirq, steal, guest
+                // We have user and system, with remaining being "other" or idle
+                let user_width = ((user_pct * bar_width as f32 / 100.0) as usize).min(bar_width);
+                let system_width = ((system_pct * bar_width as f32 / 100.0) as usize).min(bar_width.saturating_sub(user_width));
+                // iowait/other shows as gray - estimated from non-idle, non-user, non-system
+                let other_pct = (100.0 - user_pct - system_pct - idle_pct).max(0.0);
+                let other_width = ((other_pct * bar_width as f32 / 100.0) as usize).min(bar_width.saturating_sub(user_width + system_width));
+                let empty_width = bar_width.saturating_sub(user_width + system_width + other_width);
 
                 Line::from(vec![
-                    Span::styled(format!("{}[", label), Style::default().fg(theme.meter_label)),
+                    Span::styled(format!("{}[", label), Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+                    // User time - green (htop: CPU_NORMAL)
                     Span::styled(bar_fill(user_width), Style::default().fg(theme.cpu_normal)),
+                    // System/kernel time - red (htop: CPU_SYSTEM)
                     Span::styled(bar_fill(system_width), Style::default().fg(theme.cpu_system)),
-                    Span::raw(bar_empty(empty_width)),
+                    // IO wait/other - gray (htop: CPU_IOWAIT)
+                    Span::styled(bar_fill(other_width), Style::default().fg(theme.cpu_iowait)),
+                    // Empty space
+                    Span::styled(bar_empty(empty_width), Style::default().fg(theme.meter_shadow)),
                     Span::styled(percent, Style::default().fg(theme.text)),
                 ])
             } else {
+                // Fallback: single color bar based on usage threshold
                 let bar_color = theme.cpu_color(usage_clamped);
                 let filled = ((usage_clamped as usize) * bar_width / 100).min(bar_width);
                 let empty = bar_width - filled;
 
                 Line::from(vec![
-                    Span::styled(format!("{}[", label), Style::default().fg(theme.meter_label)),
+                    Span::styled(format!("{}[", label), Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
                     Span::styled(bar_fill(filled), Style::default().fg(bar_color)),
-                    Span::raw(bar_empty(empty)),
+                    Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
                     Span::styled(percent, Style::default().fg(theme.text)),
                 ])
             }
@@ -306,16 +320,18 @@ fn draw_memory_bar(frame: &mut Frame, app: &App, area: Rect) {
     let mem = &app.system_metrics.memory;
     let usage = mem.used_percent.clamp(0.0, 100.0);
     let theme = &app.theme;
-    let mem_info = format!("{}/{}", format_bytes(mem.used), format_bytes(mem.total));
+    // htop shows "used + shared + compressed" in the info text (line 53-57 of MemoryMeter.c)
+    let total_used = mem.used + mem.shared + mem.buffers;
+    let mem_info = format!("{}/{}", format_bytes(total_used), format_bytes(mem.total));
 
     let line = match mode {
         MeterMode::Text => {
             // Text mode: just show "Mem: XX.X% (used/total)"
             Line::from(vec![
-                Span::styled("Mem: ", Style::default().fg(theme.meter_label)),
+                Span::styled("Mem: ", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
                 Span::styled(
                     format!("{:5.1}%", usage),
-                    Style::default().fg(theme.memory_used),
+                    Style::default().fg(theme.memory_used).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!(" ({})", mem_info), Style::default().fg(theme.text)),
             ])
@@ -326,22 +342,44 @@ fn draw_memory_bar(frame: &mut Frame, app: &App, area: Rect) {
             let graph_str = render_sparkline(&app.mem_history, graph_width);
 
             Line::from(vec![
-                Span::styled("Mem[", Style::default().fg(theme.meter_label)),
-                Span::styled(graph_str, Style::default().fg(theme.memory_used)),
+                Span::styled("Mem[", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+                Span::styled(graph_str, Style::default().fg(theme.memory_used).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("{}]", mem_info), Style::default().fg(theme.text)),
             ])
         }
         MeterMode::Bar | MeterMode::Hidden => {
-            // Bar mode (default)
+            // Bar mode (default): multi-segment bar matching htop exactly
+            // htop order: used (green) + shared (magenta) + buffers (blue) + cache (yellow)
+            // See htop MemoryMeter.c: MemoryMeter_attributes[]
             let info_len = mem_info.len() + 1;
             let bar_width = area.width.saturating_sub(4 + info_len as u16) as usize;
-            let filled = ((usage as usize) * bar_width / 100).min(bar_width);
-            let empty = bar_width - filled;
+
+            // Calculate segment percentages (htop style)
+            let total_f = mem.total as f32;
+            let used_pct = if total_f > 0.0 { (mem.used as f32 / total_f * 100.0).clamp(0.0, 100.0) } else { 0.0 };
+            let shared_pct = if total_f > 0.0 { (mem.shared as f32 / total_f * 100.0).clamp(0.0, 100.0) } else { 0.0 };
+            let buffers_pct = if total_f > 0.0 { (mem.buffers as f32 / total_f * 100.0).clamp(0.0, 100.0) } else { 0.0 };
+            let cached_pct = if total_f > 0.0 { (mem.cached as f32 / total_f * 100.0).clamp(0.0, 100.0) } else { 0.0 };
+
+            // Calculate widths ensuring they don't exceed bar_width
+            let used_width = ((used_pct * bar_width as f32 / 100.0) as usize).min(bar_width);
+            let shared_width = ((shared_pct * bar_width as f32 / 100.0) as usize).min(bar_width.saturating_sub(used_width));
+            let buffers_width = ((buffers_pct * bar_width as f32 / 100.0) as usize).min(bar_width.saturating_sub(used_width + shared_width));
+            let cached_width = ((cached_pct * bar_width as f32 / 100.0) as usize).min(bar_width.saturating_sub(used_width + shared_width + buffers_width));
+            let empty_width = bar_width.saturating_sub(used_width + shared_width + buffers_width + cached_width);
 
             Line::from(vec![
-                Span::styled("Mem[", Style::default().fg(theme.meter_label)),
-                Span::styled(bar_fill(filled), Style::default().fg(theme.memory_used)),
-                Span::raw(bar_empty(empty)),
+                Span::styled("Mem[", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+                // Used memory - green (htop: MEMORY_USED)
+                Span::styled(bar_fill(used_width), Style::default().fg(theme.memory_used)),
+                // Shared memory - magenta (htop: MEMORY_SHARED)
+                Span::styled(bar_fill(shared_width), Style::default().fg(theme.memory_shared)),
+                // Buffer cache - blue bold (htop: MEMORY_BUFFERS)
+                Span::styled(bar_fill(buffers_width), Style::default().fg(theme.memory_buffers).add_modifier(Modifier::BOLD)),
+                // Page cache/standby - yellow (htop: MEMORY_CACHE)
+                Span::styled(bar_fill(cached_width), Style::default().fg(theme.memory_cache)),
+                // Empty/free space
+                Span::styled(bar_empty(empty_width), Style::default().fg(theme.meter_shadow)),
                 Span::styled(format!("{}]", mem_info), Style::default().fg(theme.text)),
             ])
         }
@@ -367,9 +405,9 @@ fn draw_swap_bar(frame: &mut Frame, app: &App, area: Rect) {
     let bar_color = theme.swap;
 
     let line = Line::from(vec![
-        Span::styled("Swp[", Style::default().fg(theme.meter_label)),
+        Span::styled("Swp[", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
         Span::styled(bar_fill(filled), Style::default().fg(bar_color)),
-        Span::raw(bar_empty(empty)),
+        Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
         Span::styled(format!("{}]", swap_info), Style::default().fg(theme.text)),
     ]);
 
@@ -386,22 +424,22 @@ fn draw_tasks_info(frame: &mut Frame, app: &App, area: Rect) {
     let total_threads: u32 = app.processes.iter().map(|p| p.thread_count).sum();
 
     let line = Line::from(vec![
-        Span::styled("Tasks: ", Style::default().fg(theme.meter_label)),
+        Span::styled("Tasks: ", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!("{}", metrics.tasks_total),
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.meter_value).add_modifier(Modifier::BOLD),
         ),
         Span::styled(", ", Style::default().fg(theme.text)),
         Span::styled(
             format!("{}", total_threads),
-            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.meter_value).add_modifier(Modifier::BOLD),
         ),
         Span::styled(" thr; ", Style::default().fg(theme.text)),
         Span::styled(
             format!("{}", metrics.tasks_running),
-            Style::default().fg(theme.status_running).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.tasks_running).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" running", Style::default().fg(theme.status_running)),
+        Span::styled(" running", Style::default().fg(theme.tasks_running).add_modifier(Modifier::BOLD)),
     ]);
 
     let paragraph = Paragraph::new(line);
@@ -416,7 +454,7 @@ fn draw_uptime_info(frame: &mut Frame, app: &App, area: Rect) {
     let mins = (uptime % 3600) / 60;
     let secs = uptime % 60;
 
-    // htop format: "Uptime: HH:MM:SS" or "D day(s), HH:MM:SS"
+    // htop format: "Uptime: D day(s), HH:MM:SS"
     let uptime_str = if days > 0 {
         let day_word = if days == 1 { "day" } else { "days" };
         format!("{} {}, {:02}:{:02}:{:02}", days, day_word, hours, mins, secs)
@@ -433,14 +471,14 @@ fn draw_uptime_info(frame: &mut Frame, app: &App, area: Rect) {
     };
 
     let line = Line::from(vec![
-        Span::styled("CPU: ", Style::default().fg(theme.meter_label)),
+        Span::styled("CPU: ", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
         Span::styled(
             format!("{:5.1}%", cpu_percent),
-            Style::default().fg(theme.cpu_color(cpu_percent)),
+            Style::default().fg(theme.cpu_color(cpu_percent)).add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled("Uptime: ", Style::default().fg(theme.meter_label)),
-        Span::styled(uptime_str, Style::default().fg(theme.text)),
+        Span::styled("Uptime: ", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+        Span::styled(uptime_str, Style::default().fg(theme.uptime).add_modifier(Modifier::BOLD)),
     ]);
 
     let paragraph = Paragraph::new(line);
@@ -454,13 +492,14 @@ fn draw_network_info(frame: &mut Frame, app: &App, area: Rect) {
     let rx_rate = format_bytes(metrics.net_rx_rate);
     let tx_rate = format_bytes(metrics.net_tx_rate);
 
+    // htop style: use meter colors for I/O
     let line = Line::from(vec![
-        Span::styled("Net[", Style::default().fg(theme.label)),
-        Span::styled("↓", Style::default().fg(Color::Green)),
-        Span::styled(format!("{}/s ", rx_rate), Style::default().fg(theme.text)),
-        Span::styled("↑", Style::default().fg(Color::Red)),
-        Span::styled(format!("{}/s", tx_rate), Style::default().fg(theme.text)),
-        Span::styled("]", Style::default().fg(theme.label)),
+        Span::styled("Net[", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+        Span::styled("↓", Style::default().fg(theme.meter_value_ok)),  // Green for download
+        Span::styled(format!("{}/s ", rx_rate), Style::default().fg(theme.meter_value).add_modifier(Modifier::BOLD)),
+        Span::styled("↑", Style::default().fg(theme.meter_value_warn)),  // Yellow for upload
+        Span::styled(format!("{}/s", tx_rate), Style::default().fg(theme.meter_value).add_modifier(Modifier::BOLD)),
+        Span::styled("]", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
     ]);
 
     let paragraph = Paragraph::new(line);
@@ -474,13 +513,14 @@ fn draw_disk_info(frame: &mut Frame, app: &App, area: Rect) {
     let read_rate = format_bytes(metrics.disk_read_rate);
     let write_rate = format_bytes(metrics.disk_write_rate);
 
+    // htop style: use meter I/O read (green) and write (blue) colors
     let line = Line::from(vec![
-        Span::styled("Dsk[", Style::default().fg(theme.label)),
-        Span::styled("R:", Style::default().fg(Color::Cyan)),
-        Span::styled(format!("{}/s ", read_rate), Style::default().fg(theme.text)),
-        Span::styled("W:", Style::default().fg(Color::Yellow)),
-        Span::styled(format!("{}/s", write_rate), Style::default().fg(theme.text)),
-        Span::styled("]", Style::default().fg(theme.label)),
+        Span::styled("Dsk[", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+        Span::styled("R:", Style::default().fg(theme.meter_value_ok)),  // Green for read
+        Span::styled(format!("{}/s ", read_rate), Style::default().fg(theme.meter_value).add_modifier(Modifier::BOLD)),
+        Span::styled("W:", Style::default().fg(theme.memory_buffers)),  // Blue for write
+        Span::styled(format!("{}/s", write_rate), Style::default().fg(theme.meter_value).add_modifier(Modifier::BOLD)),
+        Span::styled("]", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
     ]);
 
     let paragraph = Paragraph::new(line);
@@ -494,25 +534,26 @@ fn draw_battery_info(frame: &mut Frame, app: &App, area: Rect) {
     let line = if let Some(percent) = metrics.battery_percent {
         let status = if metrics.battery_charging { "+" } else { "-" };
         let color = if percent > 50.0 {
-            Color::Green
+            theme.meter_value_ok  // Green
         } else if percent > 20.0 {
-            Color::Yellow
+            theme.meter_value_warn  // Yellow
         } else {
-            Color::Red
+            theme.meter_value_error  // Red
         };
 
         Line::from(vec![
-            Span::styled("Bat[", Style::default().fg(theme.label)),
-            Span::styled(status, Style::default().fg(color)),
-            Span::styled(format!("{:.0}%", percent), Style::default().fg(color)),
-            Span::styled("]", Style::default().fg(theme.label)),
+            Span::styled("Bat[", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+            Span::styled(status, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{:.0}%", percent), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled("]", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
         ])
     } else {
-        // No battery detected, show hostname instead
+        // No battery detected, show hostname instead (htop style)
         Line::from(vec![
+            Span::styled("Host: ", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
             Span::styled(
-                format!("Host: {}", metrics.hostname),
-                Style::default().fg(theme.text_dim),
+                metrics.hostname.clone(),
+                Style::default().fg(theme.hostname).add_modifier(Modifier::BOLD),
             ),
         ])
     };

@@ -1,6 +1,6 @@
 use ratatui::{
     layout::{Constraint, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Cell, Row, Table},
     Frame,
@@ -102,42 +102,66 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             let cells: Vec<Cell> = visible_columns
                 .iter()
                 .map(|col| {
-                    // Command column uses multi-span for colored indicators
+                    // Command column uses multi-span for colored indicators (htop style)
                     if *col == SortColumn::Command {
-                        let cmd_color = if app.tree_view && !tree_prefix.is_empty() {
-                            theme.process_tree
-                        } else {
-                            theme.text
-                        };
-                        let cmd_color = if is_selected { theme.selection_fg } else { cmd_color };
-
                         // Build spans with distinct colors
                         let mut spans: Vec<Span> = Vec::new();
 
-                        // Elevated indicator - gold/yellow color
+                        // Elevated indicator - use theme's privileged process color
                         if proc.is_elevated {
                             spans.push(Span::styled(
                                 "🛡️ ",
-                                Style::default().fg(if is_selected { theme.selection_fg } else { Color::Yellow })
+                                Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_priv })
                             ));
                         }
 
-                        // Architecture indicator - cyan color
+                        // Architecture indicator - use theme's megabytes color (cyan in default)
                         let arch_str = proc.arch.as_str();
                         if !arch_str.is_empty() {
                             spans.push(Span::styled(
                                 format!("[{}] ", arch_str),
-                                Style::default().fg(if is_selected { theme.selection_fg } else { Color::Cyan })
+                                Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_megabytes })
                             ));
                         }
 
-                        // Tree prefix
+                        // Tree prefix with tree color
                         if !tree_prefix.is_empty() {
-                            spans.push(Span::styled(tree_prefix.clone(), Style::default().fg(cmd_color)));
+                            spans.push(Span::styled(
+                                tree_prefix.clone(),
+                                Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_tree })
+                            ));
                         }
 
-                        // Command text
-                        spans.push(Span::styled(display_command.to_string(), Style::default().fg(cmd_color)));
+                        // htop style: path in dim color, basename in bold/bright color
+                        if app.config.show_program_path {
+                            // Split into path and basename
+                            if let Some(last_sep) = display_command.rfind(|c| c == '\\' || c == '/') {
+                                let path = &display_command[..=last_sep];
+                                let basename = &display_command[last_sep + 1..];
+                                // Path in dimmer color
+                                spans.push(Span::styled(
+                                    path.to_string(),
+                                    Style::default().fg(if is_selected { theme.selection_fg } else { theme.text_dim })
+                                ));
+                                // Basename in bright color (htop: PROCESS_BASENAME = bold cyan)
+                                spans.push(Span::styled(
+                                    basename.to_string(),
+                                    Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_basename }).add_modifier(Modifier::BOLD)
+                                ));
+                            } else {
+                                // No path separator, just show as basename
+                                spans.push(Span::styled(
+                                    display_command.to_string(),
+                                    Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_basename }).add_modifier(Modifier::BOLD)
+                                ));
+                            }
+                        } else {
+                            // Just show name (already is the basename)
+                            spans.push(Span::styled(
+                                display_command.to_string(),
+                                Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_basename }).add_modifier(Modifier::BOLD)
+                            ));
+                        }
 
                         return Cell::from(Line::from(spans));
                     }
@@ -151,10 +175,20 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             format!("{:>6}", proc.parent_pid),
                             if is_selected { theme.selection_fg } else { theme.text_dim }
                         ),
-                        SortColumn::User => (
-                            format!("{:10}", truncate_str(&proc.user, 10)),
-                            if is_selected { theme.selection_fg } else { theme.user_color }
-                        ),
+                        SortColumn::User => {
+                            // htop colors: root/SYSTEM = magenta, normal users = different colors
+                            let user_color = if is_selected {
+                                theme.selection_fg
+                            } else if proc.user.eq_ignore_ascii_case("SYSTEM")
+                                    || proc.user.eq_ignore_ascii_case("root")
+                                    || proc.user.eq_ignore_ascii_case("LOCAL SERVICE")
+                                    || proc.user.eq_ignore_ascii_case("NETWORK SERVICE") {
+                                theme.process_priv  // Magenta for system/privileged users
+                            } else {
+                                theme.user_color
+                            };
+                            (format!("{:10}", truncate_str(&proc.user, 10)), user_color)
+                        }
                         SortColumn::Priority => (
                             format!("{:>3}", proc.priority),
                             if is_selected { theme.selection_fg } else { theme.priority_color_for_nice(proc.nice) }
@@ -181,6 +215,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                         ),
                         SortColumn::Status => {
                             // Show status char + leaf emoji for efficiency mode
+                            // htop: Running processes are green and bold
                             let status_str = if proc.efficiency_mode {
                                 format!("{}🌿", proc.status)  // e.g., "R🌿" for Running+Efficiency
                             } else {
@@ -197,7 +232,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                         ),
                         SortColumn::Mem => (
                             format!("{:>5.1}", proc.mem_percent),
-                            if is_selected { theme.selection_fg } else { theme.mem_low }
+                            if is_selected { theme.selection_fg } else { theme.mem_color(proc.mem_percent) }
                         ),
                         SortColumn::Time => (
                             format!("{:>9}", proc.format_cpu_time()),
@@ -208,31 +243,52 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             if is_selected { theme.selection_fg } else { theme.text_dim }
                         ),
                         SortColumn::Command => unreachable!(), // Handled above
-                        // Windows-specific columns
+                        // Windows-specific columns (use theme colors)
                         SortColumn::Elevated => (
                             if proc.is_elevated { "🛡️".to_string() } else { " ".to_string() },
-                            if is_selected { theme.selection_fg } else { Color::Yellow }
+                            if is_selected { theme.selection_fg } else { theme.process_priv }  // Magenta for privileged
                         ),
                         SortColumn::Arch => (
                             format!("{:>4}", proc.arch.as_str()),
-                            if is_selected { theme.selection_fg } else { Color::Cyan }
+                            if is_selected { theme.selection_fg } else { theme.process_megabytes }  // Cyan for info
                         ),
                         SortColumn::Efficiency => (
                             if proc.efficiency_mode { "🌿".to_string() } else { " ".to_string() },
-                            if is_selected { theme.selection_fg } else { Color::Green }
+                            if is_selected { theme.selection_fg } else { theme.process_low_priority }  // Green for eco mode
                         ),
                     };
-                    Cell::from(Span::styled(text, Style::default().fg(color)))
+                    // Add bold modifier matching htop's A_BOLD usage:
+                    // - High CPU (>50%) - bold for visibility
+                    // - Running status ('R') - htop uses PROCESS_RUN_STATE
+                    // - Disk wait/zombie ('D', 'Z') - htop uses A_BOLD | PROCESS_D_STATE
+                    // - High priority (nice < 0) - htop uses PROCESS_HIGH_PRIORITY
+                    // - Large memory (>1GB) - bold for visibility
+                    let style = if *col == SortColumn::Cpu && proc.cpu_percent > 50.0 {
+                        Style::default().fg(color).add_modifier(Modifier::BOLD)
+                    } else if *col == SortColumn::Status && (proc.status == 'R' || proc.status == 'D' || proc.status == 'Z') {
+                        // htop: Running is green, D/Z states are A_BOLD | Red
+                        Style::default().fg(color).add_modifier(Modifier::BOLD)
+                    } else if *col == SortColumn::Priority && proc.nice < 0 {
+                        Style::default().fg(color).add_modifier(Modifier::BOLD)
+                    } else if *col == SortColumn::Res && proc.resident_mem >= 1_073_741_824 {
+                        // Bold for processes using > 1GB memory
+                        Style::default().fg(color).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(color)
+                    };
+                    Cell::from(Span::styled(text, style))
                 })
                 .collect();
 
             // Row styling - always set background from theme
+            // htop uses A_BOLD for selected and tagged processes
             let row_style = if is_selected {
                 Style::default().bg(theme.selection_bg).add_modifier(Modifier::BOLD)
             } else if matches_search {
                 Style::default().bg(theme.search_match)
             } else if is_tagged {
-                Style::default().fg(theme.process_tag).bg(theme.background)
+                // htop: PROCESS_TAG = A_BOLD | ColorPair(Yellow, Black)
+                Style::default().fg(theme.process_tag).bg(theme.background).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().bg(theme.background)
             };
