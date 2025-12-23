@@ -359,11 +359,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             )
                         }
                         SortColumn::Cpu => {
-                            // htop Row_printPercentage: < 0.05 → shadow, >= 99.9 → megabytes
+                            // htop: use gradient coloring, highlight >= 99.9%
                             let color = if is_selected {
                                 theme.selection_fg
-                            } else if proc.cpu_percent < 0.05 {
-                                theme.process_shadow
                             } else if proc.cpu_percent >= 99.9 {
                                 theme.process_megabytes
                             } else {
@@ -372,11 +370,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             (format!("{:>5.1}", proc.cpu_percent), color)
                         }
                         SortColumn::Mem => {
-                            // htop Row_printPercentage: < 0.05 → shadow, >= 99.9 → megabytes
+                            // htop: use threshold coloring, highlight >= 99.9%
                             let color = if is_selected {
                                 theme.selection_fg
-                            } else if proc.mem_percent < 0.05 {
-                                theme.process_shadow
                             } else if proc.mem_percent >= 99.9 {
                                 theme.process_megabytes
                             } else {
