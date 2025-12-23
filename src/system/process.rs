@@ -89,6 +89,40 @@ pub fn enable_debug_privilege() -> bool {
 static PID_USER_CACHE: LazyLock<RwLock<HashMap<u32, String>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 
+// Common usernames as UTF-16 for fast comparison (avoids UTF-16 to UTF-8 conversion)
+#[cfg(windows)]
+const SYSTEM_UTF16: [u16; 6] = [0x53, 0x59, 0x53, 0x54, 0x45, 0x4D]; // "SYSTEM"
+#[cfg(windows)]
+const LOCAL_SERVICE_UTF16: [u16; 13] = [0x4C, 0x4F, 0x43, 0x41, 0x4C, 0x20, 0x53, 0x45, 0x52, 0x56, 0x49, 0x43, 0x45]; // "LOCAL SERVICE"
+#[cfg(windows)]
+const NETWORK_SERVICE_UTF16: [u16; 15] = [0x4E, 0x45, 0x54, 0x57, 0x4F, 0x52, 0x4B, 0x20, 0x53, 0x45, 0x52, 0x56, 0x49, 0x43, 0x45]; // "NETWORK SERVICE"
+
+// Pre-allocated static strings for common usernames
+#[cfg(windows)]
+static SYSTEM_STR: &str = "SYSTEM";
+#[cfg(windows)]
+static LOCAL_SERVICE_STR: &str = "LOCAL SERVICE";
+#[cfg(windows)]
+static NETWORK_SERVICE_STR: &str = "NETWORK SERVICE";
+
+/// Intern a username from UTF-16, avoiding conversion for common names
+#[cfg(windows)]
+#[inline]
+fn intern_username_utf16(name: &[u16]) -> String {
+    // Fast path: check against known common usernames (avoids UTF-16 conversion)
+    if name == SYSTEM_UTF16 {
+        return SYSTEM_STR.to_string();
+    }
+    if name == LOCAL_SERVICE_UTF16 {
+        return LOCAL_SERVICE_STR.to_string();
+    }
+    if name == NETWORK_SERVICE_UTF16 {
+        return NETWORK_SERVICE_STR.to_string();
+    }
+    // Fallback: convert from UTF-16
+    String::from_utf16_lossy(name)
+}
+
 // Cache for static process info (elevation, architecture, exe_path) - these don't change during process lifetime
 #[cfg(windows)]
 static STATIC_PROCESS_INFO_CACHE: LazyLock<RwLock<HashMap<u32, (bool, ProcessArch, String)>>> =
@@ -274,7 +308,8 @@ fn get_user_from_token(token_handle: HANDLE, pid: u32) -> Option<String> {
         )
         .is_ok()
         {
-            let username = String::from_utf16_lossy(&name[..name_len as usize]);
+            // Use interning to avoid UTF-16 conversion for common usernames
+            let username = intern_username_utf16(&name[..name_len as usize]);
 
             // Cache the result
             if let Ok(mut cache) = PID_USER_CACHE.write() {
@@ -365,7 +400,7 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                     efficiency_mode: false,
                     is_elevated: pid == 4,  // System process is elevated
                     arch: ProcessArch::Native,
-                    user: Some("SYSTEM".to_string()),
+                    user: Some(SYSTEM_STR.to_string()),
                     exe_path: String::new(),
                 };
             }
@@ -464,13 +499,12 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                 false
             };
 
-            // Use cached elevation/user/arch or query if needed
-            let (is_elevated, user, arch) = if let Some(&(elevated, arch, _)) = cached_static {
-                let user = cached_user.cloned();
-                (elevated, user, arch)
+            // Use cached elevation/arch if available, otherwise query
+            let (is_elevated, arch) = if let Some(&(elevated, arch, _)) = cached_static {
+                (elevated, arch)
             } else if let Some(h) = handle {
-                // Query elevation and user from token
-                let (elevated, user) = unsafe {
+                // Query elevation from token
+                let elevated = unsafe {
                     let mut token_handle = HANDLE::default();
                     if OpenProcessToken(h, TOKEN_QUERY, &mut token_handle).is_ok() {
                         let mut elevation = TOKEN_ELEVATION::default();
@@ -482,12 +516,10 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                             std::mem::size_of::<TOKEN_ELEVATION>() as u32,
                             &mut return_length,
                         ).is_ok() && elevation.TokenIsElevated != 0;
-
-                        let u = get_user_from_token(token_handle, pid);
                         let _ = CloseHandle(token_handle);
-                        (elev, u)
+                        elev
                     } else {
-                        (false, None)
+                        false
                     }
                 };
 
@@ -512,9 +544,27 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                     }
                 };
 
-                (elevated, user, arch)
+                (elevated, arch)
             } else {
-                (false, None, ProcessArch::Native)
+                (false, ProcessArch::Native)
+            };
+
+            // Get user from cache or query from token (separate from elevation/arch caching)
+            let user = if let Some(u) = cached_user {
+                Some(u.clone())
+            } else if let Some(h) = handle {
+                unsafe {
+                    let mut token_handle = HANDLE::default();
+                    if OpenProcessToken(h, TOKEN_QUERY, &mut token_handle).is_ok() {
+                        let u = get_user_from_token(token_handle, pid);
+                        let _ = CloseHandle(token_handle);
+                        u
+                    } else {
+                        None
+                    }
+                }
+            } else {
+                None
             };
 
             if let Some(h) = handle {
@@ -755,11 +805,9 @@ impl ProcessInfo {
                     .ok()
                     .and_then(|cache| cache.get(&pid).cloned())
                     .unwrap_or_else(|| {
-                        // Special cases
-                        if pid == 0 {
-                            "SYSTEM".to_string()
-                        } else if pid == 4 {
-                            "SYSTEM".to_string()
+                        // Special cases - use interned string
+                        if pid == 0 || pid == 4 {
+                            SYSTEM_STR.to_string()
                         } else {
                             "-".to_string()
                         }
