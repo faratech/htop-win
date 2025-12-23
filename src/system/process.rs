@@ -126,6 +126,8 @@ fn cleanup_stale_caches(current_pids: &std::collections::HashSet<u32>) {
     if let Ok(mut cache) = EFFICIENCY_MODE_CACHE.write() {
         cache.retain(|pid, _| current_pids.contains(pid));
     }
+    // Also clean up CPU time cache in native module
+    super::cleanup_cpu_time_cache(current_pids);
 }
 
 /// Process architecture
@@ -331,6 +333,24 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
     use rayon::prelude::*;
     use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
 
+    // Pre-read caches to avoid lock contention in parallel loop
+    let static_cache_snapshot: HashMap<u32, (bool, ProcessArch, String)> = STATIC_PROCESS_INFO_CACHE
+        .read()
+        .map(|c| c.clone())
+        .unwrap_or_default();
+    let user_cache_snapshot: HashMap<u32, String> = PID_USER_CACHE
+        .read()
+        .map(|c| c.clone())
+        .unwrap_or_default();
+    let efficiency_cache_snapshot: HashMap<u32, EfficiencyModeCache> = EFFICIENCY_MODE_CACHE
+        .read()
+        .map(|c| c.iter().map(|(&k, v)| (k, EfficiencyModeCache {
+            efficiency_mode: v.efficiency_mode,
+            last_update: v.last_update,
+        })).collect())
+        .unwrap_or_default();
+    let now = std::time::Instant::now();
+
     // Query data in parallel
     let enriched_data: Vec<EnrichedProcessData> = processes
         .par_iter()
@@ -350,92 +370,156 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                 };
             }
 
-            let handle = match open_process_query(pid) {
-                Some(h) => h,
-                None => return EnrichedProcessData {
+            // Check static cache for elevation, arch, exe_path (these never change)
+            let cached_static = static_cache_snapshot.get(&pid);
+            let cached_user = user_cache_snapshot.get(&pid);
+            let cached_efficiency = efficiency_cache_snapshot.get(&pid);
+
+            // Check if efficiency cache is still valid (within TTL)
+            let efficiency_valid = cached_efficiency
+                .map(|c| now.duration_since(c.last_update).as_millis() < EFFICIENCY_CACHE_TTL_MS)
+                .unwrap_or(false);
+
+            // Determine what we need to query
+            let need_static = cached_static.is_none();
+            let need_user = cached_user.is_none();
+            let need_efficiency = !efficiency_valid;
+            let need_exe_path = fetch_exe_path && cached_static.map(|(_, _, p)| p.is_empty()).unwrap_or(true);
+
+            // Skip OpenProcess entirely if we have all cached data and don't need times
+            let need_handle = need_static || need_user || need_efficiency || need_exe_path;
+
+            let handle = if need_handle {
+                open_process_query(pid)
+            } else {
+                None
+            };
+
+            // If we couldn't get a handle but need one, use cached data if available
+            if need_handle && handle.is_none() {
+                let (is_elevated, arch, exe_path) = cached_static
+                    .map(|(e, a, p)| (*e, *a, p.clone()))
+                    .unwrap_or((false, ProcessArch::Native, String::new()));
+                let user = cached_user.cloned();
+                let efficiency_mode = cached_efficiency.map(|c| c.efficiency_mode).unwrap_or(false);
+
+                return EnrichedProcessData {
                     pid,
                     cpu_time: Duration::ZERO,
                     start_time: 0,
                     shared_mem: 0,
-                    efficiency_mode: false,
-                    is_elevated: false,
-                    arch: ProcessArch::Native,
-                    user: None,
-                    exe_path: String::new(),
-                },
+                    efficiency_mode,
+                    is_elevated,
+                    arch,
+                    user,
+                    exe_path,
+                };
+            }
+
+            // Query times and memory (always needed for TIME+ accuracy)
+            let (cpu_time, start_time, shared_mem) = if let Some(h) = handle {
+                let (ct, st) = query_process_times(h);
+                let sm = query_shared_mem(h);
+                (ct, st, sm)
+            } else {
+                (Duration::ZERO, 0, 0)
             };
 
-            // Query times and memory
-            let (cpu_time, start_time) = query_process_times(handle);
-            let shared_mem = query_shared_mem(handle);
-
-            // Query exe path only when needed (expensive API call)
+            // Use cached exe_path or query if needed
             let exe_path = if fetch_exe_path {
-                query_exe_path(handle)
+                if let Some((_, _, path)) = cached_static {
+                    if !path.is_empty() {
+                        path.clone()
+                    } else if let Some(h) = handle {
+                        query_exe_path(h)
+                    } else {
+                        String::new()
+                    }
+                } else if let Some(h) = handle {
+                    query_exe_path(h)
+                } else {
+                    String::new()
+                }
             } else {
                 String::new()
             };
 
-            // Query efficiency mode
-            let efficiency_mode = unsafe {
-                let mut throttle_state = PROCESS_POWER_THROTTLING_STATE::default();
-                throttle_state.Version = 1;
-                let result = GetProcessInformation(
-                    handle, ProcessPowerThrottling,
-                    &mut throttle_state as *mut _ as *mut _,
-                    std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
-                );
-                result.is_ok()
-                    && (throttle_state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
-                    && (throttle_state.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
-            };
-
-            // Query elevation and user from token
-            let (is_elevated, user) = unsafe {
-                let mut token_handle = HANDLE::default();
-                if OpenProcessToken(handle, TOKEN_QUERY, &mut token_handle).is_ok() {
-                    // Check elevation
-                    let mut elevation = TOKEN_ELEVATION::default();
-                    let mut return_length: u32 = 0;
-                    let elevated = GetTokenInformation(
-                        token_handle,
-                        TokenElevation,
-                        Some(&mut elevation as *mut _ as *mut _),
-                        std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                        &mut return_length,
-                    ).is_ok() && elevation.TokenIsElevated != 0;
-
-                    // Get user from token
-                    let user = get_user_from_token(token_handle, pid);
-                    let _ = CloseHandle(token_handle);
-                    (elevated, user)
-                } else {
-                    (false, None)
+            // Use cached efficiency mode or query if stale
+            let efficiency_mode = if efficiency_valid {
+                cached_efficiency.unwrap().efficiency_mode
+            } else if let Some(h) = handle {
+                unsafe {
+                    let mut throttle_state = PROCESS_POWER_THROTTLING_STATE::default();
+                    throttle_state.Version = 1;
+                    let result = GetProcessInformation(
+                        h, ProcessPowerThrottling,
+                        &mut throttle_state as *mut _ as *mut _,
+                        std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+                    );
+                    result.is_ok()
+                        && (throttle_state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
+                        && (throttle_state.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
                 }
+            } else {
+                false
             };
 
-            // Query architecture
-            let arch = unsafe {
-                let mut process_machine = IMAGE_FILE_MACHINE::default();
-                let mut native_machine = IMAGE_FILE_MACHINE::default();
-                if IsWow64Process2(handle, &mut process_machine, Some(&mut native_machine)).is_ok() {
-                    if process_machine.0 == 0 {
-                        ProcessArch::Native
-                    } else if process_machine == IMAGE_FILE_MACHINE_I386 {
-                        ProcessArch::X86
-                    } else if process_machine == IMAGE_FILE_MACHINE_AMD64 {
-                        ProcessArch::X64
-                    } else if process_machine == IMAGE_FILE_MACHINE_ARM64 {
-                        ProcessArch::ARM64
+            // Use cached elevation/user/arch or query if needed
+            let (is_elevated, user, arch) = if let Some(&(elevated, arch, _)) = cached_static {
+                let user = cached_user.cloned();
+                (elevated, user, arch)
+            } else if let Some(h) = handle {
+                // Query elevation and user from token
+                let (elevated, user) = unsafe {
+                    let mut token_handle = HANDLE::default();
+                    if OpenProcessToken(h, TOKEN_QUERY, &mut token_handle).is_ok() {
+                        let mut elevation = TOKEN_ELEVATION::default();
+                        let mut return_length: u32 = 0;
+                        let elev = GetTokenInformation(
+                            token_handle,
+                            TokenElevation,
+                            Some(&mut elevation as *mut _ as *mut _),
+                            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                            &mut return_length,
+                        ).is_ok() && elevation.TokenIsElevated != 0;
+
+                        let u = get_user_from_token(token_handle, pid);
+                        let _ = CloseHandle(token_handle);
+                        (elev, u)
+                    } else {
+                        (false, None)
+                    }
+                };
+
+                // Query architecture
+                let arch = unsafe {
+                    let mut process_machine = IMAGE_FILE_MACHINE::default();
+                    let mut native_machine = IMAGE_FILE_MACHINE::default();
+                    if IsWow64Process2(h, &mut process_machine, Some(&mut native_machine)).is_ok() {
+                        if process_machine.0 == 0 {
+                            ProcessArch::Native
+                        } else if process_machine == IMAGE_FILE_MACHINE_I386 {
+                            ProcessArch::X86
+                        } else if process_machine == IMAGE_FILE_MACHINE_AMD64 {
+                            ProcessArch::X64
+                        } else if process_machine == IMAGE_FILE_MACHINE_ARM64 {
+                            ProcessArch::ARM64
+                        } else {
+                            ProcessArch::Native
+                        }
                     } else {
                         ProcessArch::Native
                     }
-                } else {
-                    ProcessArch::Native
-                }
+                };
+
+                (elevated, user, arch)
+            } else {
+                (false, None, ProcessArch::Native)
             };
 
-            unsafe { let _ = CloseHandle(handle); }
+            if let Some(h) = handle {
+                unsafe { let _ = CloseHandle(h); }
+            }
 
             EnrichedProcessData {
                 pid,
@@ -451,7 +535,7 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
         })
         .collect();
 
-    // Update caches
+    // Update caches with newly queried data
     if let Ok(mut cache) = STATIC_PROCESS_INFO_CACHE.write() {
         for data in &enriched_data {
             cache.insert(data.pid, (data.is_elevated, data.arch, data.exe_path.clone()));
@@ -488,7 +572,9 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             if data.start_time != 0 {
                 proc.start_time = data.start_time;
             }
-            proc.shared_mem = data.shared_mem;
+            if data.shared_mem != 0 {
+                proc.shared_mem = data.shared_mem;
+            }
             proc.efficiency_mode = data.efficiency_mode;
             proc.is_elevated = data.is_elevated;
             proc.arch = data.arch;

@@ -11,7 +11,7 @@ pub use process::{
     kill_process, set_priority, set_process_affinity, ProcessInfo,
 };
 #[cfg(windows)]
-pub use native::{query_all_processes, calculate_cpu_percentages};
+pub use native::{query_all_processes, calculate_cpu_percentages, cleanup_cpu_time_cache};
 
 /// System metrics
 pub struct SystemMetrics {

@@ -1,6 +1,6 @@
 [package]
 name = "htop-win"
-version = "0.0.3"
+version = "0.0.4"
 edition = "2024"
 description = "A Windows clone of htop - interactive process viewer"
 authors = ["htop-win contributors"]

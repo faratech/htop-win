@@ -73,9 +73,26 @@ struct SystemProcessInfo {
 static CPU_TIME_CACHE: std::sync::LazyLock<RwLock<HashMap<u32, (u64, u64, std::time::Instant)>>> =
     std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
 
+// Reusable buffer for NtQuerySystemInformation to avoid repeated allocations
+thread_local! {
+    static QUERY_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(1024 * 1024));
+}
+
 /// Query all processes using NtQuerySystemInformation (single syscall)
 pub fn query_all_processes() -> Vec<NativeProcessInfo> {
-    let mut buffer: Vec<u8> = vec![0; 1024 * 1024]; // Start with 1MB buffer
+    QUERY_BUFFER.with(|buf| {
+        let mut buffer = buf.borrow_mut();
+        let cap = buffer.capacity();
+        if cap < 1024 * 1024 {
+            buffer.reserve(1024 * 1024 - cap);
+        }
+        let new_cap = buffer.capacity();
+        buffer.resize(new_cap, 0);
+        query_all_processes_with_buffer(&mut buffer)
+    })
+}
+
+fn query_all_processes_with_buffer(buffer: &mut Vec<u8>) -> Vec<NativeProcessInfo> {
     let mut return_length: u32 = 0;
 
     // Query system process information
@@ -194,15 +211,22 @@ pub fn calculate_cpu_percentages(
         }
     } // Read lock released here
 
-    // Update cache with current times
+    // Update cache with current times (don't clear - just overwrite)
+    // Stale entries from dead PIDs will be cleaned up by periodic cache cleanup
     if let Ok(mut cache) = CPU_TIME_CACHE.write() {
-        cache.clear();
         for proc in processes.iter() {
             cache.insert(proc.pid, (proc.kernel_time, proc.user_time, now));
         }
     }
 
     cpu_percentages
+}
+
+/// Clean up stale entries from the CPU time cache
+pub fn cleanup_cpu_time_cache(current_pids: &std::collections::HashSet<u32>) {
+    if let Ok(mut cache) = CPU_TIME_CACHE.write() {
+        cache.retain(|pid, _| current_pids.contains(pid));
+    }
 }
 
 /// Convert FILETIME (100-ns intervals since 1601) to Unix timestamp
