@@ -175,26 +175,11 @@ fn get_shadow_prefix_len(path: &str) -> usize {
 
 /// Get column width constraint for a given column
 fn column_width(col: &SortColumn) -> Constraint {
-    match col {
-        SortColumn::Pid => Constraint::Length(7),
-        SortColumn::PPid => Constraint::Length(7),
-        SortColumn::User => Constraint::Length(10),
-        SortColumn::Priority => Constraint::Length(4),
-        SortColumn::Nice => Constraint::Length(4),
-        SortColumn::Threads => Constraint::Length(4),
-        SortColumn::Virt => Constraint::Length(8),
-        SortColumn::Res => Constraint::Length(8),
-        SortColumn::Shr => Constraint::Length(8),
-        SortColumn::Status => Constraint::Length(3),  // Status + efficiency indicator
-        SortColumn::Cpu => Constraint::Length(6),
-        SortColumn::Mem => Constraint::Length(6),
-        SortColumn::Time => Constraint::Length(10),
-        SortColumn::StartTime => Constraint::Length(8),
-        SortColumn::Command => Constraint::Min(20),
-        // Windows-specific columns
-        SortColumn::Elevated => Constraint::Length(4),
-        SortColumn::Arch => Constraint::Length(5),
-        SortColumn::Efficiency => Constraint::Length(4),
+    // Command column uses Min() to expand, all others use fixed Length()
+    if matches!(col, SortColumn::Command) {
+        Constraint::Min(col.width())
+    } else {
+        Constraint::Length(col.width())
     }
 }
 

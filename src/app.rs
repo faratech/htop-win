@@ -4,6 +4,75 @@ use crate::ui::colors::Theme;
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
+/// Bounds of a single column in the process list header
+#[derive(Debug, Clone, Default)]
+pub struct ColumnBounds {
+    pub column: Option<SortColumn>,
+    pub x: u16,
+    pub width: u16,
+}
+
+/// UI layout bounds - populated during render for accurate mouse/keyboard navigation
+#[derive(Debug, Clone, Default)]
+pub struct UIBounds {
+    /// Header meters area (CPU bars, memory, etc.)
+    pub header_y_start: u16,
+    pub header_y_end: u16,
+
+    /// Process list column headers
+    pub column_header_y: u16,
+    pub columns: Vec<ColumnBounds>,
+
+    /// Process list data rows
+    pub process_list_y_start: u16,
+    pub process_list_y_end: u16,
+
+    /// Footer area
+    pub footer_y_start: u16,
+}
+
+impl UIBounds {
+    /// Find which column contains the given x coordinate
+    pub fn column_at_x(&self, x: u16) -> Option<SortColumn> {
+        for (i, col) in self.columns.iter().enumerate() {
+            let is_last = i == self.columns.len() - 1;
+            // Last column extends to infinity (captures everything to the right)
+            if is_last {
+                if x >= col.x {
+                    return col.column;
+                }
+            } else {
+                // Check if x is within this column's content area only
+                // The gap after this column will be checked as part of the next column
+                let col_end = col.x + col.width;
+                if x >= col.x && x < col_end {
+                    return col.column;
+                }
+            }
+        }
+        None
+    }
+
+    /// Check if y coordinate is on the column header row
+    pub fn is_column_header(&self, y: u16) -> bool {
+        y == self.column_header_y
+    }
+
+    /// Check if y coordinate is in the process list data area
+    pub fn is_process_row(&self, y: u16) -> bool {
+        y > self.column_header_y && y < self.footer_y_start
+    }
+
+    /// Get the process row index for a given y coordinate (0-indexed from first visible row)
+    pub fn process_row_index(&self, y: u16) -> Option<usize> {
+        if self.is_process_row(y) {
+            Some((y - self.column_header_y - 1) as usize)
+        } else {
+            None
+        }
+    }
+}
+
 /// Sort column for process list
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortColumn {
@@ -72,6 +141,30 @@ impl SortColumn {
             SortColumn::Elevated => "ELEV",
             SortColumn::Arch => "ARCH",
             SortColumn::Efficiency => "ECO",
+        }
+    }
+
+    /// Get the display width for this column (must match ui/process_list.rs column_width)
+    pub fn width(&self) -> u16 {
+        match self {
+            SortColumn::Pid => 7,
+            SortColumn::PPid => 7,
+            SortColumn::User => 10,
+            SortColumn::Priority => 4,
+            SortColumn::Nice => 4,
+            SortColumn::Threads => 4,
+            SortColumn::Virt => 8,
+            SortColumn::Res => 8,
+            SortColumn::Shr => 8,
+            SortColumn::Status => 3,
+            SortColumn::Cpu => 6,
+            SortColumn::Mem => 6,
+            SortColumn::Time => 10,
+            SortColumn::StartTime => 8,
+            SortColumn::Command => 20, // Min width, but effectively extends to end
+            SortColumn::Elevated => 4,
+            SortColumn::Arch => 5,
+            SortColumn::Efficiency => 4,
         }
     }
 }
@@ -198,6 +291,8 @@ pub struct App {
     pub mem_history: VecDeque<f32>,
     /// Cached visible columns (updated when column config changes)
     pub cached_visible_columns: Vec<SortColumn>,
+    /// UI layout bounds (populated during render for accurate mouse/keyboard navigation)
+    pub ui_bounds: UIBounds,
 }
 
 impl App {
@@ -255,6 +350,7 @@ impl App {
             cpu_history: Vec::new(),
             mem_history: VecDeque::new(),
             cached_visible_columns: visible_columns,
+            ui_bounds: UIBounds::default(),
         }
     }
 

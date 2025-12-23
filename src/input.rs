@@ -786,29 +786,18 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
 }
 
 fn handle_mouse_click(app: &mut App, x: u16, y: u16) {
-    // Calculate header height to determine click location
-    // This must match the calculation in ui/mod.rs
-    let header_height = if app.show_header {
-        let cpu_count = app.system_metrics.cpu.core_usage.len();
-        let cpu_rows = (cpu_count + 1) / 2;
-        let meter_rows = cpu_rows.max(4);
-        (meter_rows + 2) as u16 + 2
-    } else {
-        0
-    };
+    let bounds = &app.ui_bounds;
 
-    if y < header_height {
+    // Check if clicked in header meters area
+    if y < bounds.header_y_end {
         // Clicked in header - ignore or could add CPU bar interactions
         return;
     }
 
-    let process_area_start = header_height;
-    let relative_y = y.saturating_sub(process_area_start);
-
-    if relative_y == 0 {
+    // Check if clicked on column header row
+    if bounds.is_column_header(y) {
         // Clicked on column header - determine which column and toggle sort
-        let column = get_column_from_x(x);
-        if let Some(col) = column {
+        if let Some(col) = bounds.column_at_x(x) {
             if app.sort_column == col {
                 // Same column - toggle ascending/descending
                 app.sort_ascending = !app.sort_ascending;
@@ -819,33 +808,14 @@ fn handle_mouse_click(app: &mut App, x: u16, y: u16) {
             }
             app.update_displayed_processes();
         }
-    } else {
-        // Clicked on a process row
-        let clicked_index = app.scroll_offset + (relative_y as usize).saturating_sub(1);
+        return;
+    }
+
+    // Check if clicked on a process row
+    if let Some(row_index) = bounds.process_row_index(y) {
+        let clicked_index = app.scroll_offset + row_index;
         if clicked_index < app.displayed_processes.len() {
             app.selected_index = clicked_index;
         }
     }
-}
-
-fn get_column_from_x(x: u16) -> Option<SortColumn> {
-    // Column widths: [7, 7, 10, 4, 4, 4, 8, 8, 8, 2, 6, 6, 10, 8, 20+]
-    // With column_spacing(1), each column occupies: width + 1 gap
-    // Cumulative end positions (exclusive):
-    const WIDTHS: [u16; 15] = [7, 7, 10, 4, 4, 4, 8, 8, 8, 2, 6, 6, 10, 8, 0];
-    const COLUMNS: [SortColumn; 15] = [
-        SortColumn::Pid, SortColumn::PPid, SortColumn::User, SortColumn::Priority,
-        SortColumn::Nice, SortColumn::Threads, SortColumn::Virt, SortColumn::Res,
-        SortColumn::Shr, SortColumn::Status, SortColumn::Cpu, SortColumn::Mem,
-        SortColumn::Time, SortColumn::StartTime, SortColumn::Command,
-    ];
-
-    let mut pos: u16 = 0;
-    for i in 0..14 {
-        pos += WIDTHS[i] + 1; // width + gap
-        if x < pos {
-            return Some(COLUMNS[i]);
-        }
-    }
-    Some(SortColumn::Command)
 }

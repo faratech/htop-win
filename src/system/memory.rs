@@ -1,3 +1,24 @@
+use std::sync::OnceLock;
+
+/// Cached page size - never changes at runtime
+static PAGE_SIZE: OnceLock<u64> = OnceLock::new();
+
+/// Get the system page size (cached after first call)
+#[cfg(windows)]
+fn get_page_size() -> u64 {
+    *PAGE_SIZE.get_or_init(|| {
+        use windows::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO};
+        let mut sys_info = SYSTEM_INFO::default();
+        unsafe { GetSystemInfo(&mut sys_info) };
+        sys_info.dwPageSize as u64
+    })
+}
+
+#[cfg(not(windows))]
+fn get_page_size() -> u64 {
+    4096
+}
+
 /// Memory usage information matching htop's memory breakdown
 /// htop shows: Used (green) + Shared (magenta) + Buffers (blue) + Cache (yellow)
 #[derive(Default, Clone)]
@@ -53,14 +74,21 @@ impl MemoryInfo {
                 let total = status.ullTotalPhys;
                 let available = status.ullAvailPhys;
 
-                // Get page size and system cache from GetPerformanceInfo
-                let (page_size, system_cache) = if GetPerformanceInfo(&mut perf_info, perf_info.cb).is_ok() {
-                    (perf_info.PageSize as u64, perf_info.SystemCache as u64 * perf_info.PageSize as u64)
+                // "In Use" as shown by Task Manager = Total - Available
+                // This is the most reliable calculation that matches Windows Task Manager
+                let in_use = total.saturating_sub(available);
+
+                // Use cached page size (never changes at runtime)
+                let page_size = get_page_size();
+
+                // Get system cache size from GetPerformanceInfo
+                let system_cache = if GetPerformanceInfo(&mut perf_info, perf_info.cb).is_ok() {
+                    perf_info.SystemCache as u64 * page_size
                 } else {
-                    (4096, 0)
+                    0
                 };
 
-                // Try to get detailed memory breakdown using NtQuerySystemInformation
+                // Try to get detailed memory breakdown for cache visualization
                 // SYSTEM_MEMORY_LIST_INFORMATION = 80
                 #[repr(C)]
                 #[derive(Default)]
@@ -83,41 +111,83 @@ impl MemoryInfo {
                     std::ptr::null_mut(),
                 );
 
-                // Calculate memory segments htop-style
+                // Calculate cache breakdown for visualization
+                // "In Use" is always from GlobalMemoryStatusEx to match Task Manager
                 let (used, cached, buffers, shared) = if status_code.is_ok() {
                     // Calculate standby (cache) from priority lists
                     let standby_pages: u64 = mem_list.page_count_by_priority.iter().sum();
                     let standby = standby_pages * page_size;
                     let modified = mem_list.modified_page_count * page_size;
-                    let free = mem_list.free_page_count * page_size;
 
-                    // htop-style calculation:
-                    // - Used = total - free - standby - buffers (what apps are actually using)
-                    // - Cache = standby list (yellow)
-                    // - Buffers = system file cache (blue) - use a portion of system_cache
-                    let in_use = total.saturating_sub(free + standby);
+                    // Cache = standby (clean cached) + modified (dirty cached)
+                    // This is what Windows considers "Available" minus truly free pages
+                    let cache = standby + modified;
 
-                    // Split system_cache into buffers (small portion) for visual variety
-                    // htop Linux shows buffers as a separate blue segment
+                    // Buffers: portion of system file cache (for htop-style display)
                     let buffers = system_cache.min(in_use / 10); // Cap at 10% of used
                     let used = in_use.saturating_sub(buffers);
 
-                    (used, standby, buffers, modified.min(used / 20)) // shared as small portion
+                    (used, cache, buffers, 0)
                 } else {
-                    // Fallback: estimate from GlobalMemoryStatusEx
-                    // available = free + standby, so standby ≈ available - some_free_estimate
-                    let in_use = total.saturating_sub(available);
-                    // Estimate: standby is roughly 80% of available, free is 20%
-                    let estimated_standby = available * 4 / 5;
+                    // Fallback without detailed breakdown
+                    // Estimate cache as the difference between available and a small free estimate
+                    let estimated_cache = available.saturating_sub(available / 10);
                     let buffers = system_cache.min(in_use / 10);
                     let used = in_use.saturating_sub(buffers);
 
-                    (used, estimated_standby, buffers, 0)
+                    (used, estimated_cache, buffers, 0)
                 };
 
-                let swap_total = status.ullTotalPageFile.saturating_sub(total);
-                let swap_available = status.ullAvailPageFile.saturating_sub(available);
-                let swap_used = swap_total.saturating_sub(swap_available);
+                // Get actual page file usage using NtQuerySystemInformation
+                // SystemPageFileInformation = 18
+                #[repr(C)]
+                struct SystemPageFileInfo {
+                    next_entry_offset: u32,
+                    total_size: u32,      // Total size in pages
+                    total_in_use: u32,    // Currently in use in pages
+                    peak_usage: u32,
+                    page_file_name: [u16; 260], // UNICODE_STRING follows but we don't need it
+                }
+
+                let mut pagefile_info: [u8; 512] = [0; 512];
+                let mut return_length: u32 = 0;
+                let pf_status = NtQuerySystemInformation(
+                    SYSTEM_INFORMATION_CLASS(18), // SystemPageFileInformation
+                    pagefile_info.as_mut_ptr() as *mut _,
+                    pagefile_info.len() as u32,
+                    &mut return_length,
+                );
+
+                let (swap_total, swap_used) = if pf_status.is_ok() && return_length >= 16 {
+                    // Parse the page file info - may have multiple page files
+                    let mut total_size: u64 = 0;
+                    let mut total_in_use: u64 = 0;
+                    let mut offset = 0usize;
+
+                    loop {
+                        if offset + 16 > pagefile_info.len() {
+                            break;
+                        }
+                        let info = &*(pagefile_info.as_ptr().add(offset) as *const SystemPageFileInfo);
+                        total_size += info.total_size as u64 * page_size;
+                        total_in_use += info.total_in_use as u64 * page_size;
+
+                        if info.next_entry_offset == 0 {
+                            break;
+                        }
+                        offset += info.next_entry_offset as usize;
+                    }
+                    (total_size, total_in_use)
+                } else {
+                    // Fallback: estimate from GetPerformanceInfo
+                    // Page file size ≈ commit limit - physical memory
+                    let pf_total = (perf_info.CommitLimit as u64)
+                        .saturating_sub(perf_info.PhysicalTotal as u64) * page_size;
+                    // Usage estimate: committed that exceeds physical
+                    let pf_used = (perf_info.CommitTotal as u64 * page_size)
+                        .saturating_sub(total);
+                    (pf_total, pf_used.min(pf_total))
+                };
 
                 // used_percent reflects actual application memory usage
                 let total_used = used + buffers + shared;

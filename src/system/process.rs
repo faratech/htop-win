@@ -566,30 +566,13 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             };
 
             // Use cached elevation/arch if available, otherwise query
-            let (is_elevated, arch) = if let Some(&(elevated, arch, _)) = cached_static {
-                (elevated, arch)
+            // Consolidate token operations - open once for both elevation and user
+            let (is_elevated, arch, user) = if let Some(&(elevated, arch, _)) = cached_static {
+                // Use cached elevation/arch, still need to check user cache
+                let user = cached_user.cloned();
+                (elevated, arch, user)
             } else if let Some(h) = handle {
-                // Query elevation from token
-                let elevated = unsafe {
-                    let mut token_handle = HANDLE::default();
-                    if OpenProcessToken(h, TOKEN_QUERY, &mut token_handle).is_ok() {
-                        let mut elevation = TOKEN_ELEVATION::default();
-                        let mut return_length: u32 = 0;
-                        let elev = GetTokenInformation(
-                            token_handle,
-                            TokenElevation,
-                            Some(&mut elevation as *mut _ as *mut _),
-                            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                            &mut return_length,
-                        ).is_ok() && elevation.TokenIsElevated != 0;
-                        let _ = CloseHandle(token_handle);
-                        elev
-                    } else {
-                        false
-                    }
-                };
-
-                // Query architecture
+                // Query architecture first (doesn't need token)
                 let arch = unsafe {
                     let mut process_machine = IMAGE_FILE_MACHINE::default();
                     let mut native_machine = IMAGE_FILE_MACHINE::default();
@@ -610,27 +593,38 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                     }
                 };
 
-                (elevated, arch)
-            } else {
-                (false, ProcessArch::Native)
-            };
-
-            // Get user from cache or query from token (separate from elevation/arch caching)
-            let user = if let Some(u) = cached_user {
-                Some(u.clone())
-            } else if let Some(h) = handle {
-                unsafe {
+                // Open token ONCE for both elevation and user queries
+                let (elevated, user) = unsafe {
                     let mut token_handle = HANDLE::default();
                     if OpenProcessToken(h, TOKEN_QUERY, &mut token_handle).is_ok() {
-                        let u = get_user_from_token(token_handle, pid);
+                        // Query elevation
+                        let mut elevation = TOKEN_ELEVATION::default();
+                        let mut return_length: u32 = 0;
+                        let elev = GetTokenInformation(
+                            token_handle,
+                            TokenElevation,
+                            Some(&mut elevation as *mut _ as *mut _),
+                            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                            &mut return_length,
+                        ).is_ok() && elevation.TokenIsElevated != 0;
+
+                        // Query user from same token (if not cached)
+                        let user = if cached_user.is_some() {
+                            cached_user.cloned()
+                        } else {
+                            get_user_from_token(token_handle, pid)
+                        };
+
                         let _ = CloseHandle(token_handle);
-                        u
+                        (elev, user)
                     } else {
-                        None
+                        (false, cached_user.cloned())
                     }
-                }
+                };
+
+                (elevated, arch, user)
             } else {
-                None
+                (false, ProcessArch::Native, cached_user.cloned())
             };
 
             if let Some(h) = handle {
@@ -831,6 +825,9 @@ impl ProcessInfo {
 
         // Use sequential iteration - the per-item work (cache reads, struct creation) is too
         // lightweight for parallelization to help
+        // Cache current time once for all processes (avoids syscall per process)
+        let now = std::time::Instant::now();
+
         native_procs
             .iter()
             .map(|proc| {
@@ -856,7 +853,6 @@ impl ProcessInfo {
                 let handle_count = proc.handle_count;
 
                 // Get cached efficiency_mode if available (requires Windows API call to query)
-                let now = std::time::Instant::now();
                 let efficiency_mode = EFFICIENCY_MODE_CACHE
                     .read()
                     .ok()

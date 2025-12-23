@@ -11,7 +11,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, ViewMode};
+use crate::app::{App, ColumnBounds, SortColumn, ViewMode};
 
 /// Draw the entire UI
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -38,6 +38,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Constraint::Length(2),
         ])
         .split(size);
+
+    // Update UI bounds for mouse/keyboard navigation
+    app.ui_bounds.header_y_start = 0;
+    app.ui_bounds.header_y_end = if app.show_header { chunks[0].y + chunks[0].height } else { 0 };
+    app.ui_bounds.column_header_y = chunks[1].y;
+    app.ui_bounds.process_list_y_start = chunks[1].y + 1; // +1 to skip header row
+    app.ui_bounds.process_list_y_end = chunks[1].y + chunks[1].height;
+    app.ui_bounds.footer_y_start = chunks[2].y;
+
+    // Calculate column bounds using the same constraint resolution as the Table widget
+    app.ui_bounds.columns = calculate_column_bounds(&app.cached_visible_columns, chunks[1]);
 
     // Draw header (CPU bars, memory, etc.) if visible
     if app.show_header {
@@ -105,4 +116,43 @@ pub fn centered_rect_fixed(width: u16, height: u16, r: Rect) -> Rect {
     let x = r.x + (r.width.saturating_sub(width)) / 2;
     let y = r.y + (r.height.saturating_sub(height)) / 2;
     Rect::new(x, y, width.min(r.width), height.min(r.height))
+}
+
+/// Calculate column bounds based on visible columns and available area
+/// Uses ratatui's Layout to resolve constraints exactly as the Table widget does
+fn calculate_column_bounds(visible_columns: &[SortColumn], area: Rect) -> Vec<ColumnBounds> {
+    if visible_columns.is_empty() {
+        return Vec::new();
+    }
+
+    // Build the same constraints used in process_list.rs
+    let constraints: Vec<Constraint> = visible_columns
+        .iter()
+        .map(|col| {
+            if matches!(col, SortColumn::Command) {
+                Constraint::Min(col.width())
+            } else {
+                Constraint::Length(col.width())
+            }
+        })
+        .collect();
+
+    // Use Layout to resolve constraints to actual widths
+    // This matches how ratatui's Table internally calculates column positions
+    let column_areas = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(constraints)
+        .spacing(1) // Match Table's column_spacing(1)
+        .split(area);
+
+    // Build column bounds from the resolved layout
+    visible_columns
+        .iter()
+        .enumerate()
+        .map(|(i, col)| ColumnBounds {
+            column: Some(*col),
+            x: column_areas[i].x,
+            width: column_areas[i].width,
+        })
+        .collect()
 }
