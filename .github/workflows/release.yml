@@ -69,6 +69,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history to access tag annotations
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -84,6 +89,16 @@ jobs:
             echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
 
+      - name: Get tag message
+        id: tag_message
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          # Get the tag annotation message (excludes the tag name line)
+          MESSAGE=$(git tag -l --format='%(contents)' "$TAG")
+          # Write to file to preserve newlines
+          echo "$MESSAGE" > release_notes.md
+          echo "Generated release notes for $TAG"
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -94,11 +109,4 @@ jobs:
           files: |
             artifacts/htop-win-amd64.exe
             artifacts/htop-win-arm64.exe
-          body: |
-            ## htop-win ${{ steps.tag.outputs.tag }}
-
-            Windows process viewer inspired by htop.
-
-            ### Downloads
-            - `htop-win-amd64.exe` - Windows x64
-            - `htop-win-arm64.exe` - Windows ARM64
+          body_path: release_notes.md
