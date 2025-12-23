@@ -903,6 +903,7 @@ impl Theme {
     }
 
     /// Get color for process priority
+    #[allow(dead_code)]
     pub fn priority_color_for_nice(&self, nice: i32) -> Color {
         if nice < 0 {
             self.process_high_priority

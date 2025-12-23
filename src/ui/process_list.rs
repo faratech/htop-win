@@ -313,12 +313,21 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                         }
                         SortColumn::Priority => (
                             format!("{:>3}", proc.priority),
-                            if is_selected { theme.selection_fg } else { theme.priority_color_for_nice(proc.nice) }
+                            if is_selected { theme.selection_fg } else { theme.process }  // htop uses default color
                         ),
-                        SortColumn::Nice => (
-                            format!("{:>3}", proc.nice),
-                            if is_selected { theme.selection_fg } else { theme.priority_color_for_nice(proc.nice) }
-                        ),
+                        SortColumn::Nice => {
+                            // htop: nice < 0 = red, nice > 0 = green, nice == 0 = shadow
+                            let color = if is_selected {
+                                theme.selection_fg
+                            } else if proc.nice < 0 {
+                                theme.process_high_priority
+                            } else if proc.nice > 0 {
+                                theme.process_low_priority
+                            } else {
+                                theme.process_shadow  // nice == 0 is dimmed in htop
+                            };
+                            (format!("{:>3}", proc.nice), color)
+                        }
                         SortColumn::Threads => {
                             // htop: If nlwp == 1, use PROCESS_SHADOW (dimmed)
                             let color = if is_selected {
@@ -359,24 +368,24 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             )
                         }
                         SortColumn::Cpu => {
-                            // htop: use gradient coloring, highlight >= 99.9%
+                            // htop Row_printPercentage: default color, only >= 99.9% is cyan
                             let color = if is_selected {
                                 theme.selection_fg
                             } else if proc.cpu_percent >= 99.9 {
                                 theme.process_megabytes
                             } else {
-                                theme.cpu_color(proc.cpu_percent)
+                                theme.process  // htop uses default/white for normal values
                             };
                             (format!("{:>5.1}", proc.cpu_percent), color)
                         }
                         SortColumn::Mem => {
-                            // htop: use threshold coloring, highlight >= 99.9%
+                            // htop Row_printPercentage: default color, only >= 99.9% is cyan
                             let color = if is_selected {
                                 theme.selection_fg
                             } else if proc.mem_percent >= 99.9 {
                                 theme.process_megabytes
                             } else {
-                                theme.mem_color(proc.mem_percent)
+                                theme.process  // htop uses default/white for normal values
                             };
                             (format!("{:>5.1}", proc.mem_percent), color)
                         }
@@ -387,7 +396,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                         }
                         SortColumn::StartTime => (
                             format!("{:>7}", format_start_time(proc.start_time, now_secs)),
-                            if is_selected { theme.selection_fg } else { theme.text_dim }
+                            if is_selected { theme.selection_fg } else { theme.process }  // htop uses default color
                         ),
                         SortColumn::Command => unreachable!(), // Handled above
                         // Windows-specific columns (use theme colors)
