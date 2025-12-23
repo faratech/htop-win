@@ -9,6 +9,61 @@ use ratatui::{
 use crate::app::{App, SortColumn};
 use crate::ui::colors::Theme;
 
+/// Format CPU time with multi-colored output like htop's Row_printTime
+/// - 0:00.00 = shadow (gray)
+/// - < 60 min: base color
+/// - Hours: hours in cyan, rest in base
+/// - Days: days in green, hours in cyan
+/// - Years: years in red, days in green
+fn format_time_colored<'a>(duration: std::time::Duration, theme: &Theme, is_selected: bool) -> Vec<Span<'a>> {
+    let total_secs = duration.as_secs();
+    let centis = duration.subsec_millis() / 10;
+
+    let (base, hour_color, day_color, year_color, shadow) = if is_selected {
+        (theme.selection_fg, theme.selection_fg, theme.selection_fg, theme.selection_fg, theme.selection_fg)
+    } else {
+        (theme.process, theme.process_megabytes, theme.process_gigabytes, theme.large_number, theme.process_shadow)
+    };
+
+    // Zero time - show in shadow
+    if total_secs == 0 && centis == 0 {
+        return vec![Span::styled(" 0:00.00 ".to_string(), Style::default().fg(shadow))];
+    }
+
+    let total_mins = total_secs / 60;
+    let total_hours = total_mins / 60;
+    let total_days = total_hours / 24;
+
+    let secs = total_secs % 60;
+    let mins = total_mins % 60;
+    let hours = total_hours % 24;
+
+    if total_mins < 60 {
+        // Minutes:seconds.centis
+        vec![Span::styled(format!("{:2}:{:02}.{:02}", total_mins, secs, centis), Style::default().fg(base))]
+    } else if total_hours < 24 {
+        // Hours in cyan, rest in base: Xh:MM:SS
+        vec![
+            Span::styled(format!("{:2}h", total_hours), Style::default().fg(hour_color)),
+            Span::styled(format!("{:02}:{:02}", mins, secs), Style::default().fg(base)),
+        ]
+    } else if total_days < 365 {
+        // Days in green, hours in cyan: Xd:XXh
+        vec![
+            Span::styled(format!("{:3}d", total_days), Style::default().fg(day_color)),
+            Span::styled(format!("{:02}h", hours), Style::default().fg(hour_color)),
+        ]
+    } else {
+        // Years in red, days in green
+        let years = total_days / 365;
+        let days = total_days % 365;
+        vec![
+            Span::styled(format!("{:3}y", years), Style::default().fg(year_color)),
+            Span::styled(format!("{:03}d", days), Style::default().fg(day_color)),
+        ]
+    }
+}
+
 /// Format bytes with multi-colored output like htop's Row_printKBytes
 /// Returns spans with different colors for different magnitude parts
 fn format_bytes_colored<'a>(bytes: u64, theme: &Theme, is_selected: bool) -> Vec<Span<'a>> {
@@ -329,10 +384,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             };
                             (format!("{:>5.1}", proc.mem_percent), color)
                         }
-                        SortColumn::Time => (
-                            format!("{:>9}", proc.format_cpu_time()),
-                            if is_selected { theme.selection_fg } else { theme.time_color }
-                        ),
+                        SortColumn::Time => {
+                            // htop: Multi-colored time display
+                            let spans = format_time_colored(proc.cpu_time, theme, is_selected);
+                            return Cell::from(Line::from(spans));
+                        }
                         SortColumn::StartTime => (
                             format!("{:>7}", format_start_time(proc.start_time, now_secs)),
                             if is_selected { theme.selection_fg } else { theme.text_dim }
