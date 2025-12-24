@@ -211,9 +211,10 @@ pub fn calculate_cpu_percentages(
     }
 
     // Batch update cache with current times (single lock acquisition)
-    let updates: Vec<(u32, u64, u64)> = processes
+    // Include create_time to detect PID reuse
+    let updates: Vec<(u32, u64, u64, u64)> = processes
         .iter()
-        .map(|p| (p.pid, p.kernel_time, p.user_time))
+        .map(|p| (p.pid, p.kernel_time, p.user_time, p.create_time))
         .collect();
     CACHE.update_cpu_times_batch(&updates);
 

@@ -1604,8 +1604,10 @@ impl App {
         if let Some(proc) = self.selected_process() {
             // Get current affinity or default to all CPUs
             let cpu_count = self.system_metrics.cpu.core_usage.len();
+            // Safe bit shift: for 64+ CPUs, use all bits set
+            let all_cpus = if cpu_count >= 64 { u64::MAX } else { (1u64 << cpu_count) - 1 };
             self.affinity_mask = crate::system::get_process_affinity(proc.pid)
-                .unwrap_or((1u64 << cpu_count) - 1);
+                .unwrap_or(all_cpus);
             self.affinity_selected = 0;
             self.view_mode = ViewMode::Affinity;
         }
@@ -1631,10 +1633,14 @@ impl App {
         let now = Instant::now();
 
         // Clear buffer if too much time has passed (1 second timeout)
+        // or if buffer exceeds max PID length (u32 max is 10 digits)
         if let Some(last_time) = self.pid_search_time {
             if now.duration_since(last_time) > Duration::from_secs(1) {
                 self.pid_search_buffer.clear();
             }
+        }
+        if self.pid_search_buffer.len() >= 10 {
+            self.pid_search_buffer.clear();
         }
 
         // Add digit to buffer

@@ -28,6 +28,9 @@ pub mod config {
 /// Per-PID cache entry containing all cached process data
 #[derive(Clone)]
 pub struct ProcessCacheEntry {
+    // Process identity - used to detect PID reuse
+    pub create_time: u64,
+
     // CPU time tracking (for CPU% delta calculation)
     pub kernel_time: u64,
     pub user_time: u64,
@@ -49,6 +52,7 @@ pub struct ProcessCacheEntry {
 impl Default for ProcessCacheEntry {
     fn default() -> Self {
         Self {
+            create_time: 0,
             kernel_time: 0,
             user_time: 0,
             cpu_time_updated: Instant::now(),
@@ -119,11 +123,22 @@ impl ProcessCache {
     }
 
     /// Batch update CPU times for multiple PIDs (single lock acquisition)
-    pub fn update_cpu_times_batch(&self, updates: &[(u32, u64, u64)]) {
+    /// Tuple: (pid, kernel_time, user_time, create_time)
+    pub fn update_cpu_times_batch(&self, updates: &[(u32, u64, u64, u64)]) {
         if let Ok(mut cache) = self.entries.write() {
             let now = Instant::now();
-            for &(pid, kernel_time, user_time) in updates {
+            for &(pid, kernel_time, user_time, create_time) in updates {
                 let entry = cache.entry(pid).or_default();
+                // Detect PID reuse: if create_time changed, invalidate static fields
+                if entry.create_time != 0 && entry.create_time != create_time {
+                    entry.user = None;
+                    entry.is_elevated = None;
+                    entry.arch = None;
+                    entry.exe_path = None;
+                    entry.efficiency_mode = None;
+                    entry.efficiency_updated = None;
+                }
+                entry.create_time = create_time;
                 entry.kernel_time = kernel_time;
                 entry.user_time = user_time;
                 entry.cpu_time_updated = now;

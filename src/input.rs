@@ -872,8 +872,8 @@ fn handle_affinity_keys(app: &mut App, key: KeyEvent) -> bool {
             app.view_mode = ViewMode::Normal;
         }
         KeyCode::Char('a') => {
-            // Select all CPUs
-            app.affinity_mask = (1u64 << cpu_count) - 1;
+            // Select all CPUs (safe for 64+ CPU systems)
+            app.affinity_mask = if cpu_count >= 64 { u64::MAX } else { (1u64 << cpu_count) - 1 };
         }
         KeyCode::Char('n') => {
             // Select no CPUs (will be invalid, but user might want to start fresh)
