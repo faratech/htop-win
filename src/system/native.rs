@@ -5,8 +5,10 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 
-use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
 use windows::Win32::Foundation::{HANDLE, UNICODE_STRING};
+use windows::Win32::System::SystemInformation::{
+    NtQuerySystemInformation, SystemProcessInformation,
+};
 
 /// Raw process information from NtQuerySystemInformation
 #[derive(Clone, Debug)]

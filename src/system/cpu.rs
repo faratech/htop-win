@@ -55,10 +55,10 @@ impl CpuInfo {
 #[cfg(windows)]
 fn get_cpu_info() -> (Vec<f32>, Vec<CpuBreakdown>) {
     use std::mem::size_of;
-    use windows::Wdk::System::SystemInformation::{
+    use windows::Win32::System::SystemInformation::{
         NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS,
+        SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION,
     };
-    use windows::Win32::System::WindowsProgramming::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION;
 
     // SystemProcessorPerformanceInformation = 8
     const SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION_CLASS: SYSTEM_INFORMATION_CLASS =

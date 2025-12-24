@@ -55,9 +55,10 @@ impl MemoryInfo {
     /// - Cache (yellow): Standby memory (can be reclaimed)
     #[cfg(windows)]
     pub fn from_native() -> Self {
-        use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
         use windows::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
-        use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
+        use windows::Win32::System::SystemInformation::{
+            GlobalMemoryStatusEx, NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS, MEMORYSTATUSEX,
+        };
 
         let mut status = MEMORYSTATUSEX {
             dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
