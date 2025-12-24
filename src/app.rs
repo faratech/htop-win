@@ -4,6 +4,69 @@ use crate::ui::colors::Theme;
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
 
+// ============================================================================
+// Unified UI Element System
+// ============================================================================
+
+/// Identifies a specific UI element that can be interacted with
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UIElement {
+    /// CPU meter bar (index = core number, None = average)
+    CpuMeter(Option<usize>),
+    /// Memory meter bar
+    MemoryMeter,
+    /// Swap meter bar
+    SwapMeter,
+    /// Column header (for sorting)
+    ColumnHeader(SortColumn),
+    /// Process row (index = visible row index, pid = process ID)
+    ProcessRow { index: usize, pid: u32 },
+    /// Footer function key (F1-F10)
+    FunctionKey(u8),
+    /// Generic header area
+    Header,
+    /// Generic footer area
+    Footer,
+}
+
+/// Actions that can be performed on UI elements
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UIAction {
+    /// Single left click
+    Click,
+    /// Double left click
+    DoubleClick,
+    /// Right click (context menu)
+    RightClick,
+    /// Middle click
+    MiddleClick,
+    /// Keyboard select (Enter/Space)
+    Select,
+    /// Keyboard navigate to
+    Focus,
+}
+
+/// A rectangular region on screen associated with a UI element
+#[derive(Debug, Clone)]
+pub struct UIRegion {
+    pub element: UIElement,
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+impl UIRegion {
+    pub fn new(element: UIElement, x: u16, y: u16, width: u16, height: u16) -> Self {
+        Self { element, x, y, width, height }
+    }
+
+    /// Check if a point is within this region
+    pub fn contains(&self, x: u16, y: u16) -> bool {
+        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+    }
+}
+
 /// Bounds of a single column in the process list header
 #[derive(Debug, Clone, Default)]
 pub struct ColumnBounds {
@@ -29,21 +92,85 @@ pub struct UIBounds {
 
     /// Footer area
     pub footer_y_start: u16,
+
+    /// All interactive UI regions (for unified hit testing)
+    pub regions: Vec<UIRegion>,
+
+    /// Function key regions in footer
+    pub function_keys: Vec<UIRegion>,
+
+    /// Currently focused element (for keyboard navigation)
+    pub focused: Option<UIElement>,
 }
 
 impl UIBounds {
+    /// Clear all regions (call at start of each render)
+    pub fn clear_regions(&mut self) {
+        self.regions.clear();
+        self.function_keys.clear();
+    }
+
+    /// Add a UI region
+    pub fn add_region(&mut self, region: UIRegion) {
+        self.regions.push(region);
+    }
+
+    /// Add a function key region
+    pub fn add_function_key(&mut self, key: u8, x: u16, y: u16, width: u16) {
+        self.function_keys.push(UIRegion::new(
+            UIElement::FunctionKey(key),
+            x, y, width, 1,
+        ));
+    }
+
+    /// Find which element is at the given coordinates
+    pub fn element_at(&self, x: u16, y: u16) -> Option<UIElement> {
+        // Check function keys first (most specific)
+        for region in &self.function_keys {
+            if region.contains(x, y) {
+                return Some(region.element.clone());
+            }
+        }
+
+        // Check all other regions
+        for region in &self.regions {
+            if region.contains(x, y) {
+                return Some(region.element.clone());
+            }
+        }
+
+        // Fall back to area-based detection
+        if y < self.header_y_end {
+            return Some(UIElement::Header);
+        }
+
+        if y == self.column_header_y {
+            if let Some(col) = self.column_at_x(x) {
+                return Some(UIElement::ColumnHeader(col));
+            }
+        }
+
+        if let Some(row_index) = self.process_row_index(y) {
+            // Note: PID needs to be filled in by caller who has process data
+            return Some(UIElement::ProcessRow { index: row_index, pid: 0 });
+        }
+
+        if y >= self.footer_y_start {
+            return Some(UIElement::Footer);
+        }
+
+        None
+    }
+
     /// Find which column contains the given x coordinate
     pub fn column_at_x(&self, x: u16) -> Option<SortColumn> {
         for (i, col) in self.columns.iter().enumerate() {
             let is_last = i == self.columns.len() - 1;
-            // Last column extends to infinity (captures everything to the right)
             if is_last {
                 if x >= col.x {
                     return col.column;
                 }
             } else {
-                // Check if x is within this column's content area only
-                // The gap after this column will be checked as part of the next column
                 let col_end = col.x + col.width;
                 if x >= col.x && x < col_end {
                     return col.column;
@@ -70,6 +197,18 @@ impl UIBounds {
         } else {
             None
         }
+    }
+
+    /// Get function key at position
+    pub fn function_key_at(&self, x: u16, y: u16) -> Option<u8> {
+        for region in &self.function_keys {
+            if region.contains(x, y) {
+                if let UIElement::FunctionKey(key) = region.element {
+                    return Some(key);
+                }
+            }
+        }
+        None
     }
 }
 
@@ -289,10 +428,19 @@ pub struct App {
     pub cpu_history: Vec<VecDeque<f32>>,
     /// Memory usage history for graph mode (last N samples)
     pub mem_history: VecDeque<f32>,
+    pub swap_history: VecDeque<f32>,
     /// Cached visible columns (updated when column config changes)
     pub cached_visible_columns: Vec<SortColumn>,
     /// UI layout bounds (populated during render for accurate mouse/keyboard navigation)
     pub ui_bounds: UIBounds,
+
+    // Mouse interaction state
+    /// Last click position for double-click detection
+    pub last_click_pos: Option<(u16, u16)>,
+    /// Last click time for double-click detection
+    pub last_click_time: Option<Instant>,
+    /// Double-click threshold in milliseconds
+    pub double_click_ms: u64,
 }
 
 impl App {
@@ -349,8 +497,12 @@ impl App {
             affinity_selected: 0,
             cpu_history: Vec::new(),
             mem_history: VecDeque::new(),
+            swap_history: VecDeque::new(),
             cached_visible_columns: visible_columns,
             ui_bounds: UIBounds::default(),
+            last_click_pos: None,
+            last_click_time: None,
+            double_click_ms: 500, // Standard double-click threshold
         }
     }
 
@@ -385,6 +537,19 @@ impl App {
         if let Some(proc) = self.selected_process() {
             self.kill_target = Some((proc.pid, proc.name.clone(), proc.command.clone()));
             self.view_mode = ViewMode::Kill;
+        }
+    }
+
+    /// Enter nice mode and capture the target process
+    pub fn enter_nice_mode(&mut self, adjust: i32) {
+        if let Some(proc) = self.selected_process() {
+            // Extract values before modifying self to satisfy borrow checker
+            let target = (proc.pid, proc.name.clone(), proc.command.clone());
+            let new_nice = (proc.nice + adjust).clamp(-20, 19);
+
+            self.kill_target = Some(target);
+            self.nice_value = new_nice;
+            self.view_mode = ViewMode::Nice;
         }
     }
 
@@ -440,6 +605,12 @@ impl App {
             self.mem_history.pop_front(); // O(1) instead of O(n)
         }
         self.mem_history.push_back(self.system_metrics.memory.used_percent);
+
+        // Add current swap usage to history
+        if self.swap_history.len() >= MAX_HISTORY {
+            self.swap_history.pop_front();
+        }
+        self.swap_history.push_back(self.system_metrics.memory.swap_percent);
     }
 
     /// Update displayed processes based on filter and sort

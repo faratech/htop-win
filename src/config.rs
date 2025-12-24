@@ -17,6 +17,18 @@ pub enum MeterMode {
     Hidden,
 }
 
+impl MeterMode {
+    /// Cycle to the next meter mode
+    pub fn next(self) -> Self {
+        match self {
+            MeterMode::Bar => MeterMode::Text,
+            MeterMode::Text => MeterMode::Graph,
+            MeterMode::Graph => MeterMode::Hidden,
+            MeterMode::Hidden => MeterMode::Bar,
+        }
+    }
+}
+
 /// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]

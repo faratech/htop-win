@@ -192,15 +192,13 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
                 .position(|c| *c == app.sort_column)
                 .unwrap_or(0);
         }
-        // Decrease priority / higher priority (F7, ])
+        // Higher priority / decrease nice value (F7, ])
         KeyCode::F(7) | KeyCode::Char(']') => {
-            app.nice_value = -5;
-            app.set_nice_selected(app.nice_value);
+            app.enter_nice_mode(-1);
         }
-        // Increase priority / lower priority (F8, [)
+        // Lower priority / increase nice value (F8, [)
         KeyCode::F(8) | KeyCode::Char('[') => {
-            app.nice_value = 5;
-            app.set_nice_selected(app.nice_value);
+            app.enter_nice_mode(1);
         }
         KeyCode::F(9) => {
             app.enter_kill_mode();
@@ -765,57 +763,262 @@ fn handle_affinity_keys(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
-/// Handle mouse events
+/// Handle mouse events with unified element detection
 pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
+    use crate::app::UIAction;
+    use std::time::Instant;
+
+    let x = mouse.column;
+    let y = mouse.row;
+
+    // Check if we're in a dialog/modal mode
+    let is_in_dialog = matches!(
+        app.view_mode,
+        ViewMode::Help
+            | ViewMode::Search
+            | ViewMode::Filter
+            | ViewMode::SortSelect
+            | ViewMode::Kill
+            | ViewMode::SignalSelect
+            | ViewMode::Nice
+            | ViewMode::Setup
+            | ViewMode::ProcessInfo
+            | ViewMode::UserSelect
+            | ViewMode::Environment
+            | ViewMode::ColorScheme
+            | ViewMode::CommandWrap
+            | ViewMode::ColumnConfig
+            | ViewMode::Affinity
+    );
+
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            handle_mouse_click(app, mouse.column, mouse.row);
+            // If in a dialog, clicking outside should close it
+            if is_in_dialog {
+                // For now, any click in dialog mode that's not on a specific element closes the dialog
+                // This is a simplified approach - clicking anywhere dismisses the dialog
+                // TODO: Could add proper dialog bounds tracking for more precise click detection
+                app.view_mode = ViewMode::Normal;
+                return;
+            }
+
+            // Check for double-click
+            let now = Instant::now();
+            let is_double_click = if let (Some(last_pos), Some(last_time)) =
+                (app.last_click_pos, app.last_click_time)
+            {
+                let same_position = last_pos == (x, y);
+                let within_threshold = now.duration_since(last_time).as_millis() < app.double_click_ms as u128;
+                same_position && within_threshold
+            } else {
+                false
+            };
+
+            // Update click tracking
+            app.last_click_pos = Some((x, y));
+            app.last_click_time = Some(now);
+
+            let action = if is_double_click {
+                // Clear for next potential double-click sequence
+                app.last_click_pos = None;
+                app.last_click_time = None;
+                UIAction::DoubleClick
+            } else {
+                UIAction::Click
+            };
+
+            handle_element_action(app, x, y, action);
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            // Right-click in dialog mode closes the dialog (like Escape)
+            if is_in_dialog {
+                app.view_mode = ViewMode::Normal;
+                return;
+            }
+            handle_element_action(app, x, y, UIAction::RightClick);
+        }
+        MouseEventKind::Down(MouseButton::Middle) => {
+            handle_element_action(app, x, y, UIAction::MiddleClick);
         }
         MouseEventKind::ScrollUp => {
-            app.select_up();
-            app.select_up();
-            app.select_up();
+            // Scroll in dialogs should scroll the dialog content
+            if is_in_dialog {
+                match app.view_mode {
+                    ViewMode::Help => app.help_scroll = app.help_scroll.saturating_sub(3),
+                    ViewMode::ProcessInfo | ViewMode::Environment => {
+                        app.env_scroll = app.env_scroll.saturating_sub(3);
+                    }
+                    ViewMode::CommandWrap => {
+                        app.command_wrap_scroll = app.command_wrap_scroll.saturating_sub(3);
+                    }
+                    ViewMode::SortSelect => app.sort_select_index = app.sort_select_index.saturating_sub(3),
+                    ViewMode::UserSelect => app.user_select_index = app.user_select_index.saturating_sub(3),
+                    ViewMode::SignalSelect => app.signal_select_index = app.signal_select_index.saturating_sub(3),
+                    _ => {}
+                }
+            } else {
+                app.select_up();
+                app.select_up();
+                app.select_up();
+            }
         }
         MouseEventKind::ScrollDown => {
-            app.select_down();
-            app.select_down();
-            app.select_down();
+            if is_in_dialog {
+                match app.view_mode {
+                    ViewMode::Help => app.help_scroll += 3,
+                    ViewMode::ProcessInfo | ViewMode::Environment => app.env_scroll += 3,
+                    ViewMode::CommandWrap => app.command_wrap_scroll += 3,
+                    ViewMode::SortSelect => app.sort_select_index += 3,
+                    ViewMode::UserSelect => app.user_select_index += 3,
+                    ViewMode::SignalSelect => app.signal_select_index += 3,
+                    _ => {}
+                }
+            } else {
+                app.select_down();
+                app.select_down();
+                app.select_down();
+            }
         }
         _ => {}
     }
 }
 
-fn handle_mouse_click(app: &mut App, x: u16, y: u16) {
-    let bounds = &app.ui_bounds;
+/// Handle an action on a UI element at the given position
+fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAction) {
+    use crate::app::{UIAction, UIElement};
 
-    // Check if clicked in header meters area
-    if y < bounds.header_y_end {
-        // Clicked in header - ignore or could add CPU bar interactions
-        return;
-    }
+    // Get the element at this position
+    let element = app.ui_bounds.element_at(x, y);
 
-    // Check if clicked on column header row
-    if bounds.is_column_header(y) {
-        // Clicked on column header - determine which column and toggle sort
-        if let Some(col) = bounds.column_at_x(x) {
-            if app.sort_column == col {
-                // Same column - toggle ascending/descending
-                app.sort_ascending = !app.sort_ascending;
+    // For process rows, fill in the actual PID
+    let element = match element {
+        Some(UIElement::ProcessRow { index, .. }) => {
+            let actual_index = app.scroll_offset + index;
+            if actual_index < app.displayed_processes.len() {
+                let pid = app.displayed_processes[actual_index].pid;
+                Some(UIElement::ProcessRow { index, pid })
             } else {
-                // Different column - switch to it with default descending
-                app.sort_column = col;
-                app.sort_ascending = false;
+                None
             }
-            app.update_displayed_processes();
         }
-        return;
-    }
+        other => other,
+    };
 
-    // Check if clicked on a process row
-    if let Some(row_index) = bounds.process_row_index(y) {
-        let clicked_index = app.scroll_offset + row_index;
-        if clicked_index < app.displayed_processes.len() {
-            app.selected_index = clicked_index;
+    // Handle the action based on element type
+    if let Some(element) = element {
+        match (&element, action) {
+            // CPU meter click - cycle meter mode
+            (UIElement::CpuMeter(_), UIAction::Click) => {
+                app.config.cpu_meter_mode = app.config.cpu_meter_mode.next();
+            }
+
+            // Memory meter click - cycle meter mode
+            (UIElement::MemoryMeter, UIAction::Click) => {
+                app.config.memory_meter_mode = app.config.memory_meter_mode.next();
+            }
+
+            // Swap meter click - cycle meter mode (shares with memory)
+            (UIElement::SwapMeter, UIAction::Click) => {
+                app.config.memory_meter_mode = app.config.memory_meter_mode.next();
+            }
+
+            // Column header clicks - sort
+            (UIElement::ColumnHeader(col), UIAction::Click) => {
+                if app.sort_column == *col {
+                    app.sort_ascending = !app.sort_ascending;
+                } else {
+                    app.sort_column = *col;
+                    app.sort_ascending = false;
+                }
+                app.update_displayed_processes();
+            }
+
+            // Process row single click - select
+            (UIElement::ProcessRow { index, .. }, UIAction::Click) => {
+                let actual_index = app.scroll_offset + index;
+                if actual_index < app.displayed_processes.len() {
+                    app.selected_index = actual_index;
+                }
+            }
+
+            // Process row double click - open process info
+            (UIElement::ProcessRow { index, pid: _ }, UIAction::DoubleClick) => {
+                let actual_index = app.scroll_offset + index;
+                if actual_index < app.displayed_processes.len() {
+                    app.selected_index = actual_index;
+                    // Open process info dialog
+                    app.enter_process_info_mode();
+                }
+            }
+
+            // Process row right click - tag process
+            (UIElement::ProcessRow { index, pid }, UIAction::RightClick) => {
+                let actual_index = app.scroll_offset + index;
+                if actual_index < app.displayed_processes.len() {
+                    app.selected_index = actual_index;
+                    // Toggle tag on the process
+                    if app.tagged_pids.contains(pid) {
+                        app.tagged_pids.remove(pid);
+                    } else {
+                        app.tagged_pids.insert(*pid);
+                    }
+                }
+            }
+
+            // Process row middle click - kill process
+            (UIElement::ProcessRow { index, pid: _ }, UIAction::MiddleClick) => {
+                let actual_index = app.scroll_offset + index;
+                if actual_index < app.displayed_processes.len() {
+                    app.selected_index = actual_index;
+                    // Open kill dialog
+                    app.enter_kill_mode();
+                }
+            }
+
+            // Function key click - trigger the key
+            (UIElement::FunctionKey(key), UIAction::Click) => {
+                handle_function_key(app, *key);
+            }
+
+            // Header area double-click - toggle header visibility
+            (UIElement::Header, UIAction::DoubleClick) => {
+                app.show_header = !app.show_header;
+            }
+
+            // Footer area double-click - open setup
+            (UIElement::Footer, UIAction::DoubleClick) => {
+                app.view_mode = ViewMode::Setup;
+            }
+
+            _ => {}
         }
+    }
+}
+
+/// Handle function key press (F1-F10)
+fn handle_function_key(app: &mut App, key: u8) {
+    match key {
+        1 => app.view_mode = ViewMode::Help,
+        2 => app.view_mode = ViewMode::Setup,
+        3 => app.view_mode = ViewMode::Search,
+        4 => app.view_mode = ViewMode::Filter,
+        5 => app.tree_view = !app.tree_view,
+        6 => app.view_mode = ViewMode::SortSelect,
+        7 => {
+            // Nice up (higher priority) - decrease nice value
+            app.enter_nice_mode(-1);
+        }
+        8 => {
+            // Nice down (lower priority) - increase nice value
+            app.enter_nice_mode(1);
+        }
+        9 => {
+            // Kill
+            app.enter_kill_mode();
+        }
+        10 => {
+            // Quit is handled specially, this shouldn't be called
+        }
+        _ => {}
     }
 }

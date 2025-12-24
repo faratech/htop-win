@@ -7,7 +7,7 @@ use ratatui::{
 };
 use std::collections::VecDeque;
 
-use crate::app::App;
+use crate::app::{App, UIElement, UIRegion};
 use crate::config::MeterMode;
 use crate::system::format_bytes;
 
@@ -56,7 +56,7 @@ pub fn calculate_header_height(app: &App) -> u16 {
     (meter_rows + 2) as u16 + 2
 }
 
-pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
+pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = &app.theme;
     let block = Block::default()
         .borders(Borders::NONE)
@@ -75,7 +75,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     draw_right_column(frame, app, columns[1]);
 }
 
-fn draw_left_column(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_left_column(frame: &mut Frame, app: &mut App, area: Rect) {
     let cpu_count = app.system_metrics.cpu.core_usage.len();
     let cpu_rows = (cpu_count + 1) / 2;
     let meter_rows = cpu_rows.max(4);
@@ -94,26 +94,50 @@ fn draw_left_column(frame: &mut Frame, app: &App, area: Rect) {
         .constraints(constraints)
         .split(area);
 
-    // Draw CPU bars (left column of CPUs)
+    // Draw CPU bars (left column of CPUs) and register their regions
     for (i, row) in rows.iter().enumerate().take(meter_rows) {
         let cpu_idx = i * 2;
         if cpu_idx < cpu_count {
+            // Register CPU meter region
+            app.ui_bounds.add_region(UIRegion {
+                element: UIElement::CpuMeter(Some(cpu_idx)),
+                x: row.x,
+                y: row.y,
+                width: row.width,
+                height: row.height,
+            });
             draw_cpu_bar(frame, app, cpu_idx, app.system_metrics.cpu.core_usage[cpu_idx], *row);
         }
     }
 
-    // Draw Memory bar
+    // Draw Memory bar and register region
     if meter_rows < rows.len() {
-        draw_memory_bar(frame, app, rows[meter_rows]);
+        let row = rows[meter_rows];
+        app.ui_bounds.add_region(UIRegion {
+            element: UIElement::MemoryMeter,
+            x: row.x,
+            y: row.y,
+            width: row.width,
+            height: row.height,
+        });
+        draw_memory_bar(frame, app, row);
     }
 
-    // Draw Swap bar
+    // Draw Swap bar and register region
     if meter_rows + 1 < rows.len() {
-        draw_swap_bar(frame, app, rows[meter_rows + 1]);
+        let row = rows[meter_rows + 1];
+        app.ui_bounds.add_region(UIRegion {
+            element: UIElement::SwapMeter,
+            x: row.x,
+            y: row.y,
+            width: row.width,
+            height: row.height,
+        });
+        draw_swap_bar(frame, app, row);
     }
 }
 
-fn draw_right_column(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_right_column(frame: &mut Frame, app: &mut App, area: Rect) {
     let cpu_count = app.system_metrics.cpu.core_usage.len();
     let cpu_rows = (cpu_count + 1) / 2;
     let meter_rows = cpu_rows.max(4);
@@ -137,7 +161,16 @@ fn draw_right_column(frame: &mut Frame, app: &App, area: Rect) {
     for i in 0..meter_rows {
         let cpu_idx = i * 2 + 1;
         if cpu_idx < cpu_count {
-            draw_cpu_bar(frame, app, cpu_idx, app.system_metrics.cpu.core_usage[cpu_idx], rows[i]);
+            // Register CPU meter region
+            let row = rows[i];
+            app.ui_bounds.add_region(UIRegion {
+                element: UIElement::CpuMeter(Some(cpu_idx)),
+                x: row.x,
+                y: row.y,
+                width: row.width,
+                height: row.height,
+            });
+            draw_cpu_bar(frame, app, cpu_idx, app.system_metrics.cpu.core_usage[cpu_idx], row);
         } else {
             // Draw additional meters in empty CPU slots
             match row_idx {
@@ -390,26 +423,60 @@ fn draw_memory_bar(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_swap_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let mode = app.config.memory_meter_mode;
+
+    if mode == MeterMode::Hidden {
+        return;
+    }
+
     let mem = &app.system_metrics.memory;
     let usage = mem.swap_percent.clamp(0.0, 100.0);
     let theme = &app.theme;
 
     // htop format: "Swp[||||...    X.XXG/X.XXG]"
     let swap_info = format!("{}/{}", format_bytes(mem.swap_used), format_bytes(mem.swap_total));
-    let info_len = swap_info.len() + 1; // +1 for the closing bracket
-    let bar_width = area.width.saturating_sub(4 + info_len as u16) as usize; // 4 for "Swp["
-    let filled = ((usage as usize) * bar_width / 100).min(bar_width);
-    let empty = bar_width - filled;
 
-    // Use theme color for swap bar (htop uses red for swap)
-    let bar_color = theme.swap;
+    let line = match mode {
+        MeterMode::Text => {
+            // Text mode: just show "Swp: XX.X% (used/total)"
+            Line::from(vec![
+                Span::styled("Swp: ", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{:5.1}%", usage),
+                    Style::default().fg(theme.swap).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" ({})", swap_info), Style::default().fg(theme.text)),
+            ])
+        }
+        MeterMode::Graph => {
+            // Graph mode: sparkline using history
+            let graph_width = area.width.saturating_sub(swap_info.len() as u16 + 6) as usize;
+            let graph_str = render_sparkline(&app.swap_history, graph_width);
 
-    let line = Line::from(vec![
-        Span::styled("Swp[", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
-        Span::styled(bar_fill(filled), Style::default().fg(bar_color)),
-        Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
-        Span::styled(format!("{}]", swap_info), Style::default().fg(theme.text)),
-    ]);
+            Line::from(vec![
+                Span::styled("Swp[", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+                Span::styled(graph_str, Style::default().fg(theme.swap).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{}]", swap_info), Style::default().fg(theme.text)),
+            ])
+        }
+        MeterMode::Bar | MeterMode::Hidden => {
+            // Bar mode (default)
+            let info_len = swap_info.len() + 1; // +1 for the closing bracket
+            let bar_width = area.width.saturating_sub(4 + info_len as u16) as usize; // 4 for "Swp["
+            let filled = ((usage as usize) * bar_width / 100).min(bar_width);
+            let empty = bar_width - filled;
+
+            // Use theme color for swap bar (htop uses red for swap)
+            let bar_color = theme.swap;
+
+            Line::from(vec![
+                Span::styled("Swp[", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+                Span::styled(bar_fill(filled), Style::default().fg(bar_color)),
+                Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
+                Span::styled(format!("{}]", swap_info), Style::default().fg(theme.text)),
+            ])
+        }
+    };
 
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);

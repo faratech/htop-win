@@ -18,6 +18,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
     let theme = &app.theme;
 
+    // Clear UI regions from previous frame (they'll be repopulated during this render)
+    app.ui_bounds.clear_regions();
+
     // Fill entire screen with theme background color
     let bg_block = Block::default().style(Style::default().bg(theme.background));
     frame.render_widget(bg_block, size);
