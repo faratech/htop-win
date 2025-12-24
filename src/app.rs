@@ -233,11 +233,10 @@ impl UIBounds {
             return Some(UIElement::Header);
         }
 
-        if y == self.column_header_y {
-            if let Some(col) = self.column_at_x(x) {
+        if y == self.column_header_y
+            && let Some(col) = self.column_at_x(x) {
                 return Some(UIElement::ColumnHeader(col));
             }
-        }
 
         if let Some(row_index) = self.process_row_index(y) {
             // Note: PID needs to be filled in by caller who has process data
@@ -884,27 +883,24 @@ impl App {
                 }
 
                 // PID filter (from CLI -p option)
-                if let Some(ref pids) = self.pid_filter {
-                    if !pids.contains(&p.pid) {
+                if let Some(ref pids) = self.pid_filter
+                    && !pids.contains(&p.pid) {
                         return false;
                     }
-                }
                 // User filter
-                if let Some(ref user) = self.user_filter {
-                    if &p.user != user {
+                if let Some(ref user) = self.user_filter
+                    && &p.user != user {
                         return false;
                     }
-                }
                 // Text filter - use pre-computed lowercase strings
-                if has_filter {
-                    if !(p.name_lower.contains(&self.filter_string_lower)
+                if has_filter
+                    && !(p.name_lower.contains(&self.filter_string_lower)
                         || p.command_lower.contains(&self.filter_string_lower)
                         || p.pid.to_string().contains(&self.filter_string_lower)
                         || p.user_lower.contains(&self.filter_string_lower))
                     {
                         return false;
                     }
-                }
                 true
             })
             .cloned()
@@ -948,12 +944,11 @@ impl App {
         }
 
         // Handle follow mode - find and select the followed PID
-        if let Some(follow_pid) = self.follow_pid {
-            if let Some(idx) = self.displayed_processes.iter().position(|p| p.pid == follow_pid) {
+        if let Some(follow_pid) = self.follow_pid
+            && let Some(idx) = self.displayed_processes.iter().position(|p| p.pid == follow_pid) {
                 self.selected_index = idx;
                 self.ensure_visible();
             }
-        }
 
         // Ensure selection is valid
         if self.selected_index >= self.displayed_processes.len() {
@@ -1103,8 +1098,8 @@ impl App {
         result.push(process);
 
         // Only add children if not collapsed
-        if !is_collapsed {
-            if let Some(children) = children_map.get(&pid) {
+        if !is_collapsed
+            && let Some(children) = children_map.get(&pid) {
                 let mut sorted_children = children.clone();
                 sorted_children.sort_by(|a, b| a.pid.cmp(&b.pid));
                 let child_count = sorted_children.len();
@@ -1126,7 +1121,6 @@ impl App {
                     self.add_tree_node(result, child, children_map, depth + 1, child_is_last, child_parent_prefix.clone());
                 }
             }
-        }
     }
 
     /// Collapse tree branch at selected process
@@ -1301,15 +1295,14 @@ impl App {
         self.search_string = self.input_buffer.clone();
         self.search_string_lower = self.search_string.to_lowercase();
         // Find first matching process using pre-computed lowercase strings
-        if !self.search_string_lower.is_empty() {
-            if let Some(idx) = self.displayed_processes.iter().position(|p| {
+        if !self.search_string_lower.is_empty()
+            && let Some(idx) = self.displayed_processes.iter().position(|p| {
                 p.name_lower.contains(&self.search_string_lower)
                     || p.command_lower.contains(&self.search_string_lower)
             }) {
                 self.selected_index = idx;
                 self.ensure_visible();
             }
-        }
         // Update matches_search flags for highlighting
         self.update_displayed_processes();
     }
@@ -1634,11 +1627,10 @@ impl App {
 
         // Clear buffer if too much time has passed (1 second timeout)
         // or if buffer exceeds max PID length (u32 max is 10 digits)
-        if let Some(last_time) = self.pid_search_time {
-            if now.duration_since(last_time) > Duration::from_secs(1) {
+        if let Some(last_time) = self.pid_search_time
+            && now.duration_since(last_time) > Duration::from_secs(1) {
                 self.pid_search_buffer.clear();
             }
-        }
         if self.pid_search_buffer.len() >= 10 {
             self.pid_search_buffer.clear();
         }

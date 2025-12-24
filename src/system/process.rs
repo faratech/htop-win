@@ -59,7 +59,7 @@ pub fn enable_debug_privilege() -> bool {
             return false;
         }
 
-        let mut tp = TOKEN_PRIVILEGES {
+        let tp = TOKEN_PRIVILEGES {
             PrivilegeCount: 1,
             Privileges: [LUID_AND_ATTRIBUTES {
                 Luid: luid,
@@ -67,7 +67,7 @@ pub fn enable_debug_privilege() -> bool {
             }],
         };
 
-        let result = AdjustTokenPrivileges(token, false, Some(&mut tp), 0, None, None).is_ok();
+        let result = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None).is_ok();
         let _ = CloseHandle(token);
         result
     }
@@ -402,7 +402,6 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             // If we couldn't get a handle but need one, use cached data if available
             if need_handle && handle.is_none() {
                 let (is_elevated, arch, exe_path) = cached_static
-                    .map(|(e, a, p)| (e, a, p))
                     .unwrap_or((false, ProcessArch::Native, String::new()));
                 let user = cached_user;
                 let efficiency_mode = cached_efficiency_mode.unwrap_or(false);
@@ -451,8 +450,10 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                 mode
             } else if let Some(h) = handle {
                 unsafe {
-                    let mut throttle_state = PROCESS_POWER_THROTTLING_STATE::default();
-                    throttle_state.Version = 1;
+                    let mut throttle_state = PROCESS_POWER_THROTTLING_STATE {
+                        Version: 1,
+                        ..Default::default()
+                    };
                     let result = GetProcessInformation(
                         h, ProcessPowerThrottling,
                         &mut throttle_state as *mut _ as *mut _,
@@ -744,11 +745,10 @@ impl ProcessInfo {
                 // Get cached efficiency_mode if available (requires Windows API call to query)
                 let efficiency_mode = cached_entry
                     .and_then(|e| {
-                        if let (Some(mode), Some(updated)) = (e.efficiency_mode, e.efficiency_updated) {
-                            if now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS {
+                        if let (Some(mode), Some(updated)) = (e.efficiency_mode, e.efficiency_updated)
+                            && now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS {
                                 return Some(mode);
                             }
-                        }
                         None
                     })
                     .unwrap_or(false);

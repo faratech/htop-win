@@ -88,11 +88,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Draw error message if present (within expiry window)
-    if let Some((ref error, time)) = app.last_error {
-        if time.elapsed() < std::time::Duration::from_secs(5) {
+    if let Some((ref error, time)) = app.last_error
+        && time.elapsed() < std::time::Duration::from_secs(5) {
             dialogs::draw_error(frame, error);
         }
-    }
 }
 
 /// Center a rectangle within another

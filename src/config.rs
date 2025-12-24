@@ -160,8 +160,8 @@ impl Config {
 
     /// Load configuration from file, or return defaults
     pub fn load() -> Self {
-        if let Some(path) = Self::config_path() {
-            if path.exists() {
+        if let Some(path) = Self::config_path()
+            && path.exists() {
                 match fs::read_to_string(&path) {
                     Ok(content) => {
                         match serde_json::from_str(&content) {
@@ -176,7 +176,6 @@ impl Config {
                     }
                 }
             }
-        }
         Self::default()
     }
 
@@ -210,23 +209,21 @@ impl Config {
 
     /// Move a visible column up in the order (returns true if moved)
     pub fn move_column_up(&mut self, column: &str) -> bool {
-        if let Some(pos) = self.visible_columns.iter().position(|c| c == column) {
-            if pos > 0 {
+        if let Some(pos) = self.visible_columns.iter().position(|c| c == column)
+            && pos > 0 {
                 self.visible_columns.swap(pos, pos - 1);
                 return true;
             }
-        }
         false
     }
 
     /// Move a visible column down in the order (returns true if moved)
     pub fn move_column_down(&mut self, column: &str) -> bool {
-        if let Some(pos) = self.visible_columns.iter().position(|c| c == column) {
-            if pos < self.visible_columns.len() - 1 {
+        if let Some(pos) = self.visible_columns.iter().position(|c| c == column)
+            && pos < self.visible_columns.len() - 1 {
                 self.visible_columns.swap(pos, pos + 1);
                 return true;
             }
-        }
         false
     }
 

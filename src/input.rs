@@ -52,11 +52,10 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
     use crate::app::FocusRegion;
 
     // Check for max iterations exit
-    if let Some(max) = app.max_iterations {
-        if app.iteration_count >= max {
+    if let Some(max) = app.max_iterations
+        && app.iteration_count >= max {
             return true;
         }
-    }
 
     match key.code {
         // Quit
@@ -666,13 +665,9 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
-fn handle_process_info_keys(app: &mut App, key: KeyEvent) -> bool {
-    match key.code {
-        _ => {
-            app.process_info_target = None;
-            app.view_mode = ViewMode::Normal;
-        }
-    }
+fn handle_process_info_keys(app: &mut App, _key: KeyEvent) -> bool {
+    app.process_info_target = None;
+    app.view_mode = ViewMode::Normal;
     false
 }
 

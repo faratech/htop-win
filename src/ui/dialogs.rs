@@ -304,8 +304,7 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &App) {
         lines.push(Line::from(""));
 
         // List tagged processes (show up to 8)
-        let mut shown = 0;
-        for pid in app.tagged_pids.iter() {
+        for (shown, pid) in app.tagged_pids.iter().enumerate() {
             if shown >= 8 {
                 lines.push(Line::from(Span::styled(
                     format!("  ... and {} more", tagged_count - 8),
@@ -323,7 +322,6 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &App) {
                 Span::styled(format!("  {} ", pid), Style::default().fg(Color::Yellow)),
                 Span::styled(name, Style::default().fg(theme.text)),
             ]));
-            shown += 1;
         }
     } else {
         // Single process
@@ -654,7 +652,7 @@ pub fn draw_signal_select(frame: &mut Frame, app: &App) {
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {:2} ", num), style),
                 Span::styled(format!("{:<10}", name), style),
-                Span::styled(format!("{}", desc), style),
+                Span::styled(desc.to_string(), style),
             ]))
         })
         .collect();

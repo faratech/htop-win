@@ -205,11 +205,10 @@ impl ProcessCache {
             .ok()
             .and_then(|cache| {
                 cache.get(&pid).and_then(|e| {
-                    if let (Some(mode), Some(updated)) = (e.efficiency_mode, e.efficiency_updated) {
-                        if now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS {
+                    if let (Some(mode), Some(updated)) = (e.efficiency_mode, e.efficiency_updated)
+                        && now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS {
                             return Some(mode);
                         }
-                    }
                     None
                 })
             })
@@ -223,8 +222,8 @@ impl ProcessCache {
             .read()
             .ok()
             .map(|cache| {
-                cache.get(&pid).map_or(true, |e| {
-                    e.efficiency_updated.map_or(true, |updated| {
+                cache.get(&pid).is_none_or(|e| {
+                    e.efficiency_updated.is_none_or(|updated| {
                         now.duration_since(updated).as_millis() >= config::EFFICIENCY_TTL_MS
                     })
                 })
@@ -261,13 +260,11 @@ impl ProcessCache {
         let cache_key = (exe_path.to_string(), start_time);
 
         // Check cache first
-        if let Ok(cache) = self.exe_status.read() {
-            if let Some(entry) = cache.get(&cache_key) {
-                if now.saturating_sub(entry.checked_at) < config::EXE_STATUS_TTL_SECS {
+        if let Ok(cache) = self.exe_status.read()
+            && let Some(entry) = cache.get(&cache_key)
+                && now.saturating_sub(entry.checked_at) < config::EXE_STATUS_TTL_SECS {
                     return (entry.updated, entry.deleted);
                 }
-            }
-        }
 
         // Cache miss or stale - do filesystem check
         let result = match fs::metadata(exe_path) {

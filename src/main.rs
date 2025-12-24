@@ -480,11 +480,10 @@ fn run_app<B: ratatui::backend::Backend>(
                 needs_redraw = true;
 
                 // Check if we've reached max iterations
-                if let Some(max) = app.max_iterations {
-                    if app.iteration_count >= max {
+                if let Some(max) = app.max_iterations
+                    && app.iteration_count >= max {
                         return Ok(());
                     }
-                }
             }
 
             // Refresh I/O counters when process info dialog is open (even when paused)

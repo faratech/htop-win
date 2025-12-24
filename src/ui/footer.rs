@@ -264,26 +264,24 @@ fn build_status_line(app: &App) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
 
     // Show error message (high priority) - expires after 5 seconds
-    if let Some((ref error, time)) = app.last_error {
-        if time.elapsed() < Duration::from_secs(5) {
+    if let Some((ref error, time)) = app.last_error
+        && time.elapsed() < Duration::from_secs(5) {
             spans.push(Span::styled(
                 format!("ERROR: {} ", error),
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ));
             return spans; // Error takes precedence
         }
-    }
 
     // Show status message (success/info) - expires after 3 seconds
-    if let Some((ref msg, time)) = app.status_message {
-        if time.elapsed() < Duration::from_secs(3) {
+    if let Some((ref msg, time)) = app.status_message
+        && time.elapsed() < Duration::from_secs(3) {
             spans.push(Span::styled(
                 format!("{} ", msg),
                 Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
             ));
             return spans; // Status message takes precedence
         }
-    }
 
     // Show focus region indicator (Tab to switch)
     let focus_indicator = match app.focus_region {

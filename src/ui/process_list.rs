@@ -304,7 +304,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                         };
 
                         // Find basename position (after last path separator)
-                        let basename_start = display_command.rfind(|c| c == '\\' || c == '/')
+                        let basename_start = display_command.rfind(['\\', '/'])
                             .map(|i| i + 1)
                             .unwrap_or(0);
 

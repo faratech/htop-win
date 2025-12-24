@@ -49,7 +49,7 @@ const GRAPH_DOTS_UTF8: [&str; 25] = [
 pub fn calculate_header_height(app: &App) -> u16 {
     let cpu_count = app.system_metrics.cpu.core_usage.len();
     // We display CPUs in two columns, plus memory and swap rows, plus task info
-    let cpu_rows = (cpu_count + 1) / 2;
+    let cpu_rows = cpu_count.div_ceil(2);
     // CPU rows + Mem row + Swap row + Net/Disk row + Tasks row + borders
     // Minimum of 4 rows for the meters
     let meter_rows = cpu_rows.max(4);
@@ -77,7 +77,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_left_column(frame: &mut Frame, app: &mut App, area: Rect) {
     let cpu_count = app.system_metrics.cpu.core_usage.len();
-    let cpu_rows = (cpu_count + 1) / 2;
+    let cpu_rows = cpu_count.div_ceil(2);
     let meter_rows = cpu_rows.max(4);
 
     // Create constraints for CPU bars (left half) plus meters
@@ -139,7 +139,7 @@ fn draw_left_column(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_right_column(frame: &mut Frame, app: &mut App, area: Rect) {
     let cpu_count = app.system_metrics.cpu.core_usage.len();
-    let cpu_rows = (cpu_count + 1) / 2;
+    let cpu_rows = cpu_count.div_ceil(2);
     let meter_rows = cpu_rows.max(4);
 
     // Create constraints
@@ -309,7 +309,7 @@ fn render_sparkline(history: &VecDeque<f32>, width: usize) -> String {
     let start = available_samples.saturating_sub(samples_needed);
 
     // Calculate how many graph chars we can generate and how many spaces we need
-    let graph_chars = ((available_samples - start) + 1) / 2;
+    let graph_chars = (available_samples - start).div_ceil(2);
     let graph_chars = graph_chars.min(width);
     let padding_chars = width.saturating_sub(graph_chars);
 
