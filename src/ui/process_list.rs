@@ -16,10 +16,10 @@ fn format_time_colored<'a>(duration: std::time::Duration, theme: &Theme, is_sele
     let total_secs = duration.as_secs();
     let centis = duration.subsec_millis() / 10;
 
-    // Zero time - always show in shadow
+    // Zero time - always show in shadow (use static str, no allocation)
     if total_secs == 0 && centis == 0 {
         let shadow = if is_selected { theme.selection_fg } else { theme.process_shadow };
-        return vec![Span::styled(" 0:00.00 ".to_string(), Style::default().fg(shadow))];
+        return vec![Span::styled(" 0:00.00 ", Style::default().fg(shadow))];
     }
 
     let total_mins = total_secs / 60;
@@ -123,7 +123,7 @@ fn format_bytes_colored<'a>(bytes: u64, theme: &Theme, is_selected: bool, highli
         } else {
             vec![
                 Span::styled(format!("{:.0}", gb), Style::default().fg(color_gb)),
-                Span::styled("G".to_string(), Style::default().fg(color_mb)),
+                Span::styled("G", Style::default().fg(color_mb)),  // Use static str
             ]
         }
     } else if bytes >= MB {
@@ -253,10 +253,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 .map(|col| {
                     // Command column uses multi-span for colored indicators (htop style)
                     if *col == SortColumn::Command {
-                        // Build spans with distinct colors
-                        let mut spans: Vec<Span> = Vec::new();
+                        // Pre-allocate spans with typical capacity (tagged + elevated + arch + tree + path parts = ~8)
+                        let mut spans: Vec<Span> = Vec::with_capacity(8);
 
-                        // Tagged indicator - yellow dot prefix for visibility
+                        // Tagged indicator - yellow dot prefix for visibility (static str)
                         if is_tagged {
                             spans.push(Span::styled(
                                 "● ",
@@ -265,7 +265,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             ));
                         }
 
-                        // Elevated indicator - use theme's privileged process color
+                        // Elevated indicator - use theme's privileged process color (static str)
                         if proc.is_elevated {
                             spans.push(Span::styled(
                                 "🛡️ ",
@@ -282,7 +282,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             ));
                         }
 
-                        // Tree prefix with tree color
+                        // Tree prefix with tree color (avoid clone when empty)
                         if !tree_prefix.is_empty() {
                             spans.push(Span::styled(
                                 tree_prefix.clone(),
@@ -317,27 +317,27 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
                             // Part 1: Shadow prefix (if any) in grey
                             if shadow_prefix_len > 0 && shadow_prefix_len <= path_end {
+                                // Use String::from to get owned value from slice
                                 spans.push(Span::styled(
-                                    display_command[..shadow_prefix_len].to_string(),
+                                    String::from(&display_command[..shadow_prefix_len]),
                                     Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_shadow })
                                 ));
                                 // Part 2: Rest of path (after shadow, before basename) in normal color
                                 if shadow_prefix_len < path_end {
                                     spans.push(Span::styled(
-                                        display_command[shadow_prefix_len..path_end].to_string(),
+                                        String::from(&display_command[shadow_prefix_len..path_end]),
                                         Style::default().fg(if is_selected { theme.selection_fg } else { theme.process })
                                     ));
                                 }
                             } else {
                                 // No shadow prefix, just path in normal color
                                 spans.push(Span::styled(
-                                    display_command[..path_end].to_string(),
+                                    String::from(&display_command[..path_end]),
                                     Style::default().fg(if is_selected { theme.selection_fg } else { theme.process })
                                 ));
                             }
 
                             // Part 3: Basename - color depends on state and highlight_basename setting
-                            let basename = &display_command[basename_start..];
                             let (basename_color, basename_bold) = if is_selected {
                                 (theme.selection_fg, false)
                             } else if is_deleted_or_updated {
@@ -353,7 +353,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 Style::default().fg(basename_color)
                             };
-                            spans.push(Span::styled(basename.to_string(), basename_style));
+                            spans.push(Span::styled(String::from(&display_command[basename_start..]), basename_style));
                         } else {
                             // Not showing path, or no path separator - show as single span
                             let (color, bold) = if is_selected {
@@ -371,7 +371,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 Style::default().fg(color)
                             };
-                            spans.push(Span::styled(display_command.to_string(), style));
+                            // Clone the display_command to avoid lifetime issues
+                            spans.push(Span::styled(display_command.clone(), style));
                         }
 
                         return Cell::from(Line::from(spans));
@@ -485,14 +486,14 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             let spans = format_time_colored(proc.cpu_time, theme, is_selected, app.config.highlight_large_numbers);
                             return Cell::from(Line::from(spans));
                         }
-                        SortColumn::StartTime => (
-                            format!("{:>7}", format_start_time(proc.start_time, now_secs)),
-                            if is_selected { theme.selection_fg } else { theme.process }  // htop uses default color
-                        ),
+                        SortColumn::StartTime => {
+                            let time_str = format_start_time(proc.start_time, now_secs);
+                            (format!("{:>7}", time_str), if is_selected { theme.selection_fg } else { theme.process })
+                        }
                         SortColumn::Command => unreachable!(), // Handled above
-                        // Windows-specific columns (use theme colors)
+                        // Windows-specific columns (use theme colors, static strings for emoji)
                         SortColumn::Elevated => (
-                            if proc.is_elevated { "🛡️".to_string() } else { " ".to_string() },
+                            (if proc.is_elevated { "🛡️" } else { " " }).to_string(),
                             if is_selected { theme.selection_fg } else { theme.process_priv }  // Magenta for privileged
                         ),
                         SortColumn::Arch => (
@@ -500,7 +501,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             if is_selected { theme.selection_fg } else { theme.process_megabytes }  // Cyan for info
                         ),
                         SortColumn::Efficiency => (
-                            if proc.efficiency_mode { "🌿".to_string() } else { " ".to_string() },
+                            (if proc.efficiency_mode { "🌿" } else { " " }).to_string(),
                             if is_selected { theme.selection_fg } else { theme.process_low_priority }  // Green for eco mode
                         ),
                     };
@@ -564,15 +565,18 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(table, area);
 }
 
-fn truncate_str(s: &str, max_len: usize) -> String {
+/// Truncate string to max display width, using Cow to avoid allocation when no truncation needed
+#[inline]
+fn truncate_str(s: &str, max_len: usize) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
     use unicode_width::UnicodeWidthStr;
 
     let width = s.width();
     if width <= max_len {
-        s.to_string()
+        Cow::Borrowed(s)
     } else {
         // Safely truncate by characters, not bytes
-        let mut result = String::new();
+        let mut result = String::with_capacity(max_len + 3); // +3 for ellipsis
         let mut current_width = 0;
         for c in s.chars() {
             let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
@@ -583,26 +587,26 @@ fn truncate_str(s: &str, max_len: usize) -> String {
             result.push(c);
             current_width += char_width;
         }
-        result
+        Cow::Owned(result)
     }
 }
 
 /// Format a Unix timestamp as elapsed time or time of day
 /// Takes pre-computed `now` to avoid syscall per process
-fn format_start_time(start_time: u64, now: u64) -> String {
-    if start_time == 0 {
-        return "-".to_string();
-    }
+/// Returns Cow to avoid allocation for static "-" case
+#[inline]
+fn format_start_time(start_time: u64, now: u64) -> std::borrow::Cow<'static, str> {
+    use std::borrow::Cow;
 
-    if start_time > now {
-        return "-".to_string();
+    if start_time == 0 || start_time > now {
+        return Cow::Borrowed("-");
     }
 
     let elapsed_secs = now - start_time;
 
     // If started today, show as HH:MM
     // If started more than a day ago, show as days
-    if elapsed_secs < 60 {
+    Cow::Owned(if elapsed_secs < 60 {
         format!("{}s", elapsed_secs)
     } else if elapsed_secs < 3600 {
         format!("{}m", elapsed_secs / 60)
@@ -615,5 +619,5 @@ fn format_start_time(start_time: u64, now: u64) -> String {
         } else {
             format!("{}d{}h", days, (elapsed_secs % 86400) / 3600)
         }
-    }
+    })
 }

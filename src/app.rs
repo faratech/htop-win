@@ -1089,9 +1089,13 @@ impl App {
         process.is_collapsed = is_collapsed;
 
         // Build the tree prefix for display
+        // Use push_str instead of format! to reduce allocations
         if depth > 0 {
             let branch = if is_last { "└─ " } else { "├─ " };
-            process.tree_prefix = format!("{}{}", parent_prefix, branch);
+            let mut prefix = String::with_capacity(parent_prefix.len() + 6);
+            prefix.push_str(&parent_prefix);
+            prefix.push_str(branch);
+            process.tree_prefix = prefix;
         } else {
             process.tree_prefix = String::new();
         }
@@ -1106,9 +1110,13 @@ impl App {
                 let child_count = sorted_children.len();
 
                 // Calculate the prefix for children
+                // Use push_str instead of format! to reduce allocations
                 let child_parent_prefix = if depth > 0 {
                     let connector = if is_last { "   " } else { "│  " };
-                    format!("{}{}", parent_prefix, connector)
+                    let mut prefix = String::with_capacity(parent_prefix.len() + 3);
+                    prefix.push_str(&parent_prefix);
+                    prefix.push_str(connector);
+                    prefix
                 } else {
                     String::new()
                 };

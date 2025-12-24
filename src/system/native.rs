@@ -4,7 +4,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
-use std::sync::RwLock;
 
 use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
 use windows::Win32::Foundation::{HANDLE, UNICODE_STRING};
@@ -69,9 +68,7 @@ struct SystemProcessInfo {
     other_transfer_count: i64,
 }
 
-// Cache for previous CPU times (needed for percentage calculation)
-static CPU_TIME_CACHE: std::sync::LazyLock<RwLock<HashMap<u32, (u64, u64, std::time::Instant)>>> =
-    std::sync::LazyLock::new(|| RwLock::new(HashMap::new()));
+// CPU time cache is now in cache.rs module
 
 // Reusable buffer for NtQuerySystemInformation to avoid repeated allocations
 thread_local! {
@@ -82,6 +79,9 @@ thread_local! {
 pub fn query_all_processes() -> Vec<NativeProcessInfo> {
     QUERY_BUFFER.with(|buf| {
         let mut buffer = buf.borrow_mut();
+        // Clear the buffer to ensure fresh data on each call
+        // This is critical - without clearing, stale data from previous calls may persist
+        buffer.clear();
         let cap = buffer.capacity();
         if cap < 1024 * 1024 {
             buffer.reserve(1024 * 1024 - cap);
@@ -144,6 +144,9 @@ fn query_all_processes_with_buffer(buffer: &mut Vec<u8>) -> Vec<NativeProcessInf
         let pid = proc_info.unique_process_id.0 as usize as u32;
         let parent_pid = proc_info.inherited_from_unique_process_id.0 as usize as u32;
 
+        let kernel_time = proc_info.kernel_time as u64;
+        let user_time = proc_info.user_time as u64;
+
         processes.push(NativeProcessInfo {
             pid,
             parent_pid,
@@ -157,8 +160,8 @@ fn query_all_processes_with_buffer(buffer: &mut Vec<u8>) -> Vec<NativeProcessInf
             // virtual_size can be 2TB+ on 64-bit which confuses users
             // pagefile_usage matches Task Manager's "Commit size"
             virtual_size: proc_info.pagefile_usage as u64,
-            kernel_time: proc_info.kernel_time as u64,
-            user_time: proc_info.user_time as u64,
+            kernel_time,
+            user_time,
             create_time: proc_info.create_time as u64,
             read_bytes: proc_info.read_transfer_count as u64,
             write_bytes: proc_info.write_transfer_count as u64,
@@ -178,56 +181,45 @@ pub fn calculate_cpu_percentages(
     processes: &mut [NativeProcessInfo],
     total_cpu_delta: u64,
 ) -> HashMap<u32, f32> {
+    use super::cache::CACHE;
+
     let now = std::time::Instant::now();
     let mut cpu_percentages = HashMap::with_capacity(processes.len());
 
-    // Read previous times (scope the read lock to avoid deadlock with write lock below)
-    {
-        let prev_times = CPU_TIME_CACHE.read().ok();
+    // Get snapshot of CPU times from unified cache
+    let cache_snapshot = CACHE.snapshot();
 
-        for proc in processes.iter() {
-            let total_time = proc.kernel_time + proc.user_time;
+    for proc in processes.iter() {
+        let total_time = proc.kernel_time + proc.user_time;
 
-            let cpu_percent = if let Some(ref cache) = prev_times {
-                if let Some(&(prev_kernel, prev_user, prev_instant)) = cache.get(&proc.pid) {
-                    let prev_total = prev_kernel + prev_user;
-                    let time_delta = total_time.saturating_sub(prev_total);
-                    let elapsed = now.duration_since(prev_instant).as_nanos() as u64;
+        let cpu_percent = if let Some(entry) = cache_snapshot.get(&proc.pid) {
+            let prev_total = entry.kernel_time + entry.user_time;
+            let time_delta = total_time.saturating_sub(prev_total);
+            let elapsed = now.duration_since(entry.cpu_time_updated).as_nanos() as u64;
 
-                    if elapsed > 0 && total_cpu_delta > 0 {
-                        // CPU percentage relative to total system CPU time
-                        (time_delta as f64 / total_cpu_delta as f64 * 100.0) as f32
-                    } else {
-                        0.0
-                    }
-                } else {
-                    0.0
-                }
+            if elapsed > 0 && total_cpu_delta > 0 {
+                // CPU percentage relative to total system CPU time
+                (time_delta as f64 / total_cpu_delta as f64 * 100.0) as f32
             } else {
                 0.0
-            };
+            }
+        } else {
+            0.0
+        };
 
-            cpu_percentages.insert(proc.pid, cpu_percent);
-        }
-    } // Read lock released here
-
-    // Update cache with current times (don't clear - just overwrite)
-    // Stale entries from dead PIDs will be cleaned up by periodic cache cleanup
-    if let Ok(mut cache) = CPU_TIME_CACHE.write() {
-        for proc in processes.iter() {
-            cache.insert(proc.pid, (proc.kernel_time, proc.user_time, now));
-        }
+        cpu_percentages.insert(proc.pid, cpu_percent);
     }
+
+    // Batch update cache with current times (single lock acquisition)
+    let updates: Vec<(u32, u64, u64)> = processes
+        .iter()
+        .map(|p| (p.pid, p.kernel_time, p.user_time))
+        .collect();
+    CACHE.update_cpu_times_batch(&updates);
 
     cpu_percentages
 }
 
-/// Clean up stale entries from the CPU time cache
-pub fn cleanup_cpu_time_cache(current_pids: &std::collections::HashSet<u32>) {
-    if let Ok(mut cache) = CPU_TIME_CACHE.write() {
-        cache.retain(|pid, _| current_pids.contains(pid));
-    }
-}
 
 /// Convert FILETIME (100-ns intervals since 1601) to Unix timestamp
 #[inline]

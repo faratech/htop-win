@@ -1,13 +1,8 @@
 use std::collections::HashMap;
-#[cfg(windows)]
-use std::sync::RwLock;
 use std::time::Duration;
 
 #[cfg(windows)]
 use super::native::{NativeProcessInfo, filetime_to_unix};
-
-#[cfg(windows)]
-use std::sync::LazyLock;
 
 #[cfg(windows)]
 use windows::core::PWSTR;
@@ -83,67 +78,13 @@ pub fn enable_debug_privilege() -> bool {
     false
 }
 
-/// Cache for exe status checks to avoid filesystem calls on every refresh
-/// Key: (exe_path, start_time), Value: (exe_updated, exe_deleted, check_timestamp)
-#[cfg(windows)]
-static EXE_STATUS_CACHE: LazyLock<RwLock<HashMap<(String, u64), (bool, bool, u64)>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-
-/// How often to re-check exe status (in seconds) - filesystem check is expensive
-#[cfg(windows)]
-const EXE_STATUS_CHECK_INTERVAL: u64 = 10;
-
 /// Check if an executable has been modified or deleted since a process started.
 /// Returns (exe_updated, exe_deleted) like htop's red basename highlighting.
-/// Cached to avoid expensive filesystem calls on every refresh.
+/// Delegates to unified cache module.
 #[cfg(windows)]
+#[inline]
 fn check_exe_status(exe_path: &str, start_time: u64) -> (bool, bool) {
-    use std::fs;
-    use std::time::UNIX_EPOCH;
-
-    if exe_path.is_empty() {
-        return (false, false);
-    }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    // Check cache first
-    let cache_key = (exe_path.to_string(), start_time);
-    if let Ok(cache) = EXE_STATUS_CACHE.read() {
-        if let Some(&(updated, deleted, check_time)) = cache.get(&cache_key) {
-            if now.saturating_sub(check_time) < EXE_STATUS_CHECK_INTERVAL {
-                return (updated, deleted);
-            }
-        }
-    }
-
-    // Cache miss or stale - do the actual check
-    let result = match fs::metadata(exe_path) {
-        Ok(metadata) => {
-            let exe_updated = metadata
-                .modified()
-                .ok()
-                .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-                .map(|mtime_unix| mtime_unix.as_secs() > start_time)
-                .unwrap_or(false);
-            (exe_updated, false)
-        }
-        Err(_) => (false, true),
-    };
-
-    // Update cache (with size limit to prevent unbounded growth)
-    if let Ok(mut cache) = EXE_STATUS_CACHE.write() {
-        // Clear cache if it grows too large (stale entries from terminated processes)
-        if cache.len() > 1000 {
-            cache.clear();
-        }
-        cache.insert(cache_key, (result.0, result.1, now));
-    }
-
-    result
+    super::cache::CACHE.check_exe_status(exe_path, start_time)
 }
 
 #[cfg(not(windows))]
@@ -151,10 +92,6 @@ fn check_exe_status(_exe_path: &str, _start_time: u64) -> (bool, bool) {
     (false, false)
 }
 
-// Cache for PID to username lookups (persists across refreshes)
-#[cfg(windows)]
-static PID_USER_CACHE: LazyLock<RwLock<HashMap<u32, String>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 // Common usernames as UTF-16 for fast comparison (avoids UTF-16 to UTF-8 conversion)
 #[cfg(windows)]
@@ -190,45 +127,12 @@ fn intern_username_utf16(name: &[u16]) -> String {
     String::from_utf16_lossy(name)
 }
 
-// Cache for static process info (elevation, architecture, exe_path) - these don't change during process lifetime
-#[cfg(windows)]
-static STATIC_PROCESS_INFO_CACHE: LazyLock<RwLock<HashMap<u32, (bool, ProcessArch, String)>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-
-// Cache for efficiency_mode (requires Windows API call, not available from NtQuerySystemInformation)
-#[cfg(windows)]
-struct EfficiencyModeCache {
-    efficiency_mode: bool,
-    last_update: std::time::Instant,
-}
-
-#[cfg(windows)]
-static EFFICIENCY_MODE_CACHE: LazyLock<RwLock<HashMap<u32, EfficiencyModeCache>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-
-#[cfg(windows)]
-const EFFICIENCY_CACHE_TTL_MS: u128 = 30000; // Refresh efficiency mode every 30 seconds
-
-// Counter for periodic cache cleanup (every N refreshes)
-#[cfg(windows)]
-static CLEANUP_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-#[cfg(windows)]
-const CLEANUP_INTERVAL: u32 = 10; // Clean caches every 10 refreshes
 
 /// Clean up caches by removing entries for PIDs that no longer exist
+/// Delegates to unified cache module
 #[cfg(windows)]
 fn cleanup_stale_caches(current_pids: &std::collections::HashSet<u32>) {
-    if let Ok(mut cache) = PID_USER_CACHE.write() {
-        cache.retain(|pid, _| current_pids.contains(pid));
-    }
-    if let Ok(mut cache) = STATIC_PROCESS_INFO_CACHE.write() {
-        cache.retain(|pid, _| current_pids.contains(pid));
-    }
-    if let Ok(mut cache) = EFFICIENCY_MODE_CACHE.write() {
-        cache.retain(|pid, _| current_pids.contains(pid));
-    }
-    // Also clean up CPU time cache in native module
-    super::cleanup_cpu_time_cache(current_pids);
+    super::cache::CACHE.cleanup(current_pids);
 }
 
 /// Process architecture
@@ -273,8 +177,11 @@ fn open_process_query(pid: u32) -> Option<HANDLE> {
 }
 
 /// Query CPU time and start time from a process handle
+/// Note: Currently unused - cpu_time and start_time come from NtQuerySystemInformation.
+/// Kept for potential future use or fallback.
 #[cfg(windows)]
 #[inline]
+#[allow(dead_code)]
 fn query_process_times(handle: HANDLE) -> (Duration, u64) {
     unsafe {
         let mut creation = FILETIME::default();
@@ -378,10 +285,8 @@ fn get_user_from_token(token_handle: HANDLE, pid: u32) -> Option<String> {
             // Use interning to avoid UTF-16 conversion for common usernames
             let username = intern_username_utf16(&name[..name_len as usize]);
 
-            // Cache the result
-            if let Ok(mut cache) = PID_USER_CACHE.write() {
-                cache.insert(pid, username.clone());
-            }
+            // Cache the result using unified cache
+            super::cache::CACHE.set_user(pid, username.clone());
 
             Some(username)
         } else {
@@ -416,8 +321,6 @@ pub fn get_process_io_counters(_pid: u32) -> (u64, u64) {
 #[cfg(windows)]
 struct EnrichedProcessData {
     pid: u32,
-    cpu_time: Duration,
-    start_time: u64,
     shared_mem: u64,
     efficiency_mode: bool,
     is_elevated: bool,
@@ -427,29 +330,18 @@ struct EnrichedProcessData {
 }
 
 /// Enrich processes with data not available from NtQuerySystemInformation
-/// (cpu_time, start_time, shared_mem, efficiency_mode, is_elevated, arch, user, exe_path)
+/// (shared_mem, efficiency_mode, is_elevated, arch, user, exe_path)
+/// Note: cpu_time and start_time come from NtQuerySystemInformation (in from_native) for ALL processes,
+/// so we don't query them here to maintain consistency between visible and non-visible processes.
 /// Call this for visible processes only to minimize Windows API calls
 /// Set fetch_exe_path=true only when show_program_path setting is enabled
 #[cfg(windows)]
 pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
+    use super::cache::{CACHE, config};
     use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
 
-    // Pre-read caches to minimize lock contention
-    let static_cache_snapshot: HashMap<u32, (bool, ProcessArch, String)> = STATIC_PROCESS_INFO_CACHE
-        .read()
-        .map(|c| c.clone())
-        .unwrap_or_default();
-    let user_cache_snapshot: HashMap<u32, String> = PID_USER_CACHE
-        .read()
-        .map(|c| c.clone())
-        .unwrap_or_default();
-    let efficiency_cache_snapshot: HashMap<u32, EfficiencyModeCache> = EFFICIENCY_MODE_CACHE
-        .read()
-        .map(|c| c.iter().map(|(&k, v)| (k, EfficiencyModeCache {
-            efficiency_mode: v.efficiency_mode,
-            last_update: v.last_update,
-        })).collect())
-        .unwrap_or_default();
+    // Get unified cache snapshot (single lock acquisition for all cached data)
+    let cache_snapshot = CACHE.snapshot();
     let now = std::time::Instant::now();
 
     // Query data sequentially - parallel overhead exceeds benefit for this workload
@@ -460,8 +352,6 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             if pid == 0 || pid == 4 {
                 return EnrichedProcessData {
                     pid,
-                    cpu_time: Duration::ZERO,
-                    start_time: 0,
                     shared_mem: 0,
                     efficiency_mode: false,
                     is_elevated: pid == 4,  // System process is elevated
@@ -471,21 +361,34 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                 };
             }
 
-            // Check static cache for elevation, arch, exe_path (these never change)
-            let cached_static = static_cache_snapshot.get(&pid);
-            let cached_user = user_cache_snapshot.get(&pid);
-            let cached_efficiency = efficiency_cache_snapshot.get(&pid);
+            // Get cached entry from unified snapshot
+            let cached_entry = cache_snapshot.get(&pid);
+
+            // Check what we have cached
+            let cached_static = cached_entry.and_then(|e| {
+                match (&e.is_elevated, &e.arch, &e.exe_path) {
+                    (Some(elev), Some(arch), Some(path)) => Some((*elev, *arch, path.clone())),
+                    _ => None,
+                }
+            });
+            let cached_user = cached_entry.and_then(|e| e.user.clone());
 
             // Check if efficiency cache is still valid (within TTL)
-            let efficiency_valid = cached_efficiency
-                .map(|c| now.duration_since(c.last_update).as_millis() < EFFICIENCY_CACHE_TTL_MS)
+            let efficiency_valid = cached_entry
+                .and_then(|e| e.efficiency_updated)
+                .map(|updated| now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS)
                 .unwrap_or(false);
+            let cached_efficiency_mode = if efficiency_valid {
+                cached_entry.and_then(|e| e.efficiency_mode)
+            } else {
+                None
+            };
 
             // Determine what we need to query
             let need_static = cached_static.is_none();
             let need_user = cached_user.is_none();
             let need_efficiency = !efficiency_valid;
-            let need_exe_path = fetch_exe_path && cached_static.map(|(_, _, p)| p.is_empty()).unwrap_or(true);
+            let need_exe_path = fetch_exe_path && cached_static.as_ref().map(|(_, _, p)| p.is_empty()).unwrap_or(true);
 
             // Skip OpenProcess entirely if we have all cached data and don't need times
             let need_handle = need_static || need_user || need_efficiency || need_exe_path;
@@ -499,15 +402,13 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             // If we couldn't get a handle but need one, use cached data if available
             if need_handle && handle.is_none() {
                 let (is_elevated, arch, exe_path) = cached_static
-                    .map(|(e, a, p)| (*e, *a, p.clone()))
+                    .map(|(e, a, p)| (e, a, p))
                     .unwrap_or((false, ProcessArch::Native, String::new()));
-                let user = cached_user.cloned();
-                let efficiency_mode = cached_efficiency.map(|c| c.efficiency_mode).unwrap_or(false);
+                let user = cached_user;
+                let efficiency_mode = cached_efficiency_mode.unwrap_or(false);
 
                 return EnrichedProcessData {
                     pid,
-                    cpu_time: Duration::ZERO,
-                    start_time: 0,
                     shared_mem: 0,
                     efficiency_mode,
                     is_elevated,
@@ -517,18 +418,18 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                 };
             }
 
-            // Query times and memory (always needed for TIME+ accuracy)
-            let (cpu_time, start_time, shared_mem) = if let Some(h) = handle {
-                let (ct, st) = query_process_times(h);
-                let sm = query_shared_mem(h);
-                (ct, st, sm)
+            // Query shared memory (not available from NtQuerySystemInformation)
+            // Note: cpu_time and start_time are already provided by NtQuerySystemInformation in from_native,
+            // so we don't query them here to avoid inconsistency between visible and non-visible processes.
+            let shared_mem = if let Some(h) = handle {
+                query_shared_mem(h)
             } else {
-                (Duration::ZERO, 0, 0)
+                0
             };
 
             // Use cached exe_path or query if needed
             let exe_path = if fetch_exe_path {
-                if let Some((_, _, path)) = cached_static {
+                if let Some((_, _, ref path)) = cached_static {
                     if !path.is_empty() {
                         path.clone()
                     } else if let Some(h) = handle {
@@ -546,8 +447,8 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             };
 
             // Use cached efficiency mode or query if stale
-            let efficiency_mode = if efficiency_valid {
-                cached_efficiency.unwrap().efficiency_mode
+            let efficiency_mode = if let Some(mode) = cached_efficiency_mode {
+                mode
             } else if let Some(h) = handle {
                 unsafe {
                     let mut throttle_state = PROCESS_POWER_THROTTLING_STATE::default();
@@ -567,10 +468,10 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
 
             // Use cached elevation/arch if available, otherwise query
             // Consolidate token operations - open once for both elevation and user
-            let (is_elevated, arch, user) = if let Some(&(elevated, arch, _)) = cached_static {
+            let (is_elevated, arch, user) = if let Some((elevated, arch, _)) = cached_static.as_ref() {
                 // Use cached elevation/arch, still need to check user cache
-                let user = cached_user.cloned();
-                (elevated, arch, user)
+                let user = cached_user.clone();
+                (*elevated, *arch, user)
             } else if let Some(h) = handle {
                 // Query architecture first (doesn't need token)
                 let arch = unsafe {
@@ -610,7 +511,7 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
 
                         // Query user from same token (if not cached)
                         let user = if cached_user.is_some() {
-                            cached_user.cloned()
+                            cached_user.clone()
                         } else {
                             get_user_from_token(token_handle, pid)
                         };
@@ -618,13 +519,13 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                         let _ = CloseHandle(token_handle);
                         (elev, user)
                     } else {
-                        (false, cached_user.cloned())
+                        (false, cached_user.clone())
                     }
                 };
 
                 (elevated, arch, user)
             } else {
-                (false, ProcessArch::Native, cached_user.cloned())
+                (false, ProcessArch::Native, cached_user.clone())
             };
 
             if let Some(h) = handle {
@@ -633,8 +534,6 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
 
             EnrichedProcessData {
                 pid,
-                cpu_time,
-                start_time,
                 shared_mem,
                 efficiency_mode,
                 is_elevated,
@@ -645,22 +544,18 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
         })
         .collect();
 
-    // Update caches with newly queried data
-    if let Ok(mut cache) = STATIC_PROCESS_INFO_CACHE.write() {
-        for data in &enriched_data {
-            cache.insert(data.pid, (data.is_elevated, data.arch, data.exe_path.clone()));
-        }
-    }
-
-    // Cache efficiency_mode (requires Windows API call, not available from NtQuerySystemInformation)
-    if let Ok(mut cache) = EFFICIENCY_MODE_CACHE.write() {
-        let now = std::time::Instant::now();
-        for data in &enriched_data {
-            cache.insert(data.pid, EfficiencyModeCache {
-                efficiency_mode: data.efficiency_mode,
-                last_update: now,
-            });
-        }
+    // Update unified cache with newly queried data (single lock acquisition)
+    {
+        let pids: Vec<u32> = enriched_data.iter().map(|d| d.pid).collect();
+        CACHE.update_batch(&pids, |pid, entry| {
+            if let Some(data) = enriched_data.iter().find(|d| d.pid == pid) {
+                entry.is_elevated = Some(data.is_elevated);
+                entry.arch = Some(data.arch);
+                entry.exe_path = Some(data.exe_path.clone());
+                entry.efficiency_mode = Some(data.efficiency_mode);
+                entry.efficiency_updated = Some(std::time::Instant::now());
+            }
+        });
     }
 
     // Build lookup map
@@ -670,18 +565,14 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
         .collect();
 
     // Update process structs
-    // IMPORTANT: Only overwrite fields if enrichment got valid data.
-    // cpu_time and start_time are already populated from NtQuerySystemInformation in from_native.
-    // Don't overwrite them with zeros when OpenProcess fails (access denied).
+    // IMPORTANT: cpu_time and start_time are already populated from NtQuerySystemInformation in from_native.
+    // Do NOT overwrite them here - NtQuerySystemInformation provides authoritative data for ALL processes,
+    // while enrich_processes only runs on VISIBLE processes. Overwriting would create inconsistency
+    // where visible processes have different (GetProcessTimes) values than non-visible ones (NtQuerySystemInformation).
+    // This caused a bug where rows appeared to "stop updating" when sorting changed which processes were visible.
     for proc in processes.iter_mut() {
         if let Some(data) = data_map.get(&proc.pid) {
-            // Only update cpu_time/start_time if we got actual data (not defaults from failed OpenProcess)
-            if !data.cpu_time.is_zero() {
-                proc.cpu_time = data.cpu_time;
-            }
-            if data.start_time != 0 {
-                proc.start_time = data.start_time;
-            }
+            // Only update shared_mem if we got valid data (not available from NtQuerySystemInformation)
             if data.shared_mem != 0 {
                 proc.shared_mem = data.shared_mem;
             }
@@ -810,14 +701,13 @@ impl ProcessInfo {
         cpu_percentages: &HashMap<u32, f32>,
         total_mem: u64,
     ) -> Vec<ProcessInfo> {
+        use super::cache::{CACHE, config};
+
         // Periodically clean up stale PIDs from caches to prevent unbounded growth
-        {
-            use std::sync::atomic::Ordering;
-            if CLEANUP_COUNTER.fetch_add(1, Ordering::Relaxed) % CLEANUP_INTERVAL == 0 {
-                let current_pids: std::collections::HashSet<u32> =
-                    native_procs.iter().map(|p| p.pid).collect();
-                cleanup_stale_caches(&current_pids);
-            }
+        if CACHE.should_cleanup() {
+            let current_pids: std::collections::HashSet<u32> =
+                native_procs.iter().map(|p| p.pid).collect();
+            cleanup_stale_caches(&current_pids);
         }
 
         // Use sequential iteration - the per-item work (cache reads, struct creation) is too
@@ -825,16 +715,25 @@ impl ProcessInfo {
         // Cache current time once for all processes (avoids syscall per process)
         let now = std::time::Instant::now();
 
+        // Get unified cache snapshot (single lock acquisition)
+        let cache_snapshot = CACHE.snapshot();
+
         native_procs
             .iter()
             .map(|proc| {
                 let pid = proc.pid;
 
+                // Get cached entry from unified snapshot
+                let cached_entry = cache_snapshot.get(&pid);
+
                 // Get cached static info (is_elevated, arch, exe_path) if available
-                let (is_elevated, arch, cached_exe_path) = STATIC_PROCESS_INFO_CACHE
-                    .read()
-                    .ok()
-                    .and_then(|cache| cache.get(&pid).cloned())
+                let (is_elevated, arch, cached_exe_path) = cached_entry
+                    .and_then(|e| {
+                        match (&e.is_elevated, &e.arch, &e.exe_path) {
+                            (Some(elev), Some(arch), Some(path)) => Some((*elev, *arch, path.clone())),
+                            _ => None,
+                        }
+                    })
                     .unwrap_or((false, ProcessArch::Native, String::new()));
 
                 // Always use native data for priority/handle_count
@@ -843,25 +742,20 @@ impl ProcessInfo {
                 let handle_count = proc.handle_count;
 
                 // Get cached efficiency_mode if available (requires Windows API call to query)
-                let efficiency_mode = EFFICIENCY_MODE_CACHE
-                    .read()
-                    .ok()
-                    .and_then(|cache| {
-                        cache.get(&pid).and_then(|info| {
-                            if now.duration_since(info.last_update).as_millis() < EFFICIENCY_CACHE_TTL_MS {
-                                Some(info.efficiency_mode)
-                            } else {
-                                None
+                let efficiency_mode = cached_entry
+                    .and_then(|e| {
+                        if let (Some(mode), Some(updated)) = (e.efficiency_mode, e.efficiency_updated) {
+                            if now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS {
+                                return Some(mode);
                             }
-                        })
+                        }
+                        None
                     })
                     .unwrap_or(false);
 
                 // Get cached user if available
-                let user = PID_USER_CACHE
-                    .read()
-                    .ok()
-                    .and_then(|cache| cache.get(&pid).cloned())
+                let user = cached_entry
+                    .and_then(|e| e.user.clone())
                     .unwrap_or_else(|| {
                         // Special cases - use interned string
                         if pid == 0 || pid == 4 {
@@ -1085,12 +979,7 @@ pub fn set_efficiency_mode(pid: u32, enabled: bool) -> Result<(), String> {
 /// Update the efficiency mode cache for a specific PID
 #[cfg(windows)]
 fn update_efficiency_mode_cache(pid: u32, enabled: bool) {
-    if let Ok(mut cache) = EFFICIENCY_MODE_CACHE.write() {
-        cache.insert(pid, EfficiencyModeCache {
-            efficiency_mode: enabled,
-            last_update: std::time::Instant::now(),
-        });
-    }
+    super::cache::CACHE.set_efficiency_mode(pid, enabled);
 }
 
 #[cfg(not(windows))]

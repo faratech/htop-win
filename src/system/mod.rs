@@ -2,6 +2,8 @@ mod cpu;
 mod memory;
 #[cfg(windows)]
 mod native;
+#[cfg(windows)]
+pub mod cache;
 mod process;
 
 pub use cpu::CpuInfo;
@@ -11,7 +13,7 @@ pub use process::{
     kill_process, set_efficiency_mode, set_priority_class, set_process_affinity, ProcessInfo,
 };
 #[cfg(windows)]
-pub use native::{query_all_processes, calculate_cpu_percentages, cleanup_cpu_time_cache};
+pub use native::{query_all_processes, calculate_cpu_percentages};
 
 /// System metrics
 pub struct SystemMetrics {
