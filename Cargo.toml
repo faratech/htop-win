@@ -12,11 +12,10 @@ categories = ["command-line-utilities", "os::windows-apis"]
 [dependencies]
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", default-features = false, features = ["events", "windows"] }
-unicode-width = "0.2"
+unicode-width = "0.1"  # Match ratatui's transitive dep
 serde = { version = "1", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 lexopt = "0.3"  # Lightweight arg parsing
-directories = "5"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
@@ -29,6 +28,8 @@ windows = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    "Win32_UI_Shell",
+    "Win32_System_Com",
     "Wdk_System_SystemInformation",
 ] }
 

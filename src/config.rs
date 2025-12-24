@@ -1,7 +1,6 @@
 //! Application configuration with persistence
 
 use crate::ui::colors::ColorScheme;
-use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::fs;
@@ -153,9 +152,18 @@ impl Default for Config {
 impl Config {
     /// Get the config file path
     pub fn config_path() -> Option<PathBuf> {
-        ProjectDirs::from("", "", "htop-win").map(|dirs| {
-            dirs.config_dir().join("config.json")
-        })
+        // Use Windows API directly instead of `directories` crate
+        use windows::core::PWSTR;
+        use windows::Win32::UI::Shell::{FOLDERID_RoamingAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+
+        unsafe {
+            let path: PWSTR = SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, None).ok()?;
+            let len = (0..).take_while(|&i| *path.0.add(i) != 0).count();
+            let slice = std::slice::from_raw_parts(path.0, len);
+            let appdata = PathBuf::from(String::from_utf16_lossy(slice));
+            windows::Win32::System::Com::CoTaskMemFree(Some(path.0 as *const _));
+            Some(appdata.join("htop-win").join("config.json"))
+        }
     }
 
     /// Load configuration from file, or return defaults
