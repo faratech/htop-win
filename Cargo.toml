@@ -5,7 +5,7 @@ edition = "2024"
 description = "A Windows clone of htop - interactive process viewer"
 authors = ["htop-win contributors"]
 license = "MIT"
-repository = "https://github.com/htop-win/htop-win"
+repository = "https://github.com/faratech/htop-win"
 keywords = ["htop", "process", "monitor", "tui", "windows"]
 categories = ["command-line-utilities", "os::windows-apis"]
 

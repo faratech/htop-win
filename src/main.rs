@@ -40,6 +40,8 @@ struct Args {
     benchmark: Option<u64>,
     inefficient: bool,
     install: bool,
+    update: bool,
+    install_update: bool,
 }
 
 /// Benchmark statistics for performance measurement
@@ -115,6 +117,12 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Long("install") => {
                 args.install = true;
             }
+            Long("update") => {
+                args.update = true;
+            }
+            Long("install-update") => {
+                args.install_update = true;
+            }
             _ => return Err(arg.unexpected()),
         }
     }
@@ -141,6 +149,7 @@ fn print_help() {
     println!("      --inefficient            Disable Efficiency Mode (run at normal priority)");
     println!("  -H, --highlight-changes <S>  Highlight process changes (seconds)");
     println!("      --install                Install to PATH (requires admin, will prompt UAC)");
+    println!("      --update                 Check for updates and install if available");
     println!("  -h, --help                   Print help");
     println!("  -V, --version                Print version");
 }
@@ -306,6 +315,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.install {
         if let Err(e) = installer::install_to_path() {
             eprintln!("Installation failed: {}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if args.update {
+        if let Err(e) = installer::update_from_github() {
+            eprintln!("Update failed: {}", e);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
+    if args.install_update {
+        // Called from elevated process to complete update installation
+        if let Err(e) = installer::complete_update_install() {
+            eprintln!("Update installation failed: {}", e);
             std::process::exit(1);
         }
         return Ok(());
