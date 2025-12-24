@@ -10,11 +10,12 @@ cargo build --release    # Release build (optimized for size)
 cargo run --release      # Build and run
 cargo test               # Run all tests
 cargo test test_name     # Run specific test
+cargo clippy --release   # Run linter
 ```
 
 ## Architecture
 
-htop-win is a Windows htop clone using ratatui for TUI rendering. The codebase follows a clear separation:
+htop-win is a Windows htop clone with a custom TUI library. The codebase follows a clear separation:
 
 ### Core Modules
 
@@ -22,17 +23,21 @@ htop-win is a Windows htop clone using ratatui for TUI rendering. The codebase f
 - **`app.rs`** - Application state (`App` struct), process sorting, tree building, view modes (`ViewMode` enum)
 - **`input.rs`** - Keyboard and mouse event handling, dispatches to mode-specific handlers
 - **`config.rs`** - Configuration struct (refresh rate, default settings)
+- **`terminal.rs`** - Custom minimal TUI library replacing ratatui (~1700 lines). Provides: Layout, Buffer, Terminal, Frame, and widgets (Block, Paragraph, Table, List, Scrollbar)
+- **`json.rs`** - Minimal JSON parser for config files (replaces serde_json)
 
 ### System Module (`system/`)
 
 - **`mod.rs`** - `SystemMetrics` struct aggregating all system data, refresh logic
-- **`cpu.rs`** - CPU per-core usage via sysinfo
-- **`memory.rs`** - Memory/swap stats, `format_bytes()` helper
-- **`process.rs`** - Process enumeration, Windows API calls for:
+- **`cpu.rs`** - CPU per-core usage via direct Windows API (`NtQuerySystemInformation`)
+- **`memory.rs`** - Memory/swap stats via Windows API, `format_bytes()` helper
+- **`cache.rs`** - Process data caching to reduce Windows API calls
+- **`process.rs`** - Process enumeration via `NtQuerySystemInformation`, Windows API calls for:
   - User lookup via process tokens (`get_process_owner`)
   - Priority/nice via `GetPriorityClass`
   - CPU time via `GetProcessTimes`
   - Process termination via `TerminateProcess`
+  - Architecture detection via `IsWow64Process2`
 
 ### UI Module (`ui/`)
 
@@ -69,8 +74,18 @@ Process info collection combines multiple Windows API calls into single `OpenPro
 fn get_win_process_info(pid: u32) -> WinProcessInfo  // Gets priority + CPU time in one call
 ```
 
-## Dependency Version Alignment
+### Custom Terminal Library (terminal.rs)
+The custom TUI library uses double-buffered rendering with diff-based updates:
+- `Buffer` holds cells with symbol, fg, bg, modifiers
+- `Terminal.draw()` compares current vs previous buffer, only updates changed cells
+- `Layout.split()` handles `Constraint::Min` as flexible (expands to fill space)
+- Widget styles: Apply background first, then render content to preserve span colors
 
-Keep versions aligned to avoid duplicate crates:
-- `crossterm` version must match what ratatui uses
-- `windows` crate version must match what sysinfo uses
+## Dependencies
+
+Minimal dependency set for small binary size:
+- `crossterm` - Terminal events and manipulation
+- `windows` - Direct Windows API bindings (no sysinfo wrapper)
+- `bitflags` - Modifier flags for terminal styling
+- `unicode-width` - Character width calculation
+- `lexopt` - Lightweight argument parsing

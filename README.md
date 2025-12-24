@@ -81,14 +81,15 @@ cargo run --release
 ## Requirements
 
 - Windows 10 or later
-- Rust 1.70 or later
+- Rust 1.85+ (edition 2024)
 
 ## Dependencies
 
-- [ratatui](https://github.com/ratatui-org/ratatui) - Terminal UI framework
+Minimal dependency set for small binary size (~500KB):
 - [crossterm](https://github.com/crossterm-rs/crossterm) - Terminal manipulation
-- [sysinfo](https://github.com/GuillaumeGomez/sysinfo) - System information
-- [windows](https://github.com/microsoft/windows-rs) - Windows API bindings
+- [windows](https://github.com/microsoft/windows-rs) - Direct Windows API bindings
+- Custom terminal UI library (no ratatui)
+- Custom JSON parser (no serde)
 
 ## License
 
