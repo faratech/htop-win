@@ -24,6 +24,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Power",
     "Win32_System_WindowsProgramming",
     "Win32_System_SystemInformation",
+    "Win32_System_Performance",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_UI_Shell",
