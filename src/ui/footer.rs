@@ -279,6 +279,14 @@ fn build_status_line(app: &App) -> Vec<Span<'static>> {
             return spans; // Status message takes precedence
         }
 
+    // Show persistent update available indicator
+    if let Some((ref version, _)) = app.update_available {
+        spans.push(Span::styled(
+            format!("[Update v{} ready - restart to apply] ", version),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+
     // Show focus region indicator (Tab to switch)
     let focus_indicator = match app.focus_region {
         FocusRegion::Header => "[Focus:Header] ",

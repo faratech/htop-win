@@ -525,14 +525,22 @@ fn run_app(
         // Check for update result from background thread
         if !app.update_checked && let Ok(status) = update_rx.try_recv() {
             app.update_checked = true;
-            if let installer::UpdateStatus::Downloaded { version, path } = status {
-                app.update_available = Some((version.clone(), path));
-                app.status_message = Some((
-                    format!("Update v{} downloaded. Restart to apply.", version),
-                    Instant::now(),
-                ));
-                needs_redraw = true;
+            match status {
+                installer::UpdateStatus::Downloaded { version, path } => {
+                    app.update_available = Some((version.clone(), path));
+                    app.status_message = Some((
+                        format!("Update v{} downloaded. Restart to apply.", version),
+                        Instant::now(),
+                    ));
+                }
+                installer::UpdateStatus::None => {
+                    app.status_message = Some((
+                        format!("v{} Up-to-date!", env!("CARGO_PKG_VERSION")),
+                        Instant::now(),
+                    ));
+                }
             }
+            needs_redraw = true;
         }
 
         // Refresh system data at tick rate (unless paused)

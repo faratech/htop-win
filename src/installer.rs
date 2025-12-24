@@ -306,8 +306,27 @@ pub fn do_install_update(update_file: &std::path::Path) -> Result<(), Box<dyn st
         fs::create_dir_all(parent)?;
     }
 
-    // Copy the new binary
-    fs::copy(update_file, &target_path)?;
+    // If target exists, use rename trick (Windows allows renaming running exe)
+    if target_path.exists() {
+        let backup_path = target_path.with_extension("exe.old");
+        let _ = fs::remove_file(&backup_path); // Remove old backup if exists
+
+        // Rename current exe to .old
+        fs::rename(&target_path, &backup_path)?;
+
+        // Copy new version
+        if let Err(e) = fs::copy(update_file, &target_path) {
+            // Failed - restore backup
+            let _ = fs::rename(&backup_path, &target_path);
+            return Err(e.into());
+        }
+
+        // Clean up backup
+        let _ = fs::remove_file(&backup_path);
+    } else {
+        // No existing file, just copy
+        fs::copy(update_file, &target_path)?;
+    }
 
     // Clean up temp file
     let _ = fs::remove_file(update_file);
