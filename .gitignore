@@ -39,3 +39,4 @@ nul
 
 # Full-resolution demo (only web version tracked)
 images/demo.gif
+*.log
