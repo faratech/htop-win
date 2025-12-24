@@ -6,14 +6,19 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, ViewMode};
+use crate::app::{App, FocusRegion, ViewMode};
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let function_keys = get_function_keys_with_num(app);
     let theme = &app.theme;
 
+    // Check if footer is focused for keyboard navigation
+    let footer_focused = app.focus_region == FocusRegion::Footer;
+    let focused_key_index = app.focus_index;
+
     // Track x position for registering function key bounds
     let mut x_pos = area.x;
+    let mut key_index = 0usize;
 
     // htop style: F1Help  F2Setup (key is black on cyan, label is white, no space between)
     let spans: Vec<Span> = function_keys
@@ -37,16 +42,27 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
 
                 x_pos += total_width;
 
+                // Check if this key is focused
+                let is_focused = footer_focused && key_num.is_some() && key_index == focused_key_index;
+                key_index += if key_num.is_some() { 1 } else { 0 };
+
+                // Use inverted colors for focused key
+                let (key_fg, key_bg, label_fg, label_bg) = if is_focused {
+                    // Highlighted/focused: invert colors
+                    (theme.header_key_bg, theme.header_key_fg, theme.background, theme.text)
+                } else {
+                    // Normal
+                    (theme.header_key_fg, theme.header_key_bg, theme.text, theme.background)
+                };
+
                 vec![
                     Span::styled(
                         key_str.to_string(),
-                        Style::default()
-                            .fg(theme.header_key_fg)
-                            .bg(theme.header_key_bg),
+                        Style::default().fg(key_fg).bg(key_bg),
                     ),
                     Span::styled(
                         format!("{:<6}", label), // htop uses fixed-width labels with trailing space
-                        Style::default().fg(theme.text).bg(theme.background),
+                        Style::default().fg(label_fg).bg(label_bg),
                     ),
                 ]
             }
@@ -244,6 +260,19 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
 
 fn build_status_line(app: &App) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
+
+    // Show focus region indicator (Tab to switch)
+    let focus_indicator = match app.focus_region {
+        FocusRegion::Header => "[Focus:Header] ",
+        FocusRegion::ProcessList => "", // Don't show when on default
+        FocusRegion::Footer => "[Focus:Footer] ",
+    };
+    if !focus_indicator.is_empty() {
+        spans.push(Span::styled(
+            focus_indicator,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+    }
 
     // Show paused indicator (high priority - show first)
     if app.paused {

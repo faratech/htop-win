@@ -40,10 +40,18 @@ pub enum UIAction {
     RightClick,
     /// Middle click
     MiddleClick,
-    /// Keyboard select (Enter/Space)
-    Select,
-    /// Keyboard navigate to
-    Focus,
+}
+
+/// Major UI regions for keyboard navigation
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FocusRegion {
+    /// Header meters (CPU, Memory, Swap)
+    Header,
+    /// Process list (default focus)
+    #[default]
+    ProcessList,
+    /// Footer function keys
+    Footer,
 }
 
 /// A rectangular region on screen associated with a UI element
@@ -98,9 +106,6 @@ pub struct UIBounds {
 
     /// Function key regions in footer
     pub function_keys: Vec<UIRegion>,
-
-    /// Currently focused element (for keyboard navigation)
-    pub focused: Option<UIElement>,
 }
 
 impl UIBounds {
@@ -180,13 +185,8 @@ impl UIBounds {
         None
     }
 
-    /// Check if y coordinate is on the column header row
-    pub fn is_column_header(&self, y: u16) -> bool {
-        y == self.column_header_y
-    }
-
     /// Check if y coordinate is in the process list data area
-    pub fn is_process_row(&self, y: u16) -> bool {
+    fn is_process_row(&self, y: u16) -> bool {
         y > self.column_header_y && y < self.footer_y_start
     }
 
@@ -197,18 +197,6 @@ impl UIBounds {
         } else {
             None
         }
-    }
-
-    /// Get function key at position
-    pub fn function_key_at(&self, x: u16, y: u16) -> Option<u8> {
-        for region in &self.function_keys {
-            if region.contains(x, y) {
-                if let UIElement::FunctionKey(key) = region.element {
-                    return Some(key);
-                }
-            }
-        }
-        None
     }
 }
 
@@ -441,6 +429,12 @@ pub struct App {
     pub last_click_time: Option<Instant>,
     /// Double-click threshold in milliseconds
     pub double_click_ms: u64,
+
+    // Keyboard navigation state
+    /// Currently focused UI region (for Tab navigation)
+    pub focus_region: FocusRegion,
+    /// Focused index within the current region (e.g., which function key)
+    pub focus_index: usize,
 }
 
 impl App {
@@ -503,6 +497,8 @@ impl App {
             last_click_pos: None,
             last_click_time: None,
             double_click_ms: 500, // Standard double-click threshold
+            focus_region: FocusRegion::default(),
+            focus_index: 0,
         }
     }
 
@@ -529,6 +525,114 @@ impl App {
     pub fn save_config(&self) {
         if let Err(e) = self.config.save() {
             eprintln!("Failed to save config: {}", e);
+        }
+    }
+
+    // =========================================================================
+    // Keyboard Navigation
+    // =========================================================================
+
+    /// Cycle focus to the next UI region (Tab key)
+    pub fn cycle_focus_next(&mut self) {
+        self.focus_region = match self.focus_region {
+            FocusRegion::Header => FocusRegion::ProcessList,
+            FocusRegion::ProcessList => FocusRegion::Footer,
+            FocusRegion::Footer => FocusRegion::Header,
+        };
+        self.focus_index = 0;
+    }
+
+    /// Cycle focus to the previous UI region (Shift+Tab key)
+    pub fn cycle_focus_prev(&mut self) {
+        self.focus_region = match self.focus_region {
+            FocusRegion::Header => FocusRegion::Footer,
+            FocusRegion::ProcessList => FocusRegion::Header,
+            FocusRegion::Footer => FocusRegion::ProcessList,
+        };
+        self.focus_index = 0;
+    }
+
+    /// Navigate left within the current focus region
+    pub fn navigate_left(&mut self) {
+        match self.focus_region {
+            FocusRegion::Header => {
+                // Cycle through meter modes
+                self.config.cpu_meter_mode = self.config.cpu_meter_mode.next();
+            }
+            FocusRegion::ProcessList => {
+                // Nothing to do for left in process list
+            }
+            FocusRegion::Footer => {
+                // Move to previous function key
+                if self.focus_index > 0 {
+                    self.focus_index -= 1;
+                } else {
+                    self.focus_index = 9; // Wrap to F10
+                }
+            }
+        }
+    }
+
+    /// Navigate right within the current focus region
+    pub fn navigate_right(&mut self) {
+        match self.focus_region {
+            FocusRegion::Header => {
+                // Cycle through meter modes
+                self.config.memory_meter_mode = self.config.memory_meter_mode.next();
+            }
+            FocusRegion::ProcessList => {
+                // Nothing to do for right in process list
+            }
+            FocusRegion::Footer => {
+                // Move to next function key
+                if self.focus_index < 9 {
+                    self.focus_index += 1;
+                } else {
+                    self.focus_index = 0; // Wrap to F1
+                }
+            }
+        }
+    }
+
+    /// Activate the currently focused element (Enter/Space)
+    pub fn activate_focused(&mut self) -> bool {
+        match self.focus_region {
+            FocusRegion::Header => {
+                // Toggle header visibility
+                self.show_header = !self.show_header;
+                false
+            }
+            FocusRegion::ProcessList => {
+                // Enter on process opens process info
+                self.enter_process_info_mode();
+                false
+            }
+            FocusRegion::Footer => {
+                // Activate the focused function key (F1-F10)
+                let key = (self.focus_index + 1) as u8;
+                if key == 10 {
+                    true // Quit
+                } else {
+                    self.handle_function_key(key);
+                    false
+                }
+            }
+        }
+    }
+
+    /// Handle function key press (used by both keyboard and mouse)
+    pub fn handle_function_key(&mut self, key: u8) {
+        match key {
+            1 => self.view_mode = ViewMode::Help,
+            2 => self.view_mode = ViewMode::Setup,
+            3 => self.view_mode = ViewMode::Search,
+            4 => self.view_mode = ViewMode::Filter,
+            5 => self.tree_view = !self.tree_view,
+            6 => self.view_mode = ViewMode::SortSelect,
+            7 => self.enter_nice_mode(-1),
+            8 => self.enter_nice_mode(1),
+            9 => self.enter_kill_mode(),
+            _ => {}
         }
     }
 

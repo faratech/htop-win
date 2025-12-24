@@ -49,6 +49,8 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
+    use crate::app::FocusRegion;
+
     // Check for max iterations exit
     if let Some(max) = app.max_iterations {
         if app.iteration_count >= max {
@@ -61,15 +63,45 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::F(10) | KeyCode::Char('q') | KeyCode::Char('Q') => return true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
 
+        // Tab navigation between regions
+        KeyCode::Tab => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                app.cycle_focus_prev();
+            } else {
+                app.cycle_focus_next();
+            }
+        }
+        KeyCode::BackTab => {
+            app.cycle_focus_prev();
+        }
+
         // Redraw screen (Ctrl+L)
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.refresh_system();
         }
 
-        // Navigation
-        KeyCode::Up => app.select_up(),
+        // Arrow key navigation - depends on focus region
+        KeyCode::Up => {
+            match app.focus_region {
+                FocusRegion::ProcessList => app.select_up(),
+                FocusRegion::Header | FocusRegion::Footer => {
+                    // Up in header/footer goes to process list
+                    app.focus_region = FocusRegion::ProcessList;
+                }
+            }
+        }
         KeyCode::Char('k') if !key.modifiers.contains(KeyModifiers::CONTROL) => app.select_up(),
-        KeyCode::Down | KeyCode::Char('j') => app.select_down(),
+        KeyCode::Down | KeyCode::Char('j') => {
+            match app.focus_region {
+                FocusRegion::ProcessList => app.select_down(),
+                FocusRegion::Header | FocusRegion::Footer => {
+                    // Down in header/footer goes to process list
+                    app.focus_region = FocusRegion::ProcessList;
+                }
+            }
+        }
+        KeyCode::Left => app.navigate_left(),
+        KeyCode::Right => app.navigate_right(),
         KeyCode::PageUp => app.page_up(),
         KeyCode::PageDown => app.page_down(),
         KeyCode::Home | KeyCode::Char('g') => app.select_first(),
@@ -210,9 +242,14 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
         // Search navigation
         KeyCode::Char('n') => app.find_next(),
 
-        // Process details (Enter or h for help-like info)
+        // Activate focused element (Enter)
+        // In process list: opens process info
+        // In footer: activates the focused function key
+        // In header: toggles header visibility
         KeyCode::Enter => {
-            app.enter_process_info_mode();
+            if app.activate_focused() {
+                return true; // Quit was requested
+            }
         }
 
         // Sort shortcuts
@@ -995,30 +1032,7 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
     }
 }
 
-/// Handle function key press (F1-F10)
+/// Handle function key press (F1-F10) - delegates to App::handle_function_key
 fn handle_function_key(app: &mut App, key: u8) {
-    match key {
-        1 => app.view_mode = ViewMode::Help,
-        2 => app.view_mode = ViewMode::Setup,
-        3 => app.view_mode = ViewMode::Search,
-        4 => app.view_mode = ViewMode::Filter,
-        5 => app.tree_view = !app.tree_view,
-        6 => app.view_mode = ViewMode::SortSelect,
-        7 => {
-            // Nice up (higher priority) - decrease nice value
-            app.enter_nice_mode(-1);
-        }
-        8 => {
-            // Nice down (lower priority) - increase nice value
-            app.enter_nice_mode(1);
-        }
-        9 => {
-            // Kill
-            app.enter_kill_mode();
-        }
-        10 => {
-            // Quit is handled specially, this shouldn't be called
-        }
-        _ => {}
-    }
+    app.handle_function_key(key);
 }
