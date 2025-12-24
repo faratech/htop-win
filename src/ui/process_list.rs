@@ -13,9 +13,10 @@ fn format_time_colored<'a>(duration: std::time::Duration, theme: &Theme, is_sele
     let centis = duration.subsec_millis() / 10;
 
     // Zero time - always show in shadow (use static str, no allocation)
+    // Format: " 0:00.00" (8 chars, consistent with other formats)
     if total_secs == 0 && centis == 0 {
         let shadow = if is_selected { theme.selection_fg } else { theme.process_shadow };
-        return vec![Span::styled(" 0:00.00 ", Style::default().fg(shadow))];
+        return vec![Span::styled(" 0:00.00", Style::default().fg(shadow))];
     }
 
     let total_mins = total_secs / 60;
@@ -29,12 +30,19 @@ fn format_time_colored<'a>(duration: std::time::Duration, theme: &Theme, is_sele
     let use_uniform = is_selected || !highlight_large_numbers;
     let base_color = if is_selected { theme.selection_fg } else { theme.process };
 
+    // All formats produce 8 characters for consistent column width:
+    // Minutes: " M:SS.cc" or "MM:SS.cc" (8 chars)
+    // Hours:   " Hh MM:SS" or "HHhMM:SS" (8 chars)
+    // Days:    "DDDd HHh" (8 chars)
+    // Years:   "YYYy DDDd" (9 chars for large values, but rare)
     if use_uniform {
         // Single span - no multi-color needed
         let text = if total_mins < 60 {
             format!("{:2}:{:02}.{:02}", total_mins, secs, centis)
         } else if total_hours < 24 {
             format!("{:2}h{:02}:{:02}", total_hours, mins, secs)
+        } else if total_days < 100 {
+            format!("{:2}d {:02}h", total_days, hours)
         } else if total_days < 365 {
             format!("{:3}d{:02}h", total_days, hours)
         } else {
@@ -56,6 +64,11 @@ fn format_time_colored<'a>(duration: std::time::Duration, theme: &Theme, is_sele
         vec![
             Span::styled(format!("{:2}h", total_hours), Style::default().fg(hour_color)),
             Span::styled(format!("{:02}:{:02}", mins, secs), Style::default().fg(base_color)),
+        ]
+    } else if total_days < 100 {
+        vec![
+            Span::styled(format!("{:2}d ", total_days), Style::default().fg(day_color)),
+            Span::styled(format!("{:02}h", hours), Style::default().fg(hour_color)),
         ]
     } else if total_days < 365 {
         vec![

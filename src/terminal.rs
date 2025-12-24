@@ -528,6 +528,8 @@ pub struct BufferCell {
     pub fg: Color,
     pub bg: Color,
     pub modifier: Modifier,
+    /// True if this cell is a continuation of a wide character in the previous cell
+    pub is_continuation: bool,
 }
 
 impl Default for BufferCell {
@@ -537,6 +539,7 @@ impl Default for BufferCell {
             fg: Color::Reset,
             bg: Color::Reset,
             modifier: Modifier::empty(),
+            is_continuation: false,
         }
     }
 }
@@ -572,6 +575,14 @@ impl BufferCell {
         self.fg = Color::Reset;
         self.bg = Color::Reset;
         self.modifier = Modifier::empty();
+        self.is_continuation = false;
+    }
+
+    /// Mark this cell as a continuation of a wide character
+    pub fn set_continuation(&mut self) -> &mut Self {
+        self.symbol.clear();
+        self.is_continuation = true;
+        self
     }
 }
 
@@ -647,6 +658,14 @@ impl Buffer {
             if let Some(cell) = self.get_mut(col, y) {
                 cell.set_char(ch);
                 cell.set_style(style);
+                cell.is_continuation = false;
+            }
+            // Mark continuation cells for wide characters
+            for i in 1..width {
+                if let Some(cont_cell) = self.get_mut(col + i, y) {
+                    cont_cell.set_continuation();
+                    cont_cell.set_style(style);
+                }
             }
             col += width.max(1);
         }
@@ -666,6 +685,15 @@ impl Buffer {
                 if let Some(cell) = self.get_mut(col, y) {
                     cell.set_char(ch);
                     cell.set_style(style);
+                    cell.is_continuation = false; // This cell has actual content
+                }
+                // Mark continuation cells for wide characters (width > 1)
+                // These cells are "occupied" by the wide char but contain no content
+                for i in 1..width {
+                    if let Some(cont_cell) = self.get_mut(col + i, y) {
+                        cont_cell.set_continuation();
+                        cont_cell.set_style(style); // Keep same style for background
+                    }
                 }
                 col += width.max(1);
             }
@@ -797,6 +825,13 @@ impl Terminal {
                 let idx = current.index_of(x, y);
                 let cell = &current.content[idx];
                 let prev = previous.content.get(idx);
+
+                // Skip continuation cells - they're placeholders for wide characters
+                // The wide char already printed and advanced the cursor past this position
+                if cell.is_continuation {
+                    skip += 1;
+                    continue;
+                }
 
                 // Skip if same as previous
                 if let Some(p) = prev
