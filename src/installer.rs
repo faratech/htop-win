@@ -181,16 +181,21 @@ const GITHUB_REPO: &str = "faratech/htop-win";
 /// Get the latest version info from GitHub
 /// Returns (version, download_url) or None if check fails
 pub fn get_latest_release() -> Option<(String, String)> {
+    // Detect architecture for correct binary
+    let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
+
     let ps_script = format!(
         r#"
         try {{
             $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/{}/releases/latest' -Headers @{{'User-Agent'='htop-win'}}
-            Write-Output "$($release.tag_name)|$($release.assets | Where-Object {{ $_.name -like '*.exe' }} | Select-Object -First 1 -ExpandProperty browser_download_url)"
+            $asset = $release.assets | Where-Object {{ $_.name -like '*{}.exe' }} | Select-Object -First 1
+            if (-not $asset) {{ $asset = $release.assets | Where-Object {{ $_.name -like '*.exe' }} | Select-Object -First 1 }}
+            Write-Output "$($release.tag_name)|$($asset.browser_download_url)"
         }} catch {{
             Write-Output "ERROR"
         }}
         "#,
-        GITHUB_REPO
+        GITHUB_REPO, arch
     );
 
     let output = std::process::Command::new("powershell")

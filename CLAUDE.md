@@ -89,3 +89,24 @@ Minimal dependency set for small binary size:
 - `bitflags` - Modifier flags for terminal styling
 - `unicode-width` - Character width calculation
 - `lexopt` - Lightweight argument parsing
+
+## Releases & Auto-Update
+
+### Creating a Release
+1. Update version in `Cargo.toml`
+2. Commit and push changes
+3. Create annotated tag: `git tag -a v0.0.X -m "Release notes here"`
+4. Push tag: `git push origin v0.0.X`
+5. GitHub Actions (`.github/workflows/release.yml`) automatically:
+   - Builds for x86_64 (amd64) and aarch64 (arm64)
+   - Creates release with `htop-win-amd64.exe` and `htop-win-arm64.exe`
+
+### Auto-Update Flow (`installer.rs`)
+1. **Background check**: 3 seconds after startup, spawns thread to check GitHub API
+2. **Architecture detection**: Selects correct binary (amd64/arm64) based on `cfg!(target_arch)`
+3. **Download**: Downloads to `%TEMP%\htop-win-update.exe`
+4. **Notification**: Shows "Update vX.Y.Z downloaded. Restart to apply." in status bar
+5. **Apply on restart**: Before UI starts, `apply_pending_update()`:
+   - Renames running `htop.exe` → `htop.exe.old` (Windows allows renaming running exe)
+   - Copies update → `htop.exe`
+   - Cleans up temp and backup files
