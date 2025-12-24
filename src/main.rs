@@ -130,7 +130,7 @@ fn print_help() {
     println!("  -n, --max-iterations <N>     Exit after N updates");
     println!("      --no-meters              Hide header meters");
     println!("      --benchmark [N]          Run N iterations (default 20) and print timing stats");
-    println!("      --readonly               Disable kill/nice operations");
+    println!("      --readonly               Disable kill/priority operations");
     println!("      --inefficient            Disable Efficiency Mode (run at normal priority)");
     println!("  -H, --highlight-changes <S>  Highlight process changes (seconds)");
     println!("  -h, --help                   Print help");

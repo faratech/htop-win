@@ -82,7 +82,7 @@ pub struct Config {
     // Mouse settings
     pub mouse_enabled: bool,
 
-    // Readonly mode (no kill/nice operations)
+    // Readonly mode (no kill/priority operations)
     pub readonly: bool,
 
     // Confirmation dialogs
@@ -130,7 +130,8 @@ impl Default for Config {
                 "PID".to_string(),
                 "USER".to_string(),
                 "PRI".to_string(),
-                "NI".to_string(),
+                "CLASS".to_string(),
+                "THR".to_string(),
                 "VIRT".to_string(),
                 "RES".to_string(),
                 "SHR".to_string(),
@@ -205,6 +206,38 @@ impl Config {
         } else {
             self.visible_columns.push(column.to_string());
         }
+    }
+
+    /// Move a visible column up in the order (returns true if moved)
+    pub fn move_column_up(&mut self, column: &str) -> bool {
+        if let Some(pos) = self.visible_columns.iter().position(|c| c == column) {
+            if pos > 0 {
+                self.visible_columns.swap(pos, pos - 1);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Move a visible column down in the order (returns true if moved)
+    pub fn move_column_down(&mut self, column: &str) -> bool {
+        if let Some(pos) = self.visible_columns.iter().position(|c| c == column) {
+            if pos < self.visible_columns.len() - 1 {
+                self.visible_columns.swap(pos, pos + 1);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get the position of a column in the visible order (None if not visible)
+    pub fn column_position(&self, column: &str) -> Option<usize> {
+        self.visible_columns.iter().position(|c| c == column)
+    }
+
+    /// Reset all settings to defaults
+    pub fn reset_to_defaults(&mut self) {
+        *self = Self::default();
     }
 
     /// Get the theme for the current color scheme

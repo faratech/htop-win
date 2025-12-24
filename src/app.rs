@@ -355,6 +355,32 @@ impl SortColumn {
         }
     }
 
+    /// Convert from column name string
+    pub fn from_name(name: &str) -> Option<SortColumn> {
+        match name {
+            "PID" => Some(SortColumn::Pid),
+            "PPID" => Some(SortColumn::PPid),
+            "USER" => Some(SortColumn::User),
+            "PRI" => Some(SortColumn::Priority),
+            "CLASS" => Some(SortColumn::PriorityClass),
+            "NI" => Some(SortColumn::PriorityClass), // Legacy name
+            "THR" => Some(SortColumn::Threads),
+            "VIRT" => Some(SortColumn::Virt),
+            "RES" => Some(SortColumn::Res),
+            "SHR" => Some(SortColumn::Shr),
+            "S" => Some(SortColumn::Status),
+            "CPU%" => Some(SortColumn::Cpu),
+            "MEM%" => Some(SortColumn::Mem),
+            "TIME+" => Some(SortColumn::Time),
+            "START" => Some(SortColumn::StartTime),
+            "Command" => Some(SortColumn::Command),
+            "ELEV" => Some(SortColumn::Elevated),
+            "ARCH" => Some(SortColumn::Arch),
+            "ECO" => Some(SortColumn::Efficiency),
+            _ => None,
+        }
+    }
+
     /// Get the display width for this column (must match ui/process_list.rs column_width)
     pub fn width(&self) -> u16 {
         match self {
@@ -391,7 +417,7 @@ pub enum ViewMode {
     SortSelect,
     Kill,
     SignalSelect,  // Select signal for kill
-    Nice,
+    Priority,      // Set process priority
     Setup,
     ProcessInfo,
     UserSelect,    // Select user to filter by
@@ -590,11 +616,11 @@ impl App {
     }
 
     /// Compute visible columns based on config (used for caching)
+    /// Respects the order defined in config.visible_columns
     fn compute_visible_columns(config: &Config) -> Vec<SortColumn> {
-        SortColumn::all()
+        config.visible_columns
             .iter()
-            .filter(|col| config.is_column_visible(col.name()))
-            .copied()
+            .filter_map(|name| SortColumn::from_name(name))
             .collect()
     }
 
@@ -716,8 +742,8 @@ impl App {
             4 => self.view_mode = ViewMode::Filter,
             5 => self.tree_view = !self.tree_view,
             6 => self.view_mode = ViewMode::SortSelect,
-            7 => self.enter_nice_mode(),
-            8 => self.enter_nice_mode(),
+            7 => self.enter_priority_mode(),
+            8 => self.enter_priority_mode(),
             9 => self.enter_kill_mode(),
             _ => {}
         }
@@ -744,7 +770,7 @@ impl App {
     }
 
     /// Enter priority mode and capture the target process
-    pub fn enter_nice_mode(&mut self) {
+    pub fn enter_priority_mode(&mut self) {
         if let Some(proc) = self.selected_process() {
             // Extract all values before modifying self to satisfy borrow checker
             let target = (proc.pid, proc.name.clone(), proc.command.clone());
@@ -753,7 +779,7 @@ impl App {
 
             self.kill_target = Some(target);
             self.priority_class_index = priority_class.index();
-            self.view_mode = ViewMode::Nice;
+            self.view_mode = ViewMode::Priority;
         }
     }
 
@@ -986,7 +1012,7 @@ impl App {
                         SortColumn::PPid => a.parent_pid.cmp(&b.parent_pid),
                         SortColumn::User => a.user.cmp(&b.user),
                         SortColumn::Priority => a.priority.cmp(&b.priority),
-                        SortColumn::PriorityClass => a.nice.cmp(&b.nice),
+                        SortColumn::PriorityClass => a.priority.cmp(&b.priority),
                         SortColumn::Threads => a.thread_count.cmp(&b.thread_count),
                         SortColumn::Virt => a.virtual_mem.cmp(&b.virtual_mem),
                         SortColumn::Shr => a.shared_mem.cmp(&b.shared_mem),

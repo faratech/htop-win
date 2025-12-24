@@ -508,14 +508,14 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                     // - High CPU (>50%) - bold for visibility
                     // - Running status ('R') - htop uses PROCESS_RUN_STATE
                     // - Disk wait/zombie ('D', 'Z') - htop uses A_BOLD | PROCESS_D_STATE
-                    // - High priority (nice < 0) - htop uses PROCESS_HIGH_PRIORITY
+                    // - High priority (base priority > 8) - htop uses PROCESS_HIGH_PRIORITY
                     // - Large memory (>1GB) - bold for visibility
                     let style = if *col == SortColumn::Cpu && proc.cpu_percent > 50.0 {
                         Style::default().fg(color).add_modifier(Modifier::BOLD)
                     } else if *col == SortColumn::Status && (proc.status == 'R' || proc.status == 'D' || proc.status == 'Z') {
                         // htop: Running is green, D/Z states are A_BOLD | Red
                         Style::default().fg(color).add_modifier(Modifier::BOLD)
-                    } else if *col == SortColumn::Priority && proc.nice < 0 {
+                    } else if *col == SortColumn::Priority && proc.priority > 8 {
                         Style::default().fg(color).add_modifier(Modifier::BOLD)
                     } else if *col == SortColumn::Res && proc.resident_mem >= 1_073_741_824 {
                         // Bold for processes using > 1GB memory

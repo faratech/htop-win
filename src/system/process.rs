@@ -4,7 +4,7 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 #[cfg(windows)]
-use super::native::{NativeProcessInfo, filetime_to_unix, priority_to_nice};
+use super::native::{NativeProcessInfo, filetime_to_unix};
 
 #[cfg(windows)]
 use std::sync::LazyLock;
@@ -710,7 +710,6 @@ pub fn enrich_processes(_processes: &mut [ProcessInfo], _fetch_exe_path: bool) {
 #[cfg(not(windows))]
 struct WinProcessInfo {
     priority: i32,
-    nice: i32,
     cpu_time: Duration,
     start_time: u64,
     handle_count: u32,
@@ -727,7 +726,6 @@ struct WinProcessInfo {
 fn get_win_process_info(_pid: u32) -> WinProcessInfo {
     WinProcessInfo {
         priority: 20,
-        nice: 0,
         cpu_time: Duration::ZERO,
         start_time: 0,
         handle_count: 0,
@@ -757,7 +755,6 @@ pub struct ProcessInfo {
     pub resident_mem: u64,
     pub shared_mem: u64,
     pub priority: i32,
-    pub nice: i32,
     pub cpu_time: Duration,
     pub tree_depth: usize,
     pub tree_prefix: String, // Tree display prefix (├─, └─, │, etc.)
@@ -840,9 +837,8 @@ impl ProcessInfo {
                     .and_then(|cache| cache.get(&pid).cloned())
                     .unwrap_or((false, ProcessArch::Native, String::new()));
 
-                // Always use native data for priority/nice/handle_count
+                // Always use native data for priority/handle_count
                 // These come directly from NtQuerySystemInformation
-                let nice = priority_to_nice(proc.base_priority);
                 let priority = proc.base_priority;
                 let handle_count = proc.handle_count;
 
@@ -924,7 +920,6 @@ impl ProcessInfo {
                     resident_mem: proc.working_set,
                     shared_mem: proc.working_set.saturating_sub(proc.private_bytes),
                     priority,
-                    nice,
                     cpu_time,
                     tree_depth: 0,
                     tree_prefix: String::new(),

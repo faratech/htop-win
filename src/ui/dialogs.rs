@@ -154,7 +154,7 @@ pub fn draw_help(frame: &mut Frame, app: &App) {
         "    --no-mouse         Disable mouse support",
         "    --no-color         Monochrome mode",
         "    --no-meters        Hide header meters",
-        "    --readonly         Disable kill/nice operations",
+        "    --readonly         Disable kill/priority operations",
         "",
         "  ─────────────────────────────────────────────────────────────",
         "  GENERAL",
@@ -374,14 +374,14 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &App) {
 }
 
 /// Draw priority class dialog
-pub fn draw_nice(frame: &mut Frame, app: &App) {
+pub fn draw_priority(frame: &mut Frame, app: &App) {
     use crate::app::WindowsPriorityClass;
 
     let classes = WindowsPriorityClass::all();
     let area = centered_rect_fixed(55, (classes.len() + 8) as u16, frame.area());
     let theme = &app.theme;
 
-    // Use captured kill_target for consistency (Nice shares target with Kill)
+    // Use captured kill_target for consistency (Priority shares target with Kill)
     let process_info = if let Some((pid, ref name, _)) = app.kill_target {
         format!("PID: {} - {}", pid, name)
     } else {
@@ -459,6 +459,7 @@ pub fn draw_setup(frame: &mut Frame, app: &App) {
         ("Confirm before kill", bool_to_str(app.config.confirm_kill)),
         ("Color scheme", app.config.color_scheme.name().to_string()),
         ("Configure columns", "→".to_string()),
+        ("Reset all settings", "⚠".to_string()),
     ];
 
     let items: Vec<ListItem> = setup_items
@@ -866,15 +867,21 @@ pub fn draw_command_wrap(frame: &mut Frame, app: &App) {
 pub fn draw_column_config(frame: &mut Frame, app: &App) {
     let theme = &app.theme;
     let columns = SortColumn::all();
-    let area = centered_rect_fixed(40, (columns.len() + 2) as u16, frame.area());
+    let area = centered_rect_fixed(50, (columns.len() + 4) as u16, frame.area());
 
-    let items: Vec<ListItem> = columns
+    let mut items: Vec<ListItem> = columns
         .iter()
         .enumerate()
         .map(|(idx, col)| {
             let col_name = col.name();
             let is_visible = app.config.is_column_visible(col_name);
             let checkbox = if is_visible { "[✓]" } else { "[ ]" };
+            // Show position in visible order if visible
+            let order_str = if let Some(pos) = app.config.column_position(col_name) {
+                format!("{:>2}", pos + 1)
+            } else {
+                "  ".to_string()
+            };
             let style = if idx == app.column_config_index {
                 selected_style(theme)
             } else if is_visible {
@@ -882,9 +889,18 @@ pub fn draw_column_config(frame: &mut Frame, app: &App) {
             } else {
                 Style::default().fg(theme.text_dim).bg(theme.background)
             };
-            ListItem::new(Line::from(vec![Span::styled(format!("{} {}", checkbox, col_name), style)]))
+            ListItem::new(Line::from(vec![Span::styled(
+                format!("{} {} {}", order_str, checkbox, col_name),
+                style,
+            )]))
         })
         .collect();
+
+    // Add help text at bottom
+    items.push(ListItem::new(Line::from("")));
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled("Shift+↑↓ to reorder", Style::default().fg(Color::DarkGray)),
+    ])));
 
     let block = Block::default()
         .title(" Columns (Space to toggle) ")

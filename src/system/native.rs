@@ -238,14 +238,3 @@ pub fn filetime_to_unix(filetime: u64) -> u64 {
     filetime.saturating_sub(116444736000000000) / 10_000_000
 }
 
-/// Convert priority to nice value (htop-style)
-#[inline]
-pub fn priority_to_nice(priority: i32) -> i32 {
-    match priority {
-        0..=4 => -20 + priority,     // Realtime
-        5..=8 => -10 + (priority - 5) * 2,  // High
-        9..=12 => priority - 10,    // Above normal to normal
-        13..=15 => (priority - 10) * 2, // Below normal
-        _ => 19,                      // Idle
-    }
-}

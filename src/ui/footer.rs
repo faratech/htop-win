@@ -147,7 +147,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        ViewMode::Nice => vec![
+        ViewMode::Priority => vec![
             (None, "↑/↓", "Select"),
             (None, "Enter", "Set"),
             (None, "Esc", "Cancel"),
@@ -221,8 +221,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
         ],
         ViewMode::ColumnConfig => vec![
             (None, "Space", "Toggle"),
+            (None, "Shift+↑↓", "Order"),
             (None, "Esc", "Done"),
-            (None, "", ""),
             (None, "", ""),
             (None, "", ""),
             (None, "", ""),

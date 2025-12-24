@@ -75,7 +75,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ViewMode::SortSelect => dialogs::draw_sort_select(frame, app),
         ViewMode::Kill => dialogs::draw_kill_confirm(frame, app),
         ViewMode::SignalSelect => dialogs::draw_signal_select(frame, app),
-        ViewMode::Nice => dialogs::draw_nice(frame, app),
+        ViewMode::Priority => dialogs::draw_priority(frame, app),
         ViewMode::Setup => dialogs::draw_setup(frame, app),
         ViewMode::ProcessInfo => dialogs::draw_process_info(frame, app),
         ViewMode::UserSelect => dialogs::draw_user_select(frame, app),

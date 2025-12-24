@@ -135,8 +135,8 @@ pub struct Theme {
     pub process_tree: Color,           // Tree lines
     pub process_run_state: Color,      // Running state
     pub process_d_state: Color,        // Disk wait state
-    pub process_high_priority: Color,  // High priority (negative nice)
-    pub process_low_priority: Color,   // Low priority (positive nice)
+    pub process_high_priority: Color,  // High priority (above normal)
+    pub process_low_priority: Color,   // Low priority (below normal)
     pub process_new: Color,            // Newly created process
     pub process_tomb: Color,           // Dying/zombie process
     pub process_thread: Color,         // Thread coloring
@@ -902,12 +902,12 @@ impl Theme {
         }
     }
 
-    /// Get color for process priority
+    /// Get color for process priority (based on base priority relative to normal=8)
     #[allow(dead_code)]
-    pub fn priority_color_for_nice(&self, nice: i32) -> Color {
-        if nice < 0 {
+    pub fn priority_color(&self, base_priority: i32) -> Color {
+        if base_priority > 8 {
             self.process_high_priority
-        } else if nice > 0 {
+        } else if base_priority < 8 {
             self.process_low_priority
         } else {
             self.text

@@ -36,7 +36,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         ViewMode::SortSelect => handle_sort_select_keys(app, key),
         ViewMode::Kill => handle_kill_keys(app, key),
         ViewMode::SignalSelect => handle_signal_select_keys(app, key),
-        ViewMode::Nice => handle_nice_keys(app, key),
+        ViewMode::Priority => handle_priority_keys(app, key),
         ViewMode::Setup => handle_setup_keys(app, key),
         ViewMode::ProcessInfo => handle_process_info_keys(app, key),
         ViewMode::UserSelect => handle_user_select_keys(app, key),
@@ -232,13 +232,13 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
                 .position(|c| *c == app.sort_column)
                 .unwrap_or(0);
         }
-        // Higher priority / decrease nice value (F7, ])
+        // Higher priority (F7, ])
         KeyCode::F(7) | KeyCode::Char(']') => {
-            app.enter_nice_mode();
+            app.enter_priority_mode();
         }
-        // Lower priority / increase nice value (F8, [)
+        // Lower priority (F8, [)
         KeyCode::F(8) | KeyCode::Char('[') => {
-            app.enter_nice_mode();
+            app.enter_priority_mode();
         }
         KeyCode::F(9) => {
             app.enter_kill_mode();
@@ -449,7 +449,7 @@ fn handle_kill_keys(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
-fn handle_nice_keys(app: &mut App, key: KeyEvent) -> bool {
+fn handle_priority_keys(app: &mut App, key: KeyEvent) -> bool {
     use crate::app::WindowsPriorityClass;
 
     let max_index = WindowsPriorityClass::all().len() - 1;
@@ -531,7 +531,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.setup_selected < 11 {
+            if app.setup_selected < 12 {
                 // Number of setup items - 1
                 app.setup_selected += 1;
             }
@@ -600,6 +600,17 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                 11 => {
                     // Open column configuration
                     app.enter_column_config_mode();
+                }
+                12 => {
+                    // Reset all settings to defaults
+                    app.config.reset_to_defaults();
+                    app.update_theme();
+                    app.update_visible_columns_cache();
+                    app.save_config();
+                    app.status_message = Some((
+                        "Settings reset to defaults".to_string(),
+                        std::time::Instant::now(),
+                    ));
                 }
                 _ => {}
             }
@@ -786,13 +797,37 @@ fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
             app.view_mode = ViewMode::Setup;
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if app.column_config_index > 0 {
-                app.column_config_index -= 1;
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                // Shift+Up: Move column up in order
+                if let Some(col) = all_columns.get(app.column_config_index) {
+                    let col_name = col.name().to_string();
+                    if app.config.move_column_up(&col_name) {
+                        app.update_visible_columns_cache();
+                        app.save_config();
+                    }
+                }
+            } else {
+                // Regular Up: Navigate
+                if app.column_config_index > 0 {
+                    app.column_config_index -= 1;
+                }
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.column_config_index < all_columns.len() - 1 {
-                app.column_config_index += 1;
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                // Shift+Down: Move column down in order
+                if let Some(col) = all_columns.get(app.column_config_index) {
+                    let col_name = col.name().to_string();
+                    if app.config.move_column_down(&col_name) {
+                        app.update_visible_columns_cache();
+                        app.save_config();
+                    }
+                }
+            } else {
+                // Regular Down: Navigate
+                if app.column_config_index < all_columns.len() - 1 {
+                    app.column_config_index += 1;
+                }
             }
         }
         KeyCode::Char(' ') | KeyCode::Enter => {
@@ -866,7 +901,7 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
             | ViewMode::SortSelect
             | ViewMode::Kill
             | ViewMode::SignalSelect
-            | ViewMode::Nice
+            | ViewMode::Priority
             | ViewMode::Setup
             | ViewMode::ProcessInfo
             | ViewMode::UserSelect
