@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod input;
+mod installer;
 mod json;
 mod system;
 mod terminal;
@@ -38,6 +39,7 @@ struct Args {
     version: bool,
     benchmark: Option<u64>,
     inefficient: bool,
+    install: bool,
 }
 
 /// Benchmark statistics for performance measurement
@@ -110,6 +112,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Long("inefficient") => {
                 args.inefficient = true;
             }
+            Long("install") => {
+                args.install = true;
+            }
             _ => return Err(arg.unexpected()),
         }
     }
@@ -135,6 +140,7 @@ fn print_help() {
     println!("      --readonly               Disable kill/priority operations");
     println!("      --inefficient            Disable Efficiency Mode (run at normal priority)");
     println!("  -H, --highlight-changes <S>  Highlight process changes (seconds)");
+    println!("      --install                Install to PATH (requires admin, will prompt UAC)");
     println!("  -h, --help                   Print help");
     println!("  -V, --version                Print version");
 }
@@ -294,6 +300,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.version {
         println!("htop-win {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    if args.install {
+        if let Err(e) = installer::install_to_path() {
+            eprintln!("Installation failed: {}", e);
+            std::process::exit(1);
+        }
         return Ok(());
     }
 
