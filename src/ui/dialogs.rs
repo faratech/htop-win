@@ -1,7 +1,8 @@
 use ratatui::{
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame,
 };
 
@@ -80,13 +81,15 @@ pub fn draw_help(frame: &mut Frame, app: &App) {
         "  ─────────────────────────────────────────────────────────────",
         "  TAGGING & SELECTION",
         "  ─────────────────────────────────────────────────────────────",
-        "    Space              Tag/untag process (tagged = batch actions)",
-        "    c                  Tag process with all children",
+        "    Space              Tag/untag process and move down",
+        "    c                  Tag process with all its children",
+        "    Ctrl+T             Tag all processes with same name",
+        "    Ctrl+A             Toggle tag on all visible processes",
         "    U                  Untag all processes",
         "    u                  Filter by user (show user list)",
         "    F                  Toggle follow mode (track selected PID)",
-        "    Note: Tagged processes are highlighted and killed together",
-        "          when pressing F9 (Kill). Count shown in status bar.",
+        "    Note: Tagged processes show a yellow ● indicator and are",
+        "          killed together when pressing F9. Count in status bar.",
         "",
         "  ─────────────────────────────────────────────────────────────",
         "  TREE VIEW (when enabled with F5)",
@@ -95,6 +98,7 @@ pub fn draw_help(frame: &mut Frame, app: &App) {
         "    -                  Collapse selected tree node",
         "    *                  Toggle expand/collapse all nodes",
         "    Backspace          Collapse to parent",
+        "    Double-click       Toggle tag for entire branch (parent + children)",
         "",
         "  ─────────────────────────────────────────────────────────────",
         "  SEARCH & SORT",
@@ -128,7 +132,7 @@ pub fn draw_help(frame: &mut Frame, app: &App) {
         "  MOUSE",
         "  ─────────────────────────────────────────────────────────────",
         "    Click process      Select process",
-        "    Double-click       Open process details",
+        "    Double-click       Open process details (or tag branch in tree mode)",
         "    Right-click        Tag/untag process (for batch kill)",
         "    Middle-click       Open kill dialog for process",
         "    Click header       Sort by column",
@@ -163,6 +167,9 @@ pub fn draw_help(frame: &mut Frame, app: &App) {
         "",
     ];
 
+    let total_lines = help_text.len();
+    let visible_lines = area.height.saturating_sub(2) as usize; // Account for border
+
     let items: Vec<ListItem> = help_text
         .iter()
         .skip(app.help_scroll)
@@ -180,6 +187,21 @@ pub fn draw_help(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, area);
     frame.render_widget(help_list, area);
+
+    // Draw scrollbar if content is scrollable
+    if total_lines > visible_lines {
+        let scrollbar_area = Rect::new(
+            area.x + area.width - 1,
+            area.y + 1,
+            1,
+            area.height.saturating_sub(2),
+        );
+        let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_lines))
+            .position(app.help_scroll);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
 }
 
 /// Draw search dialog
@@ -260,48 +282,104 @@ pub fn draw_sort_select(frame: &mut Frame, app: &App) {
 
 /// Draw kill confirmation dialog
 pub fn draw_kill_confirm(frame: &mut Frame, app: &App) {
-    let area = centered_rect_fixed(50, 8, frame.area());
+    let tagged_count = app.tagged_pids.len();
 
-    // Use captured kill_target to prevent race condition with list refresh
-    let process_info = if let Some((pid, ref name, ref command)) = app.kill_target {
-        format!(
-            "PID: {}\nName: {}\nCommand: {}",
-            pid,
-            name,
-            truncate_str(command, 40)
-        )
+    // Determine dialog height based on tagged processes
+    let base_height = if tagged_count > 0 { 10 } else { 8 };
+    let extra_height = tagged_count.min(8) as u16; // Show up to 8 tagged processes
+    let height = base_height + extra_height;
+
+    let area = centered_rect_fixed(55, height, frame.area());
+    let theme = &app.theme;
+
+    // Build content lines
+    let mut lines: Vec<Line> = Vec::new();
+
+    if tagged_count > 0 {
+        // Multiple processes - show list
+        lines.push(Line::from(Span::styled(
+            format!("Kill {} tagged processes?", tagged_count),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+
+        // List tagged processes (show up to 8)
+        let mut shown = 0;
+        for pid in app.tagged_pids.iter() {
+            if shown >= 8 {
+                lines.push(Line::from(Span::styled(
+                    format!("  ... and {} more", tagged_count - 8),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                break;
+            }
+            // Try to find process name
+            let name = app.displayed_processes
+                .iter()
+                .find(|p| p.pid == *pid)
+                .map(|p| p.name.as_str())
+                .unwrap_or("(unknown)");
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {} ", pid), Style::default().fg(Color::Yellow)),
+                Span::styled(name, Style::default().fg(theme.text)),
+            ]));
+            shown += 1;
+        }
     } else {
-        "No process selected".to_string()
-    };
+        // Single process
+        lines.push(Line::from(Span::styled(
+            "Kill this process?",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
 
-    let tagged_info = if !app.tagged_pids.is_empty() {
-        format!("\n\n{} tagged processes will also be killed", app.tagged_pids.len())
-    } else {
-        String::new()
-    };
+        if let Some((pid, ref name, ref command)) = app.kill_target {
+            lines.push(Line::from(vec![
+                Span::styled("PID:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{}", pid), Style::default().fg(Color::Yellow)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Name: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(name.clone(), Style::default().fg(theme.text)),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Cmd:  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(truncate_str(command, 42), Style::default().fg(Color::DarkGray)),
+            ]));
+        } else {
+            lines.push(Line::from("No process selected"));
+        }
+    }
 
-    let content = format!(
-        "Kill this process?\n\n{}{}\n\nPress Enter to confirm, Esc to cancel",
-        process_info, tagged_info
-    );
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[Y/Enter/Click]", Style::default().fg(Color::Green)),
+        Span::raw(" Yes  "),
+        Span::styled("[N/Esc/Right-click]", Style::default().fg(Color::Red)),
+        Span::raw(" No"),
+    ]));
 
-    let dialog = Paragraph::new(content)
+    let dialog = Paragraph::new(lines)
         .block(
             Block::default()
                 .title(" Kill Process ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
+                .border_style(Style::default().fg(Color::Red))
+                .style(Style::default().bg(theme.background)),
         )
-        .style(Style::default().fg(Color::White))
-        .wrap(Wrap { trim: true });
+        .style(Style::default().fg(Color::White));
 
     frame.render_widget(Clear, area);
     frame.render_widget(dialog, area);
 }
 
-/// Draw nice value dialog
+/// Draw priority class dialog
 pub fn draw_nice(frame: &mut Frame, app: &App) {
-    let area = centered_rect_fixed(40, 6, frame.area());
+    use crate::app::WindowsPriorityClass;
+
+    let classes = WindowsPriorityClass::all();
+    let area = centered_rect_fixed(55, (classes.len() + 8) as u16, frame.area());
+    let theme = &app.theme;
 
     // Use captured kill_target for consistency (Nice shares target with Kill)
     let process_info = if let Some((pid, ref name, _)) = app.kill_target {
@@ -310,22 +388,56 @@ pub fn draw_nice(frame: &mut Frame, app: &App) {
         "No process selected".to_string()
     };
 
-    let content = format!(
-        "{}\n\nNew nice value: {}\n\n← → to adjust, Enter to set, Esc to cancel",
-        process_info, app.nice_value
-    );
+    // Get efficiency mode status from process_info_target or selected process
+    let efficiency_mode = app.process_info_target.as_ref()
+        .or_else(|| app.selected_process())
+        .map(|p| p.efficiency_mode)
+        .unwrap_or(false);
 
-    let dialog = Paragraph::new(content)
-        .block(
-            Block::default()
-                .title(" Set Priority ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
-        )
-        .style(Style::default().fg(Color::White));
+    // Build list of priority classes with base priority values
+    let mut items: Vec<ListItem> = classes
+        .iter()
+        .enumerate()
+        .map(|(idx, class)| {
+            let indicator = if idx == app.priority_class_index { "▶ " } else { "  " };
+            let style = if idx == app.priority_class_index {
+                selected_style(theme)
+            } else {
+                normal_style(theme)
+            };
+            ListItem::new(Line::from(Span::styled(
+                format!("{}{:<14} (base priority: {:>2})", indicator, class.name(), class.base_priority()),
+                style,
+            )))
+        })
+        .collect();
+
+    // Add separator and efficiency mode option
+    items.push(ListItem::new(Line::from("")));
+    let efficiency_status = if efficiency_mode { "ON 🌿" } else { "OFF" };
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled("  [E] Efficiency Mode: ", Style::default().fg(Color::Cyan)),
+        Span::styled(efficiency_status, Style::default().fg(if efficiency_mode { Color::Green } else { Color::DarkGray })),
+    ])));
+
+    let block = Block::default()
+        .title(format!(" Set Priority: {} ", process_info))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Style::default().bg(theme.background));
+
+    let list = List::new(items)
+        .block(block)
+        .style(Style::default().fg(theme.text).bg(theme.background));
 
     frame.render_widget(Clear, area);
-    frame.render_widget(dialog, area);
+    frame.render_widget(list, area);
+
+    // Draw footer hint
+    let hint_area = Rect::new(area.x + 1, area.y + area.height - 2, area.width - 2, 1);
+    let hint = Paragraph::new("↑↓ select, E efficiency, Enter apply, Esc cancel")
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(hint, hint_area);
 }
 
 /// Draw setup menu
@@ -344,6 +456,7 @@ pub fn draw_setup(frame: &mut Frame, app: &App) {
         ("Highlight new processes", bool_to_str(app.config.highlight_new_processes)),
         ("Highlight large numbers", bool_to_str(app.config.highlight_large_numbers)),
         ("Tree view", bool_to_str(app.tree_view)),
+        ("Confirm before kill", bool_to_str(app.config.confirm_kill)),
         ("Color scheme", app.config.color_scheme.name().to_string()),
         ("Configure columns", "→".to_string()),
     ];
@@ -389,7 +502,7 @@ fn meter_mode_str(mode: crate::config::MeterMode) -> String {
 
 /// Draw process info dialog
 pub fn draw_process_info(frame: &mut Frame, app: &App) {
-    let area = centered_rect(70, 70, frame.area());
+    let area = centered_rect(75, 80, frame.area());
 
     // Use captured process_info_target to prevent race condition with list refresh
     let content = if let Some(ref proc) = app.process_info_target {
@@ -408,41 +521,68 @@ pub fn draw_process_info(frame: &mut Frame, app: &App) {
             proc.exe_path.clone()
         };
 
+        let arch_str = match proc.arch.as_str() {
+            "" => "Native",
+            s => s,
+        };
+
+        let elevated_str = if proc.is_elevated { "Yes 🛡️" } else { "No" };
+        let efficiency_str = if proc.efficiency_mode { "Yes 🌿" } else { "No" };
+
         format!(
             "Process Information\n\
-             ─────────────────────────────────────\n\
-             PID:           {}\n\
-             Parent PID:    {}\n\
-             Name:          {}\n\
-             User:          {}\n\
-             Status:        {} ({})\n\
-             Priority:      {}\n\
-             Nice:          {}\n\
-             Threads:       {}\n\
-             Handles:       {}\n\
+             ─────────────────────────────────────────────────\n\
+             PID:             {}\n\
+             Parent PID:      {}\n\
+             Name:            {}\n\
+             User:            {}\n\
+             Status:          {} ({})\n\
              \n\
-             CPU Usage:     {:.1}%\n\
-             Memory Usage:  {:.1}%\n\
-             Virtual Mem:   {}\n\
-             Resident Mem:  {}\n\
-             Shared Mem:    {}\n\
-             CPU Time:      {}\n\
+             ─────────────────────────────────────────────────\n\
+             SCHEDULING\n\
+             ─────────────────────────────────────────────────\n\
+             Base Priority:   {}\n\
+             Priority Class:  {}\n\
+             Elevated:        {}\n\
+             Efficiency Mode: {}\n\
+             Architecture:    {}\n\
              \n\
-             I/O Read:      {}\n\
-             I/O Write:     {}\n\
+             ─────────────────────────────────────────────────\n\
+             RESOURCES\n\
+             ─────────────────────────────────────────────────\n\
+             Threads:         {}\n\
+             Handles:         {}\n\
+             CPU Usage:       {:.1}%\n\
+             Memory Usage:    {:.1}%\n\
+             Virtual Mem:     {}\n\
+             Resident Mem:    {}\n\
+             Shared Mem:      {}\n\
+             CPU Time:        {}\n\
              \n\
-             Executable:\n{}\n\
+             ─────────────────────────────────────────────────\n\
+             DISK I/O (live)\n\
+             ─────────────────────────────────────────────────\n\
+             I/O Read:        {}\n\
+             I/O Write:       {}\n\
              \n\
-             Command Line:\n{}\n\
+             ─────────────────────────────────────────────────\n\
+             PATHS\n\
+             ─────────────────────────────────────────────────\n\
+             Executable:\n  {}\n\
              \n\
-             Press any key to close",
+             Command Line:\n  {}\n\
+             \n\
+             Press Esc to close",
             proc.pid,
             proc.parent_pid,
             proc.name,
             proc.user,
             proc.status, status_desc,
             proc.priority,
-            proc.nice,
+            crate::app::WindowsPriorityClass::from_base_priority(proc.priority).name(),
+            elevated_str,
+            efficiency_str,
+            arch_str,
             proc.thread_count,
             proc.handle_count,
             proc.cpu_percent,
@@ -687,6 +827,9 @@ pub fn draw_command_wrap(frame: &mut Frame, app: &App) {
         "No process selected".to_string()
     };
 
+    let total_lines = content.lines().count();
+    let visible_lines = area.height.saturating_sub(2) as usize;
+
     let items: Vec<ListItem> = content
         .lines()
         .skip(app.command_wrap_scroll)
@@ -702,6 +845,21 @@ pub fn draw_command_wrap(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, area);
     frame.render_widget(list, area);
+
+    // Draw scrollbar if content is scrollable
+    if total_lines > visible_lines {
+        let scrollbar_area = Rect::new(
+            area.x + area.width - 1,
+            area.y + 1,
+            1,
+            area.height.saturating_sub(2),
+        );
+        let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_lines))
+            .position(app.command_wrap_scroll);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
 }
 
 /// Draw column configuration dialog

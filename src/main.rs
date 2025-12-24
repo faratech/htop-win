@@ -487,6 +487,12 @@ fn run_app<B: ratatui::backend::Backend>(
                 }
             }
 
+            // Refresh I/O counters when process info dialog is open (even when paused)
+            if app.view_mode == app::ViewMode::ProcessInfo {
+                app.refresh_process_info_io();
+                needs_redraw = true;
+            }
+
             // Advance the tick even while paused to avoid busy-looping with a
             // zero-duration poll timeout (which drives CPU usage up).
             last_tick = Instant::now();

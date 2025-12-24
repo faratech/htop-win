@@ -8,7 +8,7 @@ pub use cpu::CpuInfo;
 pub use memory::{format_bytes, MemoryInfo};
 pub use process::{
     enable_debug_privilege, enrich_processes, get_process_affinity, get_process_io_counters,
-    kill_process, set_priority, set_process_affinity, ProcessInfo,
+    kill_process, set_efficiency_mode, set_priority_class, set_process_affinity, ProcessInfo,
 };
 #[cfg(windows)]
 pub use native::{query_all_processes, calculate_cpu_percentages, cleanup_cpu_time_cache};

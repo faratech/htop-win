@@ -256,6 +256,15 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                         // Build spans with distinct colors
                         let mut spans: Vec<Span> = Vec::new();
 
+                        // Tagged indicator - yellow dot prefix for visibility
+                        if is_tagged {
+                            spans.push(Span::styled(
+                                "● ",
+                                Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_tag })
+                                    .add_modifier(Modifier::BOLD)
+                            ));
+                        }
+
                         // Elevated indicator - use theme's privileged process color
                         if proc.is_elevated {
                             spans.push(Span::styled(
@@ -395,18 +404,20 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             format!("{:>3}", proc.priority),
                             if is_selected { theme.selection_fg } else { theme.process }  // htop uses default color
                         ),
-                        SortColumn::Nice => {
-                            // htop: nice < 0 = red, nice > 0 = green, nice == 0 = shadow
+                        SortColumn::PriorityClass => {
+                            // Display Windows priority class name with color coding
+                            use crate::app::WindowsPriorityClass;
+                            let priority_class = WindowsPriorityClass::from_base_priority(proc.priority);
                             let color = if is_selected {
                                 theme.selection_fg
-                            } else if proc.nice < 0 {
-                                theme.process_high_priority
-                            } else if proc.nice > 0 {
-                                theme.process_low_priority
                             } else {
-                                theme.process_shadow  // nice == 0 is dimmed in htop
+                                match priority_class {
+                                    WindowsPriorityClass::Realtime | WindowsPriorityClass::High => theme.process_high_priority,
+                                    WindowsPriorityClass::Idle | WindowsPriorityClass::BelowNormal => theme.process_low_priority,
+                                    _ => theme.process_shadow,
+                                }
                             };
-                            (format!("{:>3}", proc.nice), color)
+                            (format!("{:>6}", priority_class.short_name()), color)
                         }
                         SortColumn::Threads => {
                             // htop: If nlwp == 1, use PROCESS_SHADOW (dimmed)

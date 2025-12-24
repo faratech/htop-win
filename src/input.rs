@@ -116,6 +116,14 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('c') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.tag_with_children();
         }
+        // Tag all processes with the same name (Ctrl+T)
+        KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.tag_all_by_name();
+        }
+        // Tag/untag all visible processes (Ctrl+A)
+        KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.tag_all_visible();
+        }
 
         // User filter
         KeyCode::Char('u') => {
@@ -226,11 +234,11 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         // Higher priority / decrease nice value (F7, ])
         KeyCode::F(7) | KeyCode::Char(']') => {
-            app.enter_nice_mode(-1);
+            app.enter_nice_mode();
         }
         // Lower priority / increase nice value (F8, [)
         KeyCode::F(8) | KeyCode::Char('[') => {
-            app.enter_nice_mode(1);
+            app.enter_nice_mode();
         }
         KeyCode::F(9) => {
             app.enter_kill_mode();
@@ -396,11 +404,27 @@ fn handle_sort_select_keys(app: &mut App, key: KeyEvent) -> bool {
 
 fn handle_kill_keys(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
-        KeyCode::Esc => {
+        // Cancel: Esc, n, N, Delete, Backspace
+        KeyCode::Esc | KeyCode::Delete | KeyCode::Backspace => {
             app.kill_target = None;
             app.view_mode = ViewMode::Normal;
         }
-        KeyCode::Enter => {
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            app.kill_target = None;
+            app.view_mode = ViewMode::Normal;
+        }
+        // Confirm: Enter, y, Y, Space
+        KeyCode::Enter | KeyCode::Char(' ') => {
+            // Kill process with SIGTERM equivalent (15)
+            if !app.tagged_pids.is_empty() {
+                app.kill_tagged(15);
+            } else {
+                app.kill_target_process(15);
+            }
+            app.kill_target = None;
+            app.view_mode = ViewMode::Normal;
+        }
+        KeyCode::Char('y') | KeyCode::Char('Y') => {
             // Kill process with SIGTERM equivalent (15)
             if !app.tagged_pids.is_empty() {
                 app.kill_tagged(15);
@@ -426,25 +450,46 @@ fn handle_kill_keys(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_nice_keys(app: &mut App, key: KeyEvent) -> bool {
+    use crate::app::WindowsPriorityClass;
+
+    let max_index = WindowsPriorityClass::all().len() - 1;
+
     match key.code {
         KeyCode::Esc => {
             app.view_mode = ViewMode::Normal;
         }
         KeyCode::Enter => {
-            app.set_nice_selected(app.nice_value);
+            let priority_class = WindowsPriorityClass::from_index(app.priority_class_index);
+            app.set_priority_selected(priority_class);
             app.view_mode = ViewMode::Normal;
         }
-        KeyCode::Left => {
-            app.nice_value = (app.nice_value - 1).max(-20);
-        }
-        KeyCode::Right => {
-            app.nice_value = (app.nice_value + 1).min(19);
-        }
+        // Up = move up in list (lower index)
         KeyCode::Up => {
-            app.nice_value = (app.nice_value - 5).max(-20);
+            if app.priority_class_index > 0 {
+                app.priority_class_index -= 1;
+            }
         }
+        // Down = move down in list (higher index)
         KeyCode::Down => {
-            app.nice_value = (app.nice_value + 5).min(19);
+            if app.priority_class_index < max_index {
+                app.priority_class_index += 1;
+            }
+        }
+        // Right = increase priority (higher index)
+        KeyCode::Right => {
+            if app.priority_class_index < max_index {
+                app.priority_class_index += 1;
+            }
+        }
+        // Left = decrease priority (lower index)
+        KeyCode::Left => {
+            if app.priority_class_index > 0 {
+                app.priority_class_index -= 1;
+            }
+        }
+        // E = toggle efficiency mode
+        KeyCode::Char('e') | KeyCode::Char('E') => {
+            app.toggle_efficiency_mode();
         }
         _ => {}
     }
@@ -486,7 +531,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if app.setup_selected < 10 {
+            if app.setup_selected < 11 {
                 // Number of setup items - 1
                 app.setup_selected += 1;
             }
@@ -541,6 +586,10 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     app.config.tree_view_default = app.tree_view;
                 }
                 9 => {
+                    // Toggle confirm before kill
+                    app.config.confirm_kill = !app.config.confirm_kill;
+                }
+                10 => {
                     // Open color scheme selection
                     let schemes = ColorScheme::all();
                     app.color_scheme_index = schemes.iter()
@@ -548,7 +597,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                         .unwrap_or(0);
                     app.view_mode = ViewMode::ColorScheme;
                 }
-                10 => {
+                11 => {
                     // Open column configuration
                     app.enter_column_config_mode();
                 }
@@ -830,13 +879,38 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            // If in a dialog, clicking outside should close it
+            // Handle dialogs specially
             if is_in_dialog {
-                // For now, any click in dialog mode that's not on a specific element closes the dialog
-                // This is a simplified approach - clicking anywhere dismisses the dialog
-                // TODO: Could add proper dialog bounds tracking for more precise click detection
-                app.view_mode = ViewMode::Normal;
-                return;
+                match app.view_mode {
+                    // Kill dialog: left-click confirms the kill
+                    ViewMode::Kill => {
+                        if !app.tagged_pids.is_empty() {
+                            app.kill_tagged(15);
+                        } else {
+                            app.kill_target_process(15);
+                        }
+                        app.kill_target = None;
+                        app.view_mode = ViewMode::Normal;
+                        return;
+                    }
+                    // SignalSelect: left-click confirms
+                    ViewMode::SignalSelect => {
+                        let signal = crate::ui::dialogs::get_signal_by_index(app.signal_select_index);
+                        if !app.tagged_pids.is_empty() {
+                            app.kill_tagged(signal);
+                        } else {
+                            app.kill_target_process(signal);
+                        }
+                        app.kill_target = None;
+                        app.view_mode = ViewMode::Normal;
+                        return;
+                    }
+                    // Other dialogs: close on click
+                    _ => {
+                        app.view_mode = ViewMode::Normal;
+                        return;
+                    }
+                }
             }
 
             // Check for double-click
@@ -947,16 +1021,19 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
             // CPU meter click - cycle meter mode
             (UIElement::CpuMeter(_), UIAction::Click) => {
                 app.config.cpu_meter_mode = app.config.cpu_meter_mode.next();
+                app.save_config();
             }
 
             // Memory meter click - cycle meter mode
             (UIElement::MemoryMeter, UIAction::Click) => {
                 app.config.memory_meter_mode = app.config.memory_meter_mode.next();
+                app.save_config();
             }
 
             // Swap meter click - cycle meter mode (shares with memory)
             (UIElement::SwapMeter, UIAction::Click) => {
                 app.config.memory_meter_mode = app.config.memory_meter_mode.next();
+                app.save_config();
             }
 
             // Column header clicks - sort
@@ -978,13 +1055,18 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
                 }
             }
 
-            // Process row double click - open process info
-            (UIElement::ProcessRow { index, pid: _ }, UIAction::DoubleClick) => {
+            // Process row double click - open process info, or toggle tag branch in tree mode
+            (UIElement::ProcessRow { index, pid }, UIAction::DoubleClick) => {
                 let actual_index = app.scroll_offset + index;
                 if actual_index < app.displayed_processes.len() {
                     app.selected_index = actual_index;
-                    // Open process info dialog
-                    app.enter_process_info_mode();
+                    if app.tree_view {
+                        // In tree mode, double-click toggles tag for entire branch
+                        app.toggle_tag_branch(*pid);
+                    } else {
+                        // In normal mode, open process info dialog
+                        app.enter_process_info_mode();
+                    }
                 }
             }
 

@@ -843,13 +843,7 @@ impl ProcessInfo {
                 // Always use native data for priority/nice/handle_count
                 // These come directly from NtQuerySystemInformation
                 let nice = priority_to_nice(proc.base_priority);
-                let priority = match proc.base_priority {
-                    0..=4 => 0,      // Realtime
-                    5..=8 => 5,      // High
-                    9..=12 => 20,    // Normal
-                    13..=15 => 30,   // Below normal
-                    _ => 39,         // Idle
-                };
+                let priority = proc.base_priority;
                 let handle_count = proc.handle_count;
 
                 // Get cached efficiency_mode if available (requires Windows API call to query)
@@ -993,9 +987,11 @@ pub fn kill_process(pid: u32, signal: u32) -> Result<(), String> {
     Ok(())
 }
 
-/// Set process priority (nice value)
+/// Set process priority class directly
 #[cfg(windows)]
-pub fn set_priority(pid: u32, nice: i32) -> Result<(), String> {
+pub fn set_priority_class(pid: u32, priority: crate::app::WindowsPriorityClass) -> Result<(), String> {
+    use crate::app::WindowsPriorityClass;
+
     unsafe {
         let handle = OpenProcess(PROCESS_SET_INFORMATION, false, pid)
             .map_err(|e| format!("Cannot open process: {}", e))?;
@@ -1004,19 +1000,14 @@ pub fn set_priority(pid: u32, nice: i32) -> Result<(), String> {
             return Err(format!("Cannot open process {} (access denied)", pid));
         }
 
-        // Map nice value to Windows priority class
-        let priority_class = if nice <= -15 {
-            REALTIME_PRIORITY_CLASS
-        } else if nice <= -10 {
-            HIGH_PRIORITY_CLASS
-        } else if nice <= -5 {
-            ABOVE_NORMAL_PRIORITY_CLASS
-        } else if nice <= 5 {
-            NORMAL_PRIORITY_CLASS
-        } else if nice <= 10 {
-            BELOW_NORMAL_PRIORITY_CLASS
-        } else {
-            IDLE_PRIORITY_CLASS
+        // Map WindowsPriorityClass to Windows API constant
+        let priority_class = match priority {
+            WindowsPriorityClass::Idle => IDLE_PRIORITY_CLASS,
+            WindowsPriorityClass::BelowNormal => BELOW_NORMAL_PRIORITY_CLASS,
+            WindowsPriorityClass::Normal => NORMAL_PRIORITY_CLASS,
+            WindowsPriorityClass::AboveNormal => ABOVE_NORMAL_PRIORITY_CLASS,
+            WindowsPriorityClass::High => HIGH_PRIORITY_CLASS,
+            WindowsPriorityClass::Realtime => REALTIME_PRIORITY_CLASS,
         };
 
         let result = SetPriorityClass(handle, priority_class);
@@ -1028,13 +1019,88 @@ pub fn set_priority(pid: u32, nice: i32) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-pub fn set_priority(pid: u32, nice: i32) -> Result<(), String> {
+pub fn set_priority_class(pid: u32, priority: crate::app::WindowsPriorityClass) -> Result<(), String> {
+    use crate::app::WindowsPriorityClass;
     use std::process::Command;
+
+    // Map to nice value for Unix
+    let nice = match priority {
+        WindowsPriorityClass::Idle => 19,
+        WindowsPriorityClass::BelowNormal => 10,
+        WindowsPriorityClass::Normal => 0,
+        WindowsPriorityClass::AboveNormal => -5,
+        WindowsPriorityClass::High => -10,
+        WindowsPriorityClass::Realtime => -20,
+    };
+
     Command::new("renice")
         .args([&nice.to_string(), "-p", &pid.to_string()])
         .output()
         .map_err(|e| format!("Failed to set priority: {}", e))?;
     Ok(())
+}
+
+/// Set process efficiency mode (EcoQoS power throttling)
+#[cfg(windows)]
+pub fn set_efficiency_mode(pid: u32, enabled: bool) -> Result<(), String> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, SetProcessInformation, ProcessPowerThrottling,
+        PROCESS_POWER_THROTTLING_STATE, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_SET_INFORMATION,
+    };
+
+    unsafe {
+        let handle = OpenProcess(PROCESS_SET_INFORMATION, false, pid)
+            .map_err(|e| format!("Cannot open process: {}", e))?;
+
+        if handle.is_invalid() {
+            return Err(format!("Cannot open process {} (access denied)", pid));
+        }
+
+        // Use both throttling flags like the working implementation in main.rs
+        let control_mask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED
+            | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION;
+
+        // StateMask: same as ControlMask to enable, default (0) to disable
+        let mut throttle_state: PROCESS_POWER_THROTTLING_STATE = std::mem::zeroed();
+        throttle_state.Version = 1;
+        throttle_state.ControlMask = control_mask;
+        if enabled {
+            throttle_state.StateMask = control_mask;
+        }
+
+        let result = SetProcessInformation(
+            handle,
+            ProcessPowerThrottling,
+            &mut throttle_state as *mut _ as *mut _,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+
+        let _ = CloseHandle(handle);
+        result.map_err(|e| format!("Cannot set efficiency mode: {}", e))?;
+    }
+
+    // Update the cache immediately so UI reflects the change
+    update_efficiency_mode_cache(pid, enabled);
+
+    Ok(())
+}
+
+/// Update the efficiency mode cache for a specific PID
+#[cfg(windows)]
+fn update_efficiency_mode_cache(pid: u32, enabled: bool) {
+    if let Ok(mut cache) = EFFICIENCY_MODE_CACHE.write() {
+        cache.insert(pid, EfficiencyModeCache {
+            efficiency_mode: enabled,
+            last_update: std::time::Instant::now(),
+        });
+    }
+}
+
+#[cfg(not(windows))]
+pub fn set_efficiency_mode(_pid: u32, _enabled: bool) -> Result<(), String> {
+    Err("Efficiency mode is only available on Windows".to_string())
 }
 
 /// Get process CPU affinity mask

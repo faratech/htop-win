@@ -85,6 +85,10 @@ pub struct Config {
     // Readonly mode (no kill/nice operations)
     pub readonly: bool,
 
+    // Confirmation dialogs
+    /// Show confirmation dialog before killing processes
+    pub confirm_kill: bool,
+
     // Tree view settings
     /// Default collapsed PIDs (persisted)
     #[serde(skip)]
@@ -139,6 +143,7 @@ impl Default for Config {
 
             mouse_enabled: true,
             readonly: false,
+            confirm_kill: true,  // Show confirmation dialogs by default
             collapsed_pids: HashSet::new(),
         }
     }

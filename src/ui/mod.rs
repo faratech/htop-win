@@ -87,9 +87,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ViewMode::Normal => {}
     }
 
-    // Draw error message if present
-    if let Some(ref error) = app.last_error {
-        dialogs::draw_error(frame, error);
+    // Draw error message if present (within expiry window)
+    if let Some((ref error, time)) = app.last_error {
+        if time.elapsed() < std::time::Duration::from_secs(5) {
+            dialogs::draw_error(frame, error);
+        }
     }
 }
 

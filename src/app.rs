@@ -54,6 +54,90 @@ pub enum FocusRegion {
     Footer,
 }
 
+/// Windows priority classes (ordered from lowest to highest priority)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsPriorityClass {
+    Idle,
+    BelowNormal,
+    Normal,
+    AboveNormal,
+    High,
+    Realtime,
+}
+
+impl WindowsPriorityClass {
+    /// Get all priority classes in order
+    pub fn all() -> &'static [WindowsPriorityClass] {
+        &[
+            WindowsPriorityClass::Idle,
+            WindowsPriorityClass::BelowNormal,
+            WindowsPriorityClass::Normal,
+            WindowsPriorityClass::AboveNormal,
+            WindowsPriorityClass::High,
+            WindowsPriorityClass::Realtime,
+        ]
+    }
+
+    /// Display name for the priority class
+    pub fn name(&self) -> &'static str {
+        match self {
+            WindowsPriorityClass::Idle => "Idle",
+            WindowsPriorityClass::BelowNormal => "Below Normal",
+            WindowsPriorityClass::Normal => "Normal",
+            WindowsPriorityClass::AboveNormal => "Above Normal",
+            WindowsPriorityClass::High => "High",
+            WindowsPriorityClass::Realtime => "Realtime",
+        }
+    }
+
+    /// Short display name for column display (max 6 chars)
+    pub fn short_name(&self) -> &'static str {
+        match self {
+            WindowsPriorityClass::Idle => "Idle",
+            WindowsPriorityClass::BelowNormal => "BelowN",
+            WindowsPriorityClass::Normal => "Normal",
+            WindowsPriorityClass::AboveNormal => "AboveN",
+            WindowsPriorityClass::High => "High",
+            WindowsPriorityClass::Realtime => "Rltm",
+        }
+    }
+
+    /// Get the typical base priority value for this class (with normal thread priority)
+    pub fn base_priority(&self) -> i32 {
+        match self {
+            WindowsPriorityClass::Idle => 4,
+            WindowsPriorityClass::BelowNormal => 6,
+            WindowsPriorityClass::Normal => 8,
+            WindowsPriorityClass::AboveNormal => 10,
+            WindowsPriorityClass::High => 13,
+            WindowsPriorityClass::Realtime => 24,
+        }
+    }
+
+    /// Convert from index
+    pub fn from_index(index: usize) -> Self {
+        Self::all().get(index).copied().unwrap_or(WindowsPriorityClass::Normal)
+    }
+
+    /// Convert from Windows base priority value (0-31)
+    /// Typical values: Idle=4, BelowNormal=6, Normal=8, AboveNormal=10, High=13, Realtime=24
+    pub fn from_base_priority(base_priority: i32) -> Self {
+        match base_priority {
+            0..=4 => WindowsPriorityClass::Idle,
+            5..=6 => WindowsPriorityClass::BelowNormal,
+            7..=9 => WindowsPriorityClass::Normal,
+            10..=12 => WindowsPriorityClass::AboveNormal,
+            13..=15 => WindowsPriorityClass::High,
+            _ => WindowsPriorityClass::Realtime, // 16+
+        }
+    }
+
+    /// Get the index in the all() array
+    pub fn index(&self) -> usize {
+        Self::all().iter().position(|p| p == self).unwrap_or(2)
+    }
+}
+
 /// A rectangular region on screen associated with a UI element
 #[derive(Debug, Clone)]
 pub struct UIRegion {
@@ -207,7 +291,7 @@ pub enum SortColumn {
     PPid,
     User,
     Priority,
-    Nice,
+    PriorityClass,
     Threads,
     Virt,
     Res,
@@ -231,7 +315,7 @@ impl SortColumn {
             SortColumn::PPid,
             SortColumn::User,
             SortColumn::Priority,
-            SortColumn::Nice,
+            SortColumn::PriorityClass,
             SortColumn::Threads,
             SortColumn::Virt,
             SortColumn::Res,
@@ -254,7 +338,7 @@ impl SortColumn {
             SortColumn::PPid => "PPID",
             SortColumn::User => "USER",
             SortColumn::Priority => "PRI",
-            SortColumn::Nice => "NI",
+            SortColumn::PriorityClass => "CLASS",
             SortColumn::Threads => "THR",
             SortColumn::Virt => "VIRT",
             SortColumn::Res => "RES",
@@ -278,7 +362,7 @@ impl SortColumn {
             SortColumn::PPid => 7,
             SortColumn::User => 10,
             SortColumn::Priority => 4,
-            SortColumn::Nice => 4,
+            SortColumn::PriorityClass => 7,
             SortColumn::Threads => 4,
             SortColumn::Virt => 8,
             SortColumn::Res => 8,
@@ -368,10 +452,12 @@ pub struct App {
     pub help_scroll: usize,
     /// Setup menu selected item
     pub setup_selected: usize,
-    /// Nice value for nice dialog
-    pub nice_value: i32,
-    /// Last error message
-    pub last_error: Option<String>,
+    /// Priority class index for priority dialog (0=Idle, 5=Realtime)
+    pub priority_class_index: usize,
+    /// Last error message with timestamp for auto-expiry
+    pub last_error: Option<(String, Instant)>,
+    /// Status message (success/info) with timestamp for auto-expiry
+    pub status_message: Option<(String, Instant)>,
     /// Kill target (captured when entering Kill mode to prevent race conditions)
     pub kill_target: Option<(u32, String, String)>,  // (pid, name, command)
     /// Process info target (captured when entering ProcessInfo mode)
@@ -467,8 +553,9 @@ impl App {
             visible_height: 20,
             help_scroll: 0,
             setup_selected: 0,
-            nice_value: 0,
+            priority_class_index: 2, // Default to Normal
             last_error: None,
+            status_message: None,
             kill_target: None,
             process_info_target: None,
             // New fields
@@ -629,8 +716,8 @@ impl App {
             4 => self.view_mode = ViewMode::Filter,
             5 => self.tree_view = !self.tree_view,
             6 => self.view_mode = ViewMode::SortSelect,
-            7 => self.enter_nice_mode(-1),
-            8 => self.enter_nice_mode(1),
+            7 => self.enter_nice_mode(),
+            8 => self.enter_nice_mode(),
             9 => self.enter_kill_mode(),
             _ => {}
         }
@@ -640,19 +727,32 @@ impl App {
     pub fn enter_kill_mode(&mut self) {
         if let Some(proc) = self.selected_process() {
             self.kill_target = Some((proc.pid, proc.name.clone(), proc.command.clone()));
-            self.view_mode = ViewMode::Kill;
+
+            // Skip confirmation dialog if disabled in settings
+            if !self.config.confirm_kill {
+                // Kill immediately without confirmation
+                if !self.tagged_pids.is_empty() {
+                    self.kill_tagged(15);
+                } else {
+                    self.kill_target_process(15);
+                }
+                self.kill_target = None;
+            } else {
+                self.view_mode = ViewMode::Kill;
+            }
         }
     }
 
-    /// Enter nice mode and capture the target process
-    pub fn enter_nice_mode(&mut self, adjust: i32) {
+    /// Enter priority mode and capture the target process
+    pub fn enter_nice_mode(&mut self) {
         if let Some(proc) = self.selected_process() {
-            // Extract values before modifying self to satisfy borrow checker
+            // Extract all values before modifying self to satisfy borrow checker
             let target = (proc.pid, proc.name.clone(), proc.command.clone());
-            let new_nice = (proc.nice + adjust).clamp(-20, 19);
+            // Convert base priority to priority class index
+            let priority_class = WindowsPriorityClass::from_base_priority(proc.priority);
 
             self.kill_target = Some(target);
-            self.nice_value = new_nice;
+            self.priority_class_index = priority_class.index();
             self.view_mode = ViewMode::Nice;
         }
     }
@@ -667,6 +767,15 @@ impl App {
             proc_copy.io_write_bytes = io_write;
             self.process_info_target = Some(proc_copy);
             self.view_mode = ViewMode::ProcessInfo;
+        }
+    }
+
+    /// Refresh I/O counters for process info dialog (called during tick when dialog is open)
+    pub fn refresh_process_info_io(&mut self) {
+        if let Some(ref mut proc) = self.process_info_target {
+            let (io_read, io_write) = crate::system::get_process_io_counters(proc.pid);
+            proc.io_read_bytes = io_read;
+            proc.io_write_bytes = io_write;
         }
     }
 
@@ -877,7 +986,7 @@ impl App {
                         SortColumn::PPid => a.parent_pid.cmp(&b.parent_pid),
                         SortColumn::User => a.user.cmp(&b.user),
                         SortColumn::Priority => a.priority.cmp(&b.priority),
-                        SortColumn::Nice => a.nice.cmp(&b.nice),
+                        SortColumn::PriorityClass => a.nice.cmp(&b.nice),
                         SortColumn::Threads => a.thread_count.cmp(&b.thread_count),
                         SortColumn::Virt => a.virtual_mem.cmp(&b.virtual_mem),
                         SortColumn::Shr => a.shared_mem.cmp(&b.shared_mem),
@@ -1088,6 +1197,42 @@ impl App {
         self.tagged_pids.clear();
     }
 
+    /// Tag all processes with the same name as the selected process
+    pub fn tag_all_by_name(&mut self) {
+        if let Some(proc) = self.selected_process() {
+            let name = proc.name.clone();
+            // Find all processes with the same name and tag them
+            let pids_to_tag: Vec<u32> = self.processes
+                .iter()
+                .filter(|p| p.name == name)
+                .map(|p| p.pid)
+                .collect();
+            for pid in pids_to_tag {
+                self.tagged_pids.insert(pid);
+            }
+        }
+    }
+
+    /// Toggle tag on all visible/filtered processes
+    pub fn tag_all_visible(&mut self) {
+        // If all visible are already tagged, untag them
+        let all_tagged = self.displayed_processes
+            .iter()
+            .all(|p| self.tagged_pids.contains(&p.pid));
+
+        if all_tagged {
+            // Untag all visible
+            for proc in &self.displayed_processes {
+                self.tagged_pids.remove(&proc.pid);
+            }
+        } else {
+            // Tag all visible
+            for proc in &self.displayed_processes {
+                self.tagged_pids.insert(proc.pid);
+            }
+        }
+    }
+
     /// Get selected process
     pub fn selected_process(&self) -> Option<&ProcessInfo> {
         self.displayed_processes.get(self.selected_index)
@@ -1157,9 +1302,17 @@ impl App {
 
     /// Kill the captured target process (used by kill confirmation dialog)
     pub fn kill_target_process(&mut self, signal: u32) {
-        if let Some((pid, _, _)) = self.kill_target {
-            if let Err(e) = crate::system::kill_process(pid, signal) {
-                self.last_error = Some(format!("Failed to kill process {}: {}", pid, e));
+        if let Some((pid, ref name, _)) = self.kill_target.clone() {
+            match crate::system::kill_process(pid, signal) {
+                Ok(_) => {
+                    self.status_message = Some((
+                        format!("Killed {} (PID {})", name, pid),
+                        Instant::now(),
+                    ));
+                }
+                Err(e) => {
+                    self.last_error = Some((format!("Failed to kill {} ({}): {}", name, pid, e), Instant::now()));
+                }
             }
         }
     }
@@ -1167,20 +1320,78 @@ impl App {
     /// Kill all tagged processes
     pub fn kill_tagged(&mut self, signal: u32) {
         let pids: Vec<u32> = self.tagged_pids.iter().copied().collect();
+        let total = pids.len();
+        let mut killed = 0;
+        let mut failed = 0;
+
         for pid in pids {
-            if let Err(e) = crate::system::kill_process(pid, signal) {
-                self.last_error = Some(format!("Failed to kill process {}: {}", pid, e));
+            match crate::system::kill_process(pid, signal) {
+                Ok(_) => killed += 1,
+                Err(e) => {
+                    failed += 1;
+                    self.last_error = Some((format!("Failed to kill process {}: {}", pid, e), Instant::now()));
+                }
             }
         }
+
+        if failed == 0 {
+            self.status_message = Some((
+                format!("Killed {} process{}", killed, if killed == 1 { "" } else { "es" }),
+                Instant::now(),
+            ));
+        } else {
+            self.status_message = Some((
+                format!("Killed {}/{} processes ({} failed)", killed, total, failed),
+                Instant::now(),
+            ));
+        }
+
         self.tagged_pids.clear();
     }
 
-    /// Set nice value for selected process
-    pub fn set_nice_selected(&mut self, nice: i32) {
-        if let Some(proc) = self.selected_process() {
-            let pid = proc.pid;
-            if let Err(e) = crate::system::set_priority(pid, nice) {
-                self.last_error = Some(format!("Failed to set priority for {}: {}", pid, e));
+    /// Set priority class for selected process
+    pub fn set_priority_selected(&mut self, priority_class: WindowsPriorityClass) {
+        if let Some((pid, _, _)) = &self.kill_target {
+            let pid = *pid;
+            if let Err(e) = crate::system::set_priority_class(pid, priority_class) {
+                self.last_error = Some((format!("Failed to set priority for {}: {}", pid, e), Instant::now()));
+            }
+        }
+    }
+
+    /// Toggle efficiency mode for selected process
+    pub fn toggle_efficiency_mode(&mut self) {
+        if let Some((pid, ref name, _)) = self.kill_target.clone() {
+            // Get current efficiency mode status
+            let current = self.selected_process()
+                .map(|p| p.efficiency_mode)
+                .unwrap_or(false);
+            let new_state = !current;
+            // Toggle it
+            match crate::system::set_efficiency_mode(pid, new_state) {
+                Ok(_) => {
+                    let state_str = if new_state { "enabled" } else { "disabled" };
+                    self.status_message = Some((
+                        format!("Efficiency mode {} for {}", state_str, name),
+                        Instant::now(),
+                    ));
+                    // Update the process in displayed_processes immediately for visual feedback
+                    for proc in &mut self.displayed_processes {
+                        if proc.pid == pid {
+                            proc.efficiency_mode = new_state;
+                            break;
+                        }
+                    }
+                    for proc in &mut self.processes {
+                        if proc.pid == pid {
+                            proc.efficiency_mode = new_state;
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.last_error = Some((format!("Failed to set efficiency mode: {}", e), Instant::now()));
+                }
             }
         }
     }
@@ -1275,6 +1486,38 @@ impl App {
         }
     }
 
+    /// Collect all descendant PIDs of a process (recursive)
+    fn collect_descendants(&self, parent_pid: u32, result: &mut Vec<u32>) {
+        for proc in &self.processes {
+            if proc.parent_pid == parent_pid {
+                result.push(proc.pid);
+                self.collect_descendants(proc.pid, result);
+            }
+        }
+    }
+
+    /// Toggle tag for a process and all its descendants (for tree mode double-click)
+    pub fn toggle_tag_branch(&mut self, pid: u32) {
+        // Collect the process and all its descendants
+        let mut branch_pids = vec![pid];
+        self.collect_descendants(pid, &mut branch_pids);
+
+        // Check if all are already tagged
+        let all_tagged = branch_pids.iter().all(|p| self.tagged_pids.contains(p));
+
+        if all_tagged {
+            // Untag all
+            for p in branch_pids {
+                self.tagged_pids.remove(&p);
+            }
+        } else {
+            // Tag all
+            for p in branch_pids {
+                self.tagged_pids.insert(p);
+            }
+        }
+    }
+
     /// Enter user select mode
     pub fn enter_user_select_mode(&mut self) {
         // Build unique user list
@@ -1338,11 +1581,11 @@ impl App {
     pub fn apply_affinity(&mut self) {
         if let Some(proc) = self.selected_process() {
             if self.affinity_mask == 0 {
-                self.last_error = Some("Cannot set empty affinity mask".to_string());
+                self.last_error = Some(("Cannot set empty affinity mask".to_string(), Instant::now()));
                 return;
             }
             if let Err(e) = crate::system::set_process_affinity(proc.pid, self.affinity_mask) {
-                self.last_error = Some(format!("Failed to set affinity: {}", e));
+                self.last_error = Some((format!("Failed to set affinity: {}", e), Instant::now()));
             }
         }
     }
