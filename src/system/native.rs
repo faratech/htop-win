@@ -190,6 +190,12 @@ pub fn calculate_cpu_percentages(
     let cache_snapshot = CACHE.snapshot();
 
     for proc in processes.iter() {
+        // System Idle Process (PID 0) represents idle CPU time, not actual work
+        if proc.pid == 0 {
+            cpu_percentages.insert(0, 0.0);
+            continue;
+        }
+
         let total_time = proc.kernel_time + proc.user_time;
 
         let cpu_percent = if let Some(entry) = cache_snapshot.get(&proc.pid) {

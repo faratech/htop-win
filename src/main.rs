@@ -41,7 +41,6 @@ struct Args {
     inefficient: bool,
     install: bool,
     update: bool,
-    install_update: bool,
     force: bool,
 }
 
@@ -120,9 +119,6 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             }
             Long("update") => {
                 args.update = true;
-            }
-            Long("install-update") => {
-                args.install_update = true;
             }
             Long("force") | Short('f') => {
                 args.force = true;
@@ -333,17 +329,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    if args.install_update {
-        // Called from elevated process to complete update installation
-        if let Err(e) = installer::complete_update_install() {
-            eprintln!("Update installation failed: {}", e);
-            std::process::exit(1);
-        }
-        return Ok(());
-    }
-
     // Apply any pending update before starting (downloaded in previous session)
-    installer::apply_pending_update();
+    let update_just_applied = installer::apply_pending_update();
 
     // Enable Efficiency Mode by default (reduces CPU usage via EcoQoS)
     if !args.inefficient {
@@ -449,8 +436,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create benchmark stats if in benchmark mode
     let mut bench_stats = benchmark_mode.map(|_| BenchmarkStats::new());
 
-    // Spawn background update check
-    let update_rx = installer::spawn_update_check();
+    // Spawn background update check (skip if we just applied an update, since
+    // the running binary is still the old version and would re-download)
+    let update_rx = if update_just_applied {
+        // Create a dummy channel that never sends anything
+        let (_, rx) = std::sync::mpsc::channel();
+        rx
+    } else {
+        installer::spawn_update_check()
+    };
 
     // Run the main loop
     let result = run_app(&mut terminal, &mut app, &config, bench_stats.as_mut(), update_rx);

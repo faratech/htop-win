@@ -3,82 +3,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-#[cfg(windows)]
-use windows::core::{PCWSTR, w};
-#[cfg(windows)]
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
-#[cfg(windows)]
-use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
-#[cfg(windows)]
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-#[cfg(windows)]
-use windows::Win32::UI::Shell::ShellExecuteW;
-#[cfg(windows)]
-use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
-
-/// Check if running as administrator
-#[cfg(windows)]
-pub fn is_admin() -> bool {
-    unsafe {
-        let mut token = HANDLE::default();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_ok() {
-            let mut elevation = TOKEN_ELEVATION::default();
-            let mut size = 0u32;
-            let result = GetTokenInformation(
-                token,
-                TokenElevation,
-                Some(&mut elevation as *mut _ as *mut _),
-                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                &mut size,
-            );
-            let _ = CloseHandle(token);
-            result.is_ok() && elevation.TokenIsElevated != 0
-        } else {
-            false
-        }
-    }
-}
-
-#[cfg(not(windows))]
-pub fn is_admin() -> bool {
-    false
-}
-
-/// Re-launch the current process with UAC elevation
-#[cfg(windows)]
-pub fn elevate_with_args(args: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let exe_path = std::env::current_exe()?;
-    let exe_path_wide: Vec<u16> = exe_path
-        .to_string_lossy()
-        .encode_utf16()
-        .chain(std::iter::once(0))
-        .collect();
-    let args_wide: Vec<u16> = format!("{}\0", args).encode_utf16().collect();
-
-    let result = unsafe {
-        ShellExecuteW(
-            Some(HWND::default()),
-            w!("runas"),
-            PCWSTR(exe_path_wide.as_ptr()),
-            PCWSTR(args_wide.as_ptr()),
-            PCWSTR::null(),
-            SW_SHOWNORMAL,
-        )
-    };
-
-    // ShellExecuteW returns > 32 on success
-    if result.0 as usize > 32 {
-        Ok(())
-    } else {
-        Err("Failed to elevate privileges".into())
-    }
-}
-
-#[cfg(not(windows))]
-pub fn elevate_with_args(_args: &str) -> Result<(), Box<dyn std::error::Error>> {
-    Err("UAC elevation is only supported on Windows".into())
-}
-
 /// Get the installation path for htop
 pub fn get_install_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let local_app_data = std::env::var("LOCALAPPDATA")?;
@@ -109,17 +33,8 @@ pub fn get_installed_version() -> Option<String> {
 }
 
 /// Install htop-win to a PATH directory so it can be run from anywhere
+/// Installs to %LOCALAPPDATA%\Microsoft\WindowsApps which is user-writable and already in PATH
 pub fn install_to_path(force: bool) -> Result<(), Box<dyn std::error::Error>> {
-    if !is_admin() {
-        // Re-launch with UAC elevation
-        println!("Requesting administrator privileges...");
-        let args = if force { "--install --force" } else { "--install" };
-        elevate_with_args(args)?;
-        println!("Elevated process launched. Check that window for results.");
-        return Ok(());
-    }
-
-    // We're running as admin - do the installation
     let current_exe = std::env::current_exe()?;
     let current_version = env!("CARGO_PKG_VERSION");
     let target_path = get_install_path()?;
@@ -245,7 +160,6 @@ fn download_file(url: &str, dest: &std::path::Path) -> Result<(), Box<dyn std::e
 fn cleanup_temp_files() {
     let temp_dir = std::env::temp_dir();
     let _ = fs::remove_file(temp_dir.join("htop-win-update.exe"));
-    let _ = fs::remove_file(temp_dir.join("htop-win-update-path.txt"));
 }
 
 /// Update htop-win from GitHub releases
@@ -281,19 +195,7 @@ pub fn update_from_github(force: bool) -> Result<(), Box<dyn std::error::Error>>
 
     println!("Download complete. Installing...");
 
-    // Need admin to install to WindowsApps
-    if !is_admin() {
-        // Copy temp file path to a location the elevated process can access
-        let update_marker = temp_dir.join("htop-win-update-path.txt");
-        fs::write(&update_marker, temp_file.to_string_lossy().as_bytes())?;
-
-        println!("Requesting administrator privileges...");
-        elevate_with_args("--install-update")?;
-        println!("Elevated process launched. Check that window for results.");
-        return Ok(());
-    }
-
-    // We're admin - do the actual install
+    // Install directly - %LOCALAPPDATA%\Microsoft\WindowsApps is user-writable
     do_install_update(&temp_file)
 }
 
@@ -338,24 +240,6 @@ pub fn do_install_update(update_file: &std::path::Path) -> Result<(), Box<dyn st
     println!("Location: {}", target_path.display());
     println!("\nRestart htop to use the new version.");
     Ok(())
-}
-
-/// Complete an update installation (called when elevated with --install-update)
-pub fn complete_update_install() -> Result<(), Box<dyn std::error::Error>> {
-    let temp_dir = std::env::temp_dir();
-    let update_marker = temp_dir.join("htop-win-update-path.txt");
-
-    let update_path = fs::read_to_string(&update_marker)?;
-    let update_file = PathBuf::from(update_path.trim());
-
-    // Clean up marker file
-    let _ = fs::remove_file(&update_marker);
-
-    if !update_file.exists() {
-        return Err("Update file not found".into());
-    }
-
-    do_install_update(&update_file)
 }
 
 /// Update status for background updates
@@ -418,24 +302,20 @@ pub fn apply_pending_update() -> bool {
     let temp_dir = std::env::temp_dir();
     let update_file = temp_dir.join("htop-win-update.exe");
 
+    // Get the currently running executable - this is what we need to update
+    let current_exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
     if !update_file.exists() {
         // Clean up any old backup files from previous updates
-        let install_path = match get_install_path() {
-            Ok(p) => p,
-            Err(_) => return false,
-        };
-        let backup_path = install_path.with_extension("exe.old");
+        let backup_path = current_exe.with_extension("exe.old");
         let _ = fs::remove_file(&backup_path);
         return false;
     }
 
-    let install_path = match get_install_path() {
-        Ok(p) => p,
-        Err(_) => {
-            let _ = fs::remove_file(&update_file);
-            return false;
-        }
-    };
+    let install_path = current_exe;
 
     // If install path doesn't exist, just copy directly
     if !install_path.exists() {

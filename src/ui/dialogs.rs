@@ -498,7 +498,8 @@ fn meter_mode_str(mode: crate::config::MeterMode) -> String {
 
 /// Draw process info dialog
 pub fn draw_process_info(frame: &mut Frame, app: &App) {
-    let area = centered_rect(75, 80, frame.area());
+    let theme = &app.theme;
+    let area = centered_rect(70, 80, frame.area());
 
     // Use captured process_info_target to prevent race condition with list refresh
     let content = if let Some(ref proc) = app.process_info_target {
@@ -512,7 +513,7 @@ pub fn draw_process_info(frame: &mut Frame, app: &App) {
         };
 
         let exe_display = if proc.exe_path.is_empty() {
-            "(not available)".to_string()
+            "(access denied)".to_string()
         } else {
             proc.exe_path.clone()
         };
@@ -526,47 +527,51 @@ pub fn draw_process_info(frame: &mut Frame, app: &App) {
         let efficiency_str = if proc.efficiency_mode { "Yes 🌿" } else { "No" };
 
         format!(
-            "Process Information\n\
-             ─────────────────────────────────────────────────\n\
-             PID:             {}\n\
-             Parent PID:      {}\n\
-             Name:            {}\n\
-             User:            {}\n\
-             Status:          {} ({})\n\
+            " PROCESS\n\
              \n\
-             ─────────────────────────────────────────────────\n\
+             PID             {}\n\
+             Parent PID      {}\n\
+             Name            {}\n\
+             User            {}\n\
+             Status          {} ({})\n\
+             Architecture    {}\n\
+             \n\
+             ───────────────────────────────────────────────────────\n\
+             \n\
              SCHEDULING\n\
-             ─────────────────────────────────────────────────\n\
-             Base Priority:   {}\n\
-             Priority Class:  {}\n\
-             Elevated:        {}\n\
-             Efficiency Mode: {}\n\
-             Architecture:    {}\n\
              \n\
-             ─────────────────────────────────────────────────\n\
+             Base Priority   {}\n\
+             Priority Class  {}\n\
+             Elevated        {}\n\
+             Efficiency Mode {}\n\
+             \n\
+             ───────────────────────────────────────────────────────\n\
+             \n\
              RESOURCES\n\
-             ─────────────────────────────────────────────────\n\
-             Threads:         {}\n\
-             Handles:         {}\n\
-             CPU Usage:       {:.1}%\n\
-             Memory Usage:    {:.1}%\n\
-             Virtual Mem:     {}\n\
-             Resident Mem:    {}\n\
-             Shared Mem:      {}\n\
-             CPU Time:        {}\n\
              \n\
-             ─────────────────────────────────────────────────\n\
-             DISK I/O (live)\n\
-             ─────────────────────────────────────────────────\n\
-             I/O Read:        {}\n\
-             I/O Write:       {}\n\
+             Threads         {}\n\
+             Handles         {}\n\
+             CPU Usage       {:.1}%\n\
+             Memory Usage    {:.1}%\n\
+             Virtual Memory  {}\n\
+             Resident Memory {}\n\
+             Shared Memory   {}\n\
+             CPU Time        {}\n\
              \n\
-             ─────────────────────────────────────────────────\n\
+             ───────────────────────────────────────────────────────\n\
+             \n\
+             DISK I/O (cumulative)\n\
+             \n\
+             Read            {}\n\
+             Write           {}\n\
+             \n\
+             ───────────────────────────────────────────────────────\n\
+             \n\
              PATHS\n\
-             ─────────────────────────────────────────────────\n\
-             Executable:\n  {}\n\
              \n\
-             Command Line:\n  {}\n\
+             Executable\n   {}\n\
+             \n\
+             Command Line\n   {}\n\
              \n\
              Press Esc to close",
             proc.pid,
@@ -574,11 +579,11 @@ pub fn draw_process_info(frame: &mut Frame, app: &App) {
             proc.name,
             proc.user,
             proc.status, status_desc,
+            arch_str,
             proc.priority,
             crate::app::WindowsPriorityClass::from_base_priority(proc.priority).name(),
             elevated_str,
             efficiency_str,
-            arch_str,
             proc.thread_count,
             proc.handle_count,
             proc.cpu_percent,
@@ -599,11 +604,12 @@ pub fn draw_process_info(frame: &mut Frame, app: &App) {
     let dialog = Paragraph::new(content)
         .block(
             Block::default()
-                .title(" Process Details ")
+                .title(format!(" {} ", app.process_info_target.as_ref().map(|p| p.name.as_str()).unwrap_or("Process Details")))
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(Color::Cyan))
+                .style(Style::default().bg(theme.background)),
         )
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(theme.text).bg(theme.background))
         .wrap(Wrap { trim: false });
 
     frame.render_widget(Clear, area);

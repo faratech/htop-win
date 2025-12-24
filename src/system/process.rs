@@ -317,6 +317,23 @@ pub fn get_process_io_counters(_pid: u32) -> (u64, u64) {
     (0, 0)
 }
 
+/// Get executable path for a specific process (on-demand, for ProcessInfo dialog)
+#[cfg(windows)]
+pub fn get_process_exe_path(pid: u32) -> String {
+    let handle = match open_process_query(pid) {
+        Some(h) => h,
+        None => return String::new(),
+    };
+    let result = query_exe_path(handle);
+    unsafe { let _ = CloseHandle(handle); }
+    result
+}
+
+#[cfg(not(windows))]
+pub fn get_process_exe_path(_pid: u32) -> String {
+    String::new()
+}
+
 /// Enriched data from Windows API for visible processes
 #[cfg(windows)]
 struct EnrichedProcessData {

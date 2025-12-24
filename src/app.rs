@@ -798,6 +798,14 @@ impl App {
             let (io_read, io_write) = crate::system::get_process_io_counters(proc.pid);
             proc_copy.io_read_bytes = io_read;
             proc_copy.io_write_bytes = io_write;
+            // Query exe path on-demand if not already available
+            if proc_copy.exe_path.is_empty() {
+                let exe_path = crate::system::get_process_exe_path(proc.pid);
+                if !exe_path.is_empty() {
+                    proc_copy.exe_path = exe_path.clone();
+                    proc_copy.command = exe_path;
+                }
+            }
             self.process_info_target = Some(proc_copy);
             self.view_mode = ViewMode::ProcessInfo;
         }
