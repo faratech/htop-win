@@ -109,11 +109,12 @@ pub fn get_installed_version() -> Option<String> {
 }
 
 /// Install htop-win to a PATH directory so it can be run from anywhere
-pub fn install_to_path() -> Result<(), Box<dyn std::error::Error>> {
+pub fn install_to_path(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     if !is_admin() {
         // Re-launch with UAC elevation
         println!("Requesting administrator privileges...");
-        elevate_with_args("--install")?;
+        let args = if force { "--install --force" } else { "--install" };
+        elevate_with_args(args)?;
         println!("Elevated process launched. Check that window for results.");
         return Ok(());
     }
@@ -123,13 +124,13 @@ pub fn install_to_path() -> Result<(), Box<dyn std::error::Error>> {
     let current_version = env!("CARGO_PKG_VERSION");
     let target_path = get_install_path()?;
 
-    // Check if already installed and compare versions
-    if target_path.exists() {
+    // Check if already installed and compare versions (unless force)
+    if target_path.exists() && !force {
         if let Some(installed_version) = get_installed_version() {
             if installed_version == current_version {
                 println!("htop {} is already installed and up to date.", current_version);
                 println!("Location: {}", target_path.display());
-                wait_for_key();
+                println!("\nUse --force to reinstall anyway.");
                 return Ok(());
             } else {
                 println!("Updating htop from {} to {}...", installed_version, current_version);
@@ -137,6 +138,8 @@ pub fn install_to_path() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             println!("Reinstalling htop {}...", current_version);
         }
+    } else if force && target_path.exists() {
+        println!("Force reinstalling htop {}...", current_version);
     } else {
         println!("Installing htop {} to PATH...", current_version);
     }
@@ -147,28 +150,7 @@ pub fn install_to_path() -> Result<(), Box<dyn std::error::Error>> {
     println!("Successfully installed htop {}!", current_version);
     println!("Location: {}", target_path.display());
     println!("\nYou can now run 'htop' from any terminal.");
-    wait_for_key();
     Ok(())
-}
-
-/// Wait for user to press any key (used in elevated console windows)
-pub fn wait_for_key() {
-    use crossterm::event::{self, Event, KeyEventKind};
-    use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-
-    println!("\nPress any key to close...");
-
-    // Use crossterm's event reading - works properly in elevated windows
-    if enable_raw_mode().is_ok() {
-        loop {
-            if let Ok(Event::Key(key)) = event::read() {
-                if key.kind == KeyEventKind::Press {
-                    break;
-                }
-            }
-        }
-        let _ = disable_raw_mode();
-    }
 }
 
 /// Parse version string to comparable tuple
@@ -196,53 +178,7 @@ pub fn is_newer_version(a: &str, b: &str) -> bool {
 /// GitHub repository for releases
 const GITHUB_REPO: &str = "faratech/htop-win";
 
-/// Check for updates from GitHub releases using PowerShell
-/// Returns Some((version, download_url)) if a newer version is available
-pub fn check_for_update() -> Option<(String, String)> {
-    let current_version = env!("CARGO_PKG_VERSION");
-
-    // Use PowerShell to fetch latest release info from GitHub API
-    let ps_script = format!(
-        r#"
-        try {{
-            $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/{}/releases/latest' -Headers @{{'User-Agent'='htop-win'}}
-            Write-Output "$($release.tag_name)|$($release.assets | Where-Object {{ $_.name -like '*.exe' }} | Select-Object -First 1 -ExpandProperty browser_download_url)"
-        }} catch {{
-            Write-Output "ERROR"
-        }}
-        "#,
-        GITHUB_REPO
-    );
-
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
-        .output()
-        .ok()?;
-
-    let result = String::from_utf8_lossy(&output.stdout);
-    let result = result.trim();
-
-    if result == "ERROR" || result.is_empty() {
-        return None;
-    }
-
-    let parts: Vec<&str> = result.splitn(2, '|').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-
-    let latest_version = parts[0].trim_start_matches('v');
-    let download_url = parts[1];
-
-    // Check if newer version is available
-    if is_newer_version(latest_version, current_version) {
-        Some((latest_version.to_string(), download_url.to_string()))
-    } else {
-        None
-    }
-}
-
-/// Get the latest version info from GitHub (for display purposes)
+/// Get the latest version info from GitHub
 /// Returns (version, download_url) or None if check fails
 pub fn get_latest_release() -> Option<(String, String)> {
     let ps_script = format!(
@@ -308,7 +244,7 @@ fn cleanup_temp_files() {
 }
 
 /// Update htop-win from GitHub releases
-pub fn update_from_github() -> Result<(), Box<dyn std::error::Error>> {
+pub fn update_from_github(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Clean up any old temp files from previous failed updates
     cleanup_temp_files();
 
@@ -319,12 +255,17 @@ pub fn update_from_github() -> Result<(), Box<dyn std::error::Error>> {
 
     let current_version = env!("CARGO_PKG_VERSION");
 
-    if !is_newer_version(&latest_version, current_version) {
+    if !force && !is_newer_version(&latest_version, current_version) {
         println!("htop {} is already the latest version.", current_version);
+        println!("\nUse --force to reinstall anyway.");
         return Ok(());
     }
 
-    println!("New version available: {} -> {}", current_version, latest_version);
+    if force && !is_newer_version(&latest_version, current_version) {
+        println!("Force reinstalling htop {} from GitHub...", latest_version);
+    } else {
+        println!("New version available: {} -> {}", current_version, latest_version);
+    }
     println!("Downloading from GitHub...");
 
     // Download to temp file
@@ -372,7 +313,6 @@ pub fn do_install_update(update_file: &std::path::Path) -> Result<(), Box<dyn st
     println!("Successfully updated to htop {}!", version);
     println!("Location: {}", target_path.display());
     println!("\nRestart htop to use the new version.");
-    wait_for_key();
     Ok(())
 }
 
@@ -392,4 +332,119 @@ pub fn complete_update_install() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     do_install_update(&update_file)
+}
+
+/// Update status for background updates
+#[derive(Clone)]
+pub enum UpdateStatus {
+    /// A newer version is available and has been downloaded
+    Downloaded { version: String, path: PathBuf },
+    /// No update available or error occurred
+    None,
+}
+
+/// Check for updates and download if available (for background auto-update)
+/// Returns UpdateStatus indicating what happened
+pub fn check_and_download_update() -> UpdateStatus {
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    let (latest_version, download_url) = match get_latest_release() {
+        Some(v) => v,
+        None => return UpdateStatus::None,
+    };
+
+    if !is_newer_version(&latest_version, current_version) {
+        return UpdateStatus::None;
+    }
+
+    // Download to temp file
+    let temp_dir = std::env::temp_dir();
+    let temp_file = temp_dir.join("htop-win-update.exe");
+
+    // Clean up any old temp files first
+    cleanup_temp_files();
+
+    match download_file(&download_url, &temp_file) {
+        Ok(()) => UpdateStatus::Downloaded {
+            version: latest_version,
+            path: temp_file,
+        },
+        Err(_) => UpdateStatus::None,
+    }
+}
+
+/// Spawn a background thread to check and download updates
+/// Returns a receiver that will receive the update status
+pub fn spawn_update_check() -> std::sync::mpsc::Receiver<UpdateStatus> {
+    let (tx, rx) = std::sync::mpsc::channel();
+
+    std::thread::spawn(move || {
+        // Small delay to not slow down startup
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        let result = check_and_download_update();
+        let _ = tx.send(result);
+    });
+
+    rx
+}
+
+/// Check for and apply pending update on startup (call before UI starts)
+/// Returns true if an update was applied (caller should continue normally)
+pub fn apply_pending_update() -> bool {
+    let temp_dir = std::env::temp_dir();
+    let update_file = temp_dir.join("htop-win-update.exe");
+
+    if !update_file.exists() {
+        // Clean up any old backup files from previous updates
+        let install_path = match get_install_path() {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let backup_path = install_path.with_extension("exe.old");
+        let _ = fs::remove_file(&backup_path);
+        return false;
+    }
+
+    let install_path = match get_install_path() {
+        Ok(p) => p,
+        Err(_) => {
+            let _ = fs::remove_file(&update_file);
+            return false;
+        }
+    };
+
+    // If install path doesn't exist, just copy directly
+    if !install_path.exists() {
+        if fs::copy(&update_file, &install_path).is_ok() {
+            let _ = fs::remove_file(&update_file);
+            eprintln!("Update installed successfully!");
+            return true;
+        }
+        return false;
+    }
+
+    // Rename current exe to .old (Windows allows renaming running exe)
+    let backup_path = install_path.with_extension("exe.old");
+    let _ = fs::remove_file(&backup_path); // Remove old backup if exists
+
+    if fs::rename(&install_path, &backup_path).is_err() {
+        // Can't rename, might not have permissions
+        let _ = fs::remove_file(&update_file);
+        return false;
+    }
+
+    // Copy new version to install location
+    if fs::copy(&update_file, &install_path).is_err() {
+        // Failed to copy, restore backup
+        let _ = fs::rename(&backup_path, &install_path);
+        let _ = fs::remove_file(&update_file);
+        return false;
+    }
+
+    // Clean up
+    let _ = fs::remove_file(&update_file);
+    let _ = fs::remove_file(&backup_path);
+
+    eprintln!("Update applied successfully!");
+    true
 }

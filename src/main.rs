@@ -42,6 +42,7 @@ struct Args {
     install: bool,
     update: bool,
     install_update: bool,
+    force: bool,
 }
 
 /// Benchmark statistics for performance measurement
@@ -123,6 +124,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Long("install-update") => {
                 args.install_update = true;
             }
+            Long("force") | Short('f') => {
+                args.force = true;
+            }
             _ => return Err(arg.unexpected()),
         }
     }
@@ -150,6 +154,7 @@ fn print_help() {
     println!("  -H, --highlight-changes <S>  Highlight process changes (seconds)");
     println!("      --install                Install to PATH (requires admin, will prompt UAC)");
     println!("      --update                 Check for updates and install if available");
+    println!("  -f, --force                  Force install/update even if same version");
     println!("  -h, --help                   Print help");
     println!("  -V, --version                Print version");
 }
@@ -313,7 +318,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.install {
-        if let Err(e) = installer::install_to_path() {
+        if let Err(e) = installer::install_to_path(args.force) {
             eprintln!("Installation failed: {}", e);
             std::process::exit(1);
         }
@@ -321,7 +326,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.update {
-        if let Err(e) = installer::update_from_github() {
+        if let Err(e) = installer::update_from_github(args.force) {
             eprintln!("Update failed: {}", e);
             std::process::exit(1);
         }
@@ -336,6 +341,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+
+    // Apply any pending update before starting (downloaded in previous session)
+    installer::apply_pending_update();
 
     // Enable Efficiency Mode by default (reduces CPU usage via EcoQoS)
     if !args.inefficient {
@@ -441,8 +449,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create benchmark stats if in benchmark mode
     let mut bench_stats = benchmark_mode.map(|_| BenchmarkStats::new());
 
+    // Spawn background update check
+    let update_rx = installer::spawn_update_check();
+
     // Run the main loop
-    let result = run_app(&mut terminal, &mut app, &config, bench_stats.as_mut());
+    let result = run_app(&mut terminal, &mut app, &config, bench_stats.as_mut(), update_rx);
 
     // Restore terminal
     disable_raw_mode()?;
@@ -470,6 +481,7 @@ fn run_app(
     app: &mut App,
     _config: &Config,
     mut bench_stats: Option<&mut BenchmarkStats>,
+    update_rx: std::sync::mpsc::Receiver<installer::UpdateStatus>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_tick = Instant::now();
     let mut needs_redraw = true;
@@ -507,6 +519,19 @@ fn run_app(
                     needs_redraw = true;
                 }
                 _ => {}
+            }
+        }
+
+        // Check for update result from background thread
+        if !app.update_checked && let Ok(status) = update_rx.try_recv() {
+            app.update_checked = true;
+            if let installer::UpdateStatus::Downloaded { version, path } = status {
+                app.update_available = Some((version.clone(), path));
+                app.status_message = Some((
+                    format!("Update v{} downloaded. Restart to apply.", version),
+                    Instant::now(),
+                ));
+                needs_redraw = true;
             }
         }
 

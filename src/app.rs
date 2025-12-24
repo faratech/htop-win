@@ -541,6 +541,12 @@ pub struct App {
     /// Double-click threshold in milliseconds
     pub double_click_ms: u64,
 
+    // Update check state
+    /// Available update version and path (set by background thread)
+    pub update_available: Option<(String, std::path::PathBuf)>,
+    /// Whether we've already checked for updates
+    pub update_checked: bool,
+
     // Keyboard navigation state
     /// Currently focused UI region (for Tab navigation)
     pub focus_region: FocusRegion,
@@ -609,6 +615,8 @@ impl App {
             last_click_pos: None,
             last_click_time: None,
             double_click_ms: 500, // Standard double-click threshold
+            update_available: None,
+            update_checked: false,
             focus_region: FocusRegion::default(),
             focus_index: 0,
         }
