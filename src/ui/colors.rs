@@ -2,10 +2,9 @@
 //! Provides 8 different color themes matching htop exactly
 
 use ratatui::style::Color;
-use serde::{Deserialize, Serialize};
 
 /// Available color schemes (matching htop exactly)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorScheme {
     #[default]
     Default,
@@ -16,6 +15,36 @@ pub enum ColorScheme {
     Blacknight,
     BrokenGray,
     Nord,
+}
+
+impl ColorScheme {
+    /// Convert to string for serialization
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ColorScheme::Default => "Default",
+            ColorScheme::Monochrome => "Monochrome",
+            ColorScheme::BlackOnWhite => "BlackOnWhite",
+            ColorScheme::LightTerminal => "LightTerminal",
+            ColorScheme::Midnight => "Midnight",
+            ColorScheme::Blacknight => "Blacknight",
+            ColorScheme::BrokenGray => "BrokenGray",
+            ColorScheme::Nord => "Nord",
+        }
+    }
+
+    /// Parse from string
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "Monochrome" => ColorScheme::Monochrome,
+            "BlackOnWhite" => ColorScheme::BlackOnWhite,
+            "LightTerminal" => ColorScheme::LightTerminal,
+            "Midnight" => ColorScheme::Midnight,
+            "Blacknight" => ColorScheme::Blacknight,
+            "BrokenGray" => ColorScheme::BrokenGray,
+            "Nord" => ColorScheme::Nord,
+            _ => ColorScheme::Default,
+        }
+    }
 }
 
 impl ColorScheme {

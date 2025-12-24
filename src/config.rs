@@ -1,19 +1,39 @@
 //! Application configuration with persistence
 
+use crate::json::{self, Value};
 use crate::ui::colors::ColorScheme;
-use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 
 /// Meter display mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MeterMode {
     #[default]
     Bar,
     Text,
     Graph,
     Hidden,
+}
+
+impl MeterMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            MeterMode::Bar => "Bar",
+            MeterMode::Text => "Text",
+            MeterMode::Graph => "Graph",
+            MeterMode::Hidden => "Hidden",
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "Text" => MeterMode::Text,
+            "Graph" => MeterMode::Graph,
+            "Hidden" => MeterMode::Hidden,
+            _ => MeterMode::Bar,
+        }
+    }
 }
 
 impl MeterMode {
@@ -29,8 +49,7 @@ impl MeterMode {
 }
 
 /// Application configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone)]
 pub struct Config {
     // Display settings
     /// Refresh rate in milliseconds
@@ -90,7 +109,6 @@ pub struct Config {
 
     // Tree view settings
     /// Default collapsed PIDs (persisted)
-    #[serde(skip)]
     pub collapsed_pids: HashSet<u32>,
 }
 
@@ -162,28 +180,28 @@ impl Config {
             let slice = std::slice::from_raw_parts(path.0, len);
             let appdata = PathBuf::from(String::from_utf16_lossy(slice));
             windows::Win32::System::Com::CoTaskMemFree(Some(path.0 as *const _));
-            Some(appdata.join("htop-win").join("config.json"))
+            Some(appdata.join("htop-win").join("config").join("config.json"))
         }
     }
 
     /// Load configuration from file, or return defaults
     pub fn load() -> Self {
         if let Some(path) = Self::config_path()
-            && path.exists() {
-                match fs::read_to_string(&path) {
-                    Ok(content) => {
-                        match serde_json::from_str(&content) {
-                            Ok(config) => return config,
-                            Err(e) => {
-                                eprintln!("Warning: Failed to parse config: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: Failed to read config: {}", e);
+            && path.exists()
+        {
+            match fs::read_to_string(&path) {
+                Ok(content) => {
+                    if let Some(value) = json::parse(&content) {
+                        return Self::from_json(&value);
+                    } else {
+                        eprintln!("Warning: Failed to parse config");
                     }
                 }
+                Err(e) => {
+                    eprintln!("Warning: Failed to read config: {}", e);
+                }
             }
+        }
         Self::default()
     }
 
@@ -195,10 +213,211 @@ impl Config {
                 fs::create_dir_all(parent)?;
             }
 
-            let content = serde_json::to_string_pretty(self)?;
+            let content = json::to_string_pretty(&self.to_json());
             fs::write(&path, content)?;
         }
         Ok(())
+    }
+
+    /// Parse config from JSON value
+    fn from_json(v: &Value) -> Self {
+        let defaults = Self::default();
+
+        // Helper to get bool with default
+        let get_bool = |key: &str, default: bool| -> bool {
+            v.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+        };
+
+        // Helper to get u64 with default
+        let get_u64 = |key: &str, default: u64| -> u64 {
+            v.get(key).and_then(|v| v.as_u64()).unwrap_or(default)
+        };
+
+        // Helper to get string with default
+        let get_str = |key: &str, default: &str| -> String {
+            v.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or(default)
+                .to_string()
+        };
+
+        // Parse visible_columns array
+        let visible_columns = v
+            .get("visible_columns")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_else(|| defaults.visible_columns.clone());
+
+        Self {
+            refresh_rate_ms: get_u64("refresh_rate_ms", defaults.refresh_rate_ms),
+            tree_view_default: get_bool("tree_view_default", defaults.tree_view_default),
+            color_scheme: ColorScheme::from_str(&get_str(
+                "color_scheme",
+                defaults.color_scheme.as_str(),
+            )),
+
+            show_kernel_threads: get_bool("show_kernel_threads", defaults.show_kernel_threads),
+            show_user_threads: get_bool("show_user_threads", defaults.show_user_threads),
+            show_program_path: get_bool("show_program_path", defaults.show_program_path),
+            highlight_running: get_bool("highlight_running", defaults.highlight_running),
+            highlight_large_numbers: get_bool(
+                "highlight_large_numbers",
+                defaults.highlight_large_numbers,
+            ),
+            highlight_new_processes: get_bool(
+                "highlight_new_processes",
+                defaults.highlight_new_processes,
+            ),
+            highlight_duration_ms: get_u64("highlight_duration_ms", defaults.highlight_duration_ms),
+            highlight_basename: get_bool("highlight_basename", defaults.highlight_basename),
+
+            show_cpu_meters: get_bool("show_cpu_meters", defaults.show_cpu_meters),
+            show_memory_meter: get_bool("show_memory_meter", defaults.show_memory_meter),
+            show_swap_meter: get_bool("show_swap_meter", defaults.show_swap_meter),
+            show_tasks_meter: get_bool("show_tasks_meter", defaults.show_tasks_meter),
+            show_uptime_meter: get_bool("show_uptime_meter", defaults.show_uptime_meter),
+            show_load_average: get_bool("show_load_average", defaults.show_load_average),
+            show_network_io: get_bool("show_network_io", defaults.show_network_io),
+            show_disk_io: get_bool("show_disk_io", defaults.show_disk_io),
+            show_clock: get_bool("show_clock", defaults.show_clock),
+            show_hostname: get_bool("show_hostname", defaults.show_hostname),
+            show_battery: get_bool("show_battery", defaults.show_battery),
+
+            cpu_meter_mode: MeterMode::from_str(&get_str(
+                "cpu_meter_mode",
+                defaults.cpu_meter_mode.as_str(),
+            )),
+            memory_meter_mode: MeterMode::from_str(&get_str(
+                "memory_meter_mode",
+                defaults.memory_meter_mode.as_str(),
+            )),
+
+            visible_columns,
+
+            mouse_enabled: get_bool("mouse_enabled", defaults.mouse_enabled),
+            readonly: get_bool("readonly", defaults.readonly),
+            confirm_kill: get_bool("confirm_kill", defaults.confirm_kill),
+            collapsed_pids: HashSet::new(),
+        }
+    }
+
+    /// Convert config to JSON value
+    fn to_json(&self) -> Value {
+        let mut map = HashMap::new();
+
+        map.insert(
+            "refresh_rate_ms".to_string(),
+            Value::Number(self.refresh_rate_ms as i64),
+        );
+        map.insert(
+            "tree_view_default".to_string(),
+            Value::Bool(self.tree_view_default),
+        );
+        map.insert(
+            "color_scheme".to_string(),
+            Value::String(self.color_scheme.as_str().to_string()),
+        );
+
+        map.insert(
+            "show_kernel_threads".to_string(),
+            Value::Bool(self.show_kernel_threads),
+        );
+        map.insert(
+            "show_user_threads".to_string(),
+            Value::Bool(self.show_user_threads),
+        );
+        map.insert(
+            "show_program_path".to_string(),
+            Value::Bool(self.show_program_path),
+        );
+        map.insert(
+            "highlight_running".to_string(),
+            Value::Bool(self.highlight_running),
+        );
+        map.insert(
+            "highlight_large_numbers".to_string(),
+            Value::Bool(self.highlight_large_numbers),
+        );
+        map.insert(
+            "highlight_new_processes".to_string(),
+            Value::Bool(self.highlight_new_processes),
+        );
+        map.insert(
+            "highlight_duration_ms".to_string(),
+            Value::Number(self.highlight_duration_ms as i64),
+        );
+        map.insert(
+            "highlight_basename".to_string(),
+            Value::Bool(self.highlight_basename),
+        );
+
+        map.insert(
+            "show_cpu_meters".to_string(),
+            Value::Bool(self.show_cpu_meters),
+        );
+        map.insert(
+            "show_memory_meter".to_string(),
+            Value::Bool(self.show_memory_meter),
+        );
+        map.insert(
+            "show_swap_meter".to_string(),
+            Value::Bool(self.show_swap_meter),
+        );
+        map.insert(
+            "show_tasks_meter".to_string(),
+            Value::Bool(self.show_tasks_meter),
+        );
+        map.insert(
+            "show_uptime_meter".to_string(),
+            Value::Bool(self.show_uptime_meter),
+        );
+        map.insert(
+            "show_load_average".to_string(),
+            Value::Bool(self.show_load_average),
+        );
+        map.insert(
+            "show_network_io".to_string(),
+            Value::Bool(self.show_network_io),
+        );
+        map.insert("show_disk_io".to_string(), Value::Bool(self.show_disk_io));
+        map.insert("show_clock".to_string(), Value::Bool(self.show_clock));
+        map.insert(
+            "show_hostname".to_string(),
+            Value::Bool(self.show_hostname),
+        );
+        map.insert("show_battery".to_string(), Value::Bool(self.show_battery));
+
+        map.insert(
+            "cpu_meter_mode".to_string(),
+            Value::String(self.cpu_meter_mode.as_str().to_string()),
+        );
+        map.insert(
+            "memory_meter_mode".to_string(),
+            Value::String(self.memory_meter_mode.as_str().to_string()),
+        );
+
+        map.insert(
+            "visible_columns".to_string(),
+            Value::Array(
+                self.visible_columns
+                    .iter()
+                    .map(|s| Value::String(s.clone()))
+                    .collect(),
+            ),
+        );
+
+        map.insert(
+            "mouse_enabled".to_string(),
+            Value::Bool(self.mouse_enabled),
+        );
+        map.insert("readonly".to_string(), Value::Bool(self.readonly));
+        map.insert("confirm_kill".to_string(), Value::Bool(self.confirm_kill));
+
+        Value::Object(map)
     }
 
     /// Check if a column should be visible
@@ -266,8 +485,12 @@ mod tests {
     #[test]
     fn test_serialization() {
         let config = Config::default();
-        let json = serde_json::to_string(&config).unwrap();
-        let loaded: Config = serde_json::from_str(&json).unwrap();
+        let json_value = config.to_json();
+        let json_str = json::to_string_pretty(&json_value);
+        let parsed = json::parse(&json_str).unwrap();
+        let loaded = Config::from_json(&parsed);
         assert_eq!(loaded.refresh_rate_ms, config.refresh_rate_ms);
+        assert_eq!(loaded.tree_view_default, config.tree_view_default);
+        assert_eq!(loaded.visible_columns, config.visible_columns);
     }
 }

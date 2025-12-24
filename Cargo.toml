@@ -13,8 +13,6 @@ categories = ["command-line-utilities", "os::windows-apis"]
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", default-features = false, features = ["events", "windows"] }
 unicode-width = "0.1"  # Match ratatui's transitive dep
-serde = { version = "1", default-features = false, features = ["derive", "std"] }
-serde_json = { version = "1", default-features = false, features = ["std"] }
 lexopt = "0.3"  # Lightweight arg parsing
 
 [target.'cfg(windows)'.dependencies]

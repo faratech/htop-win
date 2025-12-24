@@ -1,6 +1,7 @@
 mod app;
 mod config;
 mod input;
+mod json;
 mod system;
 mod ui;
 
