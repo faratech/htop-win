@@ -16,6 +16,7 @@ struct PrevCpuTimes {
     user: i64,
     kernel: i64,
     idle: i64,
+    initialized: bool, // Track if we have valid previous values
 }
 
 /// CPU usage information
@@ -105,29 +106,9 @@ fn get_cpu_info() -> (Vec<f32>, Vec<CpuBreakdown>) {
 
         let prev = &prev_times[i];
 
-        // Calculate deltas
-        let user_delta = (user - prev.user).max(0);
-        let kernel_delta = (kernel - prev.kernel).max(0);
-        let idle_delta = (idle - prev.idle).max(0);
-
-        // Total time = user + kernel (kernel already includes idle)
-        // Active kernel time = kernel - idle
-        let total = user_delta + kernel_delta;
-        let system_delta = kernel_delta - idle_delta;
-
-        let (usage, breakdown) = if total > 0 {
-            let user_pct = (user_delta as f64 / total as f64 * 100.0) as f32;
-            let system_pct = (system_delta as f64 / total as f64 * 100.0).max(0.0) as f32;
-            let idle_pct = (idle_delta as f64 / total as f64 * 100.0) as f32;
-            (
-                user_pct + system_pct, // Total usage = user + system
-                CpuBreakdown {
-                    user: user_pct,
-                    system: system_pct,
-                    idle: idle_pct,
-                },
-            )
-        } else {
+        // Skip first sample - we need valid previous values to calculate meaningful deltas
+        // Otherwise we'd be using cumulative times since boot which is not accurate
+        let (usage, breakdown) = if !prev.initialized {
             (
                 0.0,
                 CpuBreakdown {
@@ -136,6 +117,39 @@ fn get_cpu_info() -> (Vec<f32>, Vec<CpuBreakdown>) {
                     idle: 100.0,
                 },
             )
+        } else {
+            // Calculate deltas
+            let user_delta = (user - prev.user).max(0);
+            let kernel_delta = (kernel - prev.kernel).max(0);
+            let idle_delta = (idle - prev.idle).max(0);
+
+            // Total time = user + kernel (kernel already includes idle)
+            // Active kernel time = kernel - idle
+            let total = user_delta + kernel_delta;
+            let system_delta = kernel_delta - idle_delta;
+
+            if total > 0 {
+                let user_pct = (user_delta as f64 / total as f64 * 100.0) as f32;
+                let system_pct = (system_delta as f64 / total as f64 * 100.0).max(0.0) as f32;
+                let idle_pct = (idle_delta as f64 / total as f64 * 100.0) as f32;
+                (
+                    user_pct + system_pct, // Total usage = user + system
+                    CpuBreakdown {
+                        user: user_pct,
+                        system: system_pct,
+                        idle: idle_pct,
+                    },
+                )
+            } else {
+                (
+                    0.0,
+                    CpuBreakdown {
+                        user: 0.0,
+                        system: 0.0,
+                        idle: 100.0,
+                    },
+                )
+            }
         };
 
         core_usage.push(usage);
@@ -146,6 +160,7 @@ fn get_cpu_info() -> (Vec<f32>, Vec<CpuBreakdown>) {
             user,
             kernel,
             idle,
+            initialized: true,
         };
     }
 

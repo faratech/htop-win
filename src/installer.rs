@@ -254,6 +254,14 @@ pub enum UpdateStatus {
 /// Check for updates and download if available (for background auto-update)
 /// Returns UpdateStatus indicating what happened
 pub fn check_and_download_update() -> UpdateStatus {
+    let temp_dir = std::env::temp_dir();
+    let temp_file = temp_dir.join("htop-win-update.exe");
+
+    // If update already downloaded and pending, don't re-download
+    if temp_file.exists() {
+        return UpdateStatus::None;
+    }
+
     let current_version = env!("CARGO_PKG_VERSION");
 
     let (latest_version, download_url) = match get_latest_release() {
@@ -264,13 +272,6 @@ pub fn check_and_download_update() -> UpdateStatus {
     if !is_newer_version(&latest_version, current_version) {
         return UpdateStatus::None;
     }
-
-    // Download to temp file
-    let temp_dir = std::env::temp_dir();
-    let temp_file = temp_dir.join("htop-win-update.exe");
-
-    // Clean up any old temp files first
-    cleanup_temp_files();
 
     match download_file(&download_url, &temp_file) {
         Ok(()) => UpdateStatus::Downloaded {
@@ -331,18 +332,19 @@ pub fn apply_pending_update() -> bool {
     let backup_path = install_path.with_extension("exe.old");
     let _ = fs::remove_file(&backup_path); // Remove old backup if exists
 
-    if fs::rename(&install_path, &backup_path).is_err() {
-        // Can't rename, might not have permissions
-        let _ = fs::remove_file(&update_file);
-        return false;
+    if let Err(e) = fs::rename(&install_path, &backup_path) {
+        // Can't rename - keep update file for retry on next restart
+        eprintln!("Update pending (cannot rename running exe: {})", e);
+        return true; // Return true to skip re-download
     }
 
     // Copy new version to install location
-    if fs::copy(&update_file, &install_path).is_err() {
+    if let Err(e) = fs::copy(&update_file, &install_path) {
         // Failed to copy, restore backup
+        eprintln!("Update failed (copy error: {}), restoring backup", e);
         let _ = fs::rename(&backup_path, &install_path);
-        let _ = fs::remove_file(&update_file);
-        return false;
+        // Keep update file for retry
+        return true; // Return true to skip re-download
     }
 
     // Clean up
