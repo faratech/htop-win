@@ -1,9 +1,6 @@
-use ratatui::{
-    layout::Rect,
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
-    Frame,
+use crate::terminal::{
+    Block, Borders, Clear, Color, Frame, Line, List, ListItem, Modifier, Paragraph, Rect,
+    Scrollbar, ScrollbarOrientation, ScrollbarState, Span, Style, Wrap,
 };
 
 use crate::app::{App, SortColumn};

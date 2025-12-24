@@ -1,9 +1,5 @@
-use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph},
-    Frame,
+use crate::terminal::{
+    Block, Borders, Constraint, Direction, Frame, Layout, Line, Modifier, Paragraph, Rect, Span, Style,
 };
 use std::collections::VecDeque;
 
@@ -158,6 +154,7 @@ fn draw_right_column(frame: &mut Frame, app: &mut App, area: Rect) {
 
     // Draw CPU bars (right column of CPUs) and additional meters
     let mut row_idx = 0;
+    #[allow(clippy::needless_range_loop)]
     for i in 0..meter_rows {
         let cpu_idx = i * 2 + 1;
         if cpu_idx < cpu_count {

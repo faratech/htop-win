@@ -935,7 +935,32 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
                         app.view_mode = ViewMode::Normal;
                         return;
                     }
-                    // Other dialogs: close on click
+                    // Setup dialog: click to select item
+                    ViewMode::Setup => {
+                        // Get terminal size and calculate dialog area (60% width/height centered)
+                        if let Ok((term_width, term_height)) = crossterm::terminal::size() {
+                            let dialog_width = term_width * 60 / 100;
+                            let dialog_height = term_height * 60 / 100;
+                            let dialog_x = (term_width.saturating_sub(dialog_width)) / 2;
+                            let dialog_y = (term_height.saturating_sub(dialog_height)) / 2;
+
+                            // Check if click is inside dialog (accounting for border)
+                            if x > dialog_x && x < dialog_x + dialog_width - 1 &&
+                               y > dialog_y && y < dialog_y + dialog_height - 1 {
+                                // Calculate which item was clicked (y - dialog_y - 1 for border)
+                                let item_index = (y.saturating_sub(dialog_y).saturating_sub(1)) as usize;
+                                let num_items = 13; // Setup has 13 items
+                                if item_index < num_items {
+                                    app.setup_selected = item_index;
+                                }
+                                return;
+                            }
+                        }
+                        // Click outside dialog closes it
+                        app.view_mode = ViewMode::Normal;
+                        return;
+                    }
+                    // Other dialogs: close on click outside, or handle click inside
                     _ => {
                         app.view_mode = ViewMode::Normal;
                         return;

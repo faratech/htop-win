@@ -1,9 +1,5 @@
-use ratatui::{
-    layout::{Constraint, Rect},
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Cell, Row, Table},
-    Frame,
+use crate::terminal::{
+    Block, Borders, Cell, Color, Constraint, Frame, Line, Modifier, Rect, Row, Span, Style, Table,
 };
 
 use crate::app::{App, SortColumn};
@@ -196,7 +192,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .add_modifier(Modifier::BOLD);
 
     // Build header with sort indicator - only for visible columns
-    let header_cells: Vec<Span> = visible_columns
+    let header_cells: Vec<Cell> = visible_columns
         .iter()
         .map(|col| {
             let name = col.name();
@@ -205,7 +201,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 ""
             };
-            Span::raw(format!("{}{}", name, indicator))
+            Cell::new(format!("{}{}", name, indicator))
         })
         .collect();
 

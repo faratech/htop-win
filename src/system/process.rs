@@ -479,13 +479,28 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                     let mut process_machine = IMAGE_FILE_MACHINE::default();
                     let mut native_machine = IMAGE_FILE_MACHINE::default();
                     if IsWow64Process2(h, &mut process_machine, Some(&mut native_machine)).is_ok() {
+                        // native_machine tells us the host OS architecture
+                        // process_machine tells us what the process is running as (0 = same as native)
+                        //
+                        // On ARM64 host:
+                        //   - ARM64 native process: process_machine=0 → Native (don't show)
+                        //   - x64 emulated: process_machine=AMD64 → show [x64]
+                        //   - x86 WoW64: process_machine=I386 → show [x86]
+                        //
+                        // On x64 host:
+                        //   - x64 native process: process_machine=0 → Native (don't show)
+                        //   - x86 WoW64: process_machine=I386 → show [x86]
+
                         if process_machine.0 == 0 {
+                            // Process matches native architecture - don't show indicator
                             ProcessArch::Native
                         } else if process_machine == IMAGE_FILE_MACHINE_I386 {
                             ProcessArch::X86
                         } else if process_machine == IMAGE_FILE_MACHINE_AMD64 {
+                            // x64 process under emulation (on ARM64 host)
                             ProcessArch::X64
                         } else if process_machine == IMAGE_FILE_MACHINE_ARM64 {
+                            // ARM64 process (would only happen if querying from x64 on ARM?)
                             ProcessArch::ARM64
                         } else {
                             ProcessArch::Native

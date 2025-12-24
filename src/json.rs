@@ -5,6 +5,8 @@
 //! - String, integer, boolean values
 //! - Arrays of strings
 
+#![allow(dead_code)] // Library provides full API even if not all used
+
 use std::collections::HashMap;
 
 /// A JSON value

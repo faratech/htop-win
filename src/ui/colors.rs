@@ -1,7 +1,7 @@
 //! Color scheme system for htop-win
 //! Provides 8 different color themes matching htop exactly
 
-use ratatui::style::Color;
+use crate::terminal::Color;
 
 /// Available color schemes (matching htop exactly)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -10,9 +10,9 @@ keywords = ["htop", "process", "monitor", "tui", "windows"]
 categories = ["command-line-utilities", "os::windows-apis"]
 
 [dependencies]
-ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 crossterm = { version = "0.28", default-features = false, features = ["events", "windows"] }
-unicode-width = "0.1"  # Match ratatui's transitive dep
+bitflags = "2"  # For Modifier flags
+unicode-width = "0.1"
 lexopt = "0.3"  # Lightweight arg parsing
 
 [target.'cfg(windows)'.dependencies]

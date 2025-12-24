@@ -4,11 +4,8 @@ mod footer;
 mod header;
 mod process_list;
 
-use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
-    widgets::Block,
-    Frame,
+use crate::terminal::{
+    Block, Constraint, Direction, Frame, Layout, Rect, Style,
 };
 
 use crate::app::{App, ColumnBounds, SortColumn, ViewMode};

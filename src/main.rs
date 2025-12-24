@@ -3,6 +3,7 @@ mod config;
 mod input;
 mod json;
 mod system;
+mod terminal;
 mod ui;
 
 use std::io;
@@ -13,7 +14,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use terminal::{CrosstermBackend, Terminal};
 
 use app::App;
 use config::Config;
@@ -424,8 +425,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_app<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
+fn run_app(
+    terminal: &mut Terminal,
     app: &mut App,
     _config: &Config,
     mut bench_stats: Option<&mut BenchmarkStats>,

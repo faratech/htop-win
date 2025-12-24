@@ -1,9 +1,5 @@
-use ratatui::{
-    layout::Rect,
-    style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::Paragraph,
-    Frame,
+use crate::terminal::{
+    Color, Frame, Line, Modifier, Paragraph, Rect, Span, Style,
 };
 
 use crate::app::{App, FocusRegion, ViewMode};

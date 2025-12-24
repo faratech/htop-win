@@ -323,7 +323,7 @@ impl ProcessCache {
 
     /// Check if cleanup should run (every CLEANUP_INTERVAL refreshes)
     pub fn should_cleanup(&self) -> bool {
-        self.cleanup_counter.fetch_add(1, Ordering::Relaxed) % config::CLEANUP_INTERVAL == 0
+        self.cleanup_counter.fetch_add(1, Ordering::Relaxed).is_multiple_of(config::CLEANUP_INTERVAL)
     }
 
     /// Remove entries for PIDs that no longer exist

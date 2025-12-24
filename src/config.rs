@@ -109,6 +109,7 @@ pub struct Config {
 
     // Tree view settings
     /// Default collapsed PIDs (persisted)
+    #[allow(dead_code)]
     pub collapsed_pids: HashSet<u32>,
 }
 
