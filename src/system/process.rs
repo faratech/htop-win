@@ -23,10 +23,10 @@ use windows::Win32::System::Threading::IO_COUNTERS;
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
     GetCurrentProcess, GetProcessInformation, GetProcessIoCounters, GetProcessTimes,
-    IsWow64Process2, OpenProcess, OpenProcessToken, ProcessPowerThrottling,
+    IsWow64Process2, OpenProcess, OpenProcessToken, ProcessMachineTypeInfo, ProcessPowerThrottling,
     QueryFullProcessImageNameW, SetPriorityClass, TerminateProcess,
     ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
-    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_NAME_WIN32,
+    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_MACHINE_INFORMATION, PROCESS_NAME_WIN32,
     PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
     PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
     PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
@@ -480,28 +480,51 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                     let mut native_machine = IMAGE_FILE_MACHINE::default();
                     if IsWow64Process2(h, &mut process_machine, Some(&mut native_machine)).is_ok() {
                         // native_machine tells us the host OS architecture
-                        // process_machine tells us what the process is running as (0 = same as native)
+                        // process_machine tells us what the process is running as
+                        //
+                        // IMPORTANT: IsWow64Process2 only detects WOW64 (32-bit) emulation.
+                        // x64 processes running under emulation on ARM64 return process_machine=0,
+                        // same as native processes! We must use GetProcessInformation to distinguish.
                         //
                         // On ARM64 host:
-                        //   - ARM64 native process: process_machine=0 → Native (don't show)
-                        //   - x64 emulated: process_machine=AMD64 → show [x64]
+                        //   - ARM64 native: process_machine=0, GetProcessInformation→ARM64
+                        //   - x64 emulated: process_machine=0, GetProcessInformation→AMD64 → show [x64]
                         //   - x86 WoW64: process_machine=I386 → show [x86]
                         //
                         // On x64 host:
                         //   - x64 native process: process_machine=0 → Native (don't show)
                         //   - x86 WoW64: process_machine=I386 → show [x86]
 
-                        if process_machine.0 == 0 {
-                            // Process matches native architecture - don't show indicator
-                            ProcessArch::Native
-                        } else if process_machine == IMAGE_FILE_MACHINE_I386 {
+                        if process_machine == IMAGE_FILE_MACHINE_I386 {
                             ProcessArch::X86
                         } else if process_machine == IMAGE_FILE_MACHINE_AMD64 {
-                            // x64 process under emulation (on ARM64 host)
                             ProcessArch::X64
                         } else if process_machine == IMAGE_FILE_MACHINE_ARM64 {
-                            // ARM64 process (would only happen if querying from x64 on ARM?)
                             ProcessArch::ARM64
+                        } else if process_machine.0 == 0 {
+                            // Not a WOW64 process - could be native OR x64 emulated on ARM64
+                            // Use GetProcessInformation to get actual machine type
+                            if native_machine == IMAGE_FILE_MACHINE_ARM64 {
+                                // On ARM64 host, need to distinguish native ARM64 from emulated x64
+                                let mut machine_info = PROCESS_MACHINE_INFORMATION::default();
+                                if GetProcessInformation(
+                                    h,
+                                    ProcessMachineTypeInfo,
+                                    &mut machine_info as *mut _ as *mut _,
+                                    std::mem::size_of::<PROCESS_MACHINE_INFORMATION>() as u32,
+                                ).is_ok() {
+                                    if machine_info.ProcessMachine == IMAGE_FILE_MACHINE_AMD64 {
+                                        ProcessArch::X64
+                                    } else {
+                                        ProcessArch::Native
+                                    }
+                                } else {
+                                    ProcessArch::Native
+                                }
+                            } else {
+                                // On x64 host, process_machine=0 means native x64
+                                ProcessArch::Native
+                            }
                         } else {
                             ProcessArch::Native
                         }
