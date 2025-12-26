@@ -3,6 +3,21 @@
 use std::fs;
 use std::path::PathBuf;
 
+#[cfg(windows)]
+use windows::core::{w, PCWSTR, PWSTR};
+#[cfg(windows)]
+use windows::Win32::Networking::WinHttp::{
+    WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
+    WinHttpQueryDataAvailable, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
+    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+    WINHTTP_FLAG_SECURE,
+    URL_COMPONENTS,
+    WINHTTP_INTERNET_SCHEME_HTTPS,
+    WINHTTP_OPEN_REQUEST_FLAGS,
+};
+#[cfg(windows)]
+use windows::Win32::Foundation::GetLastError;
+
 /// Get the installation path for htop
 pub fn get_install_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let local_app_data = std::env::var("LOCALAPPDATA")?;
@@ -46,7 +61,7 @@ pub fn install_to_path(force: bool) -> Result<(), Box<dyn std::error::Error>> {
                 println!("htop {} is already installed and up to date.", current_version);
                 println!("Location: {}", target_path.display());
                 println!("\nUse --force to reinstall anyway.");
-                return Ok(());
+                return Ok(())
             } else {
                 println!("Updating htop from {} to {}...", installed_version, current_version);
             }
@@ -90,70 +105,201 @@ pub fn is_newer_version(a: &str, b: &str) -> bool {
     }
 }
 
+/// Helper struct to automatically close WinHTTP handles
+#[cfg(windows)]
+struct HandleGuard(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl Drop for HandleGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { let _ = WinHttpCloseHandle(self.0); }
+        }
+    }
+}
+
+/// Native HTTP GET using WinHTTP (no PowerShell, no extra deps)
+#[cfg(windows)]
+fn native_http_get(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use std::ffi::c_void;
+
+    unsafe {
+        // 1. Open Session
+        let session = WinHttpOpen(
+            w!("htop-win-updater/1.0"),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            None,
+            None,
+            0,
+        );
+        if session.is_null() {
+            return Err(format!("WinHttpOpen failed: {:?}", GetLastError()).into());
+        }
+        let _session_guard = HandleGuard(session);
+
+        // 2. Crack URL
+        let mut host_name = vec![0u16; 256];
+        let mut url_path = vec![0u16; 2048];
+        
+        let url_wide: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
+        let mut components = URL_COMPONENTS::default();
+        components.dwStructSize = std::mem::size_of::<URL_COMPONENTS>() as u32;
+        components.dwHostNameLength = host_name.len() as u32;
+        components.lpszHostName = PWSTR(host_name.as_mut_ptr());
+        components.dwUrlPathLength = url_path.len() as u32;
+        components.lpszUrlPath = PWSTR(url_path.as_mut_ptr());
+
+        if WinHttpCrackUrl(&url_wide, 0, &mut components).is_err() {
+             return Err(format!("WinHttpCrackUrl failed: {:?}", GetLastError()).into());
+        }
+
+        // 3. Connect
+        let connect = WinHttpConnect(
+            session,
+            PCWSTR(components.lpszHostName.0),
+            components.nPort as u16,
+            0,
+        );
+        if connect.is_null() {
+            return Err(format!("WinHttpConnect failed: {:?}", GetLastError()).into());
+        }
+        let _connect_guard = HandleGuard(connect);
+
+        // 4. Open Request
+        let flags = if components.nScheme == WINHTTP_INTERNET_SCHEME_HTTPS { WINHTTP_FLAG_SECURE } else { WINHTTP_OPEN_REQUEST_FLAGS(0) };
+        let request = WinHttpOpenRequest(
+            connect,
+            w!("GET"),
+            PCWSTR(components.lpszUrlPath.0),
+            None,
+            None,
+            std::ptr::null(), // Accept types
+            flags,
+        );
+        if request.is_null() {
+            return Err(format!("WinHttpOpenRequest failed: {:?}", GetLastError()).into());
+        }
+        let _request_guard = HandleGuard(request);
+
+        // 5. Send Request
+        if WinHttpSendRequest(
+            request,
+            None,
+            None,
+            0,
+            0,
+            0,
+        ).is_err() {
+            return Err(format!("WinHttpSendRequest failed: {:?}", GetLastError()).into());
+        }
+
+        // 6. Receive Response
+        if WinHttpReceiveResponse(request, std::ptr::null_mut()).is_err() {
+            return Err(format!("WinHttpReceiveResponse failed: {:?}", GetLastError()).into());
+        }
+
+        // 7. Read Data
+        let mut body = Vec::new();
+        let mut buffer = vec![0u8; 8192];
+        let mut bytes_read = 0;
+
+        loop {
+            if WinHttpQueryDataAvailable(request, &mut bytes_read).is_err() {
+                break;
+            }
+            if bytes_read == 0 {
+                break;
+            }
+            
+            let to_read = bytes_read.min(buffer.len() as u32);
+            let mut read_now = 0;
+            
+            if WinHttpReadData(
+                request,
+                buffer.as_mut_ptr() as *mut c_void,
+                to_read,
+                &mut read_now,
+            ).is_err() {
+                break;
+            }
+            
+            if read_now == 0 {
+                break;
+            }
+            
+            body.extend_from_slice(&buffer[..read_now as usize]);
+        }
+
+        Ok(body)
+    }
+}
+
+// Fallback for non-windows (though we really only target windows)
+#[cfg(not(windows))]
+fn native_http_get(_url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    Err("Not supported on non-Windows".into())
+}
+
 /// GitHub repository for releases
 const GITHUB_REPO: &str = "faratech/htop-win";
 
 /// Get the latest version info from GitHub
 /// Returns (version, download_url) or None if check fails
 pub fn get_latest_release() -> Option<(String, String)> {
-    // Detect architecture for correct binary
-    let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
+    let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
+    
+    // Fetch JSON from GitHub API
+    let body = native_http_get(&url).ok()?;
+    let json_text = String::from_utf8(body).ok()?;
+    
+    // Parse JSON manually to avoid complex deps
+    // We look for "tag_name": "vX.Y.Z"
+    let version = json_text.split("\"tag_name\"")
+        .nth(1)?
+        .split(':')
+        .nth(1)?
+        .split("\"")
+        .nth(1)?
+        .trim_start_matches('v')
+        .to_string();
 
-    let ps_script = format!(
-        r#"
-        try {{
-            $release = Invoke-RestMethod -Uri 'https://api.github.com/repos/{}/releases/latest' -Headers @{{'User-Agent'='htop-win'}}
-            $asset = $release.assets | Where-Object {{ $_.name -like '*{}.exe' }} | Select-Object -First 1
-            if (-not $asset) {{ $asset = $release.assets | Where-Object {{ $_.name -like '*.exe' }} | Select-Object -First 1 }}
-            Write-Output "$($release.tag_name)|$($asset.browser_download_url)"
-        }} catch {{
-            Write-Output "ERROR"
-        }}
-        "#,
-        GITHUB_REPO, arch
-    );
+    // Detect architecture
+    let target_arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
+    let target_suffix = format!("htop-win-{}.exe", target_arch);
 
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
-        .output()
-        .ok()?;
-
-    let result = String::from_utf8_lossy(&output.stdout);
-    let result = result.trim();
-
-    if result == "ERROR" || result.is_empty() {
-        return None;
+    // Find asset URL
+    // Look for "browser_download_url": "..." that ends with target_suffix
+    let mut download_url = String::new();
+    for part in json_text.split("\"browser_download_url\"") {
+        if let Some(url_part) = part.split(':').nth(1) {
+            if let Some(url) = url_part.split("\"").nth(1) {
+                if url.ends_with(&target_suffix) {
+                    download_url = url.to_string();
+                    break;
+                }
+            }
+        }
     }
 
-    let parts: Vec<&str> = result.splitn(2, '|').collect();
-    if parts.len() != 2 {
-        return None;
+    // Fallback: if specific arch not found, try any .exe
+    if download_url.is_empty() {
+        for part in json_text.split("\"browser_download_url\"") {
+            if let Some(url_part) = part.split(':').nth(1) {
+                if let Some(url) = url_part.split("\"").nth(1) {
+                    if url.ends_with(".exe") {
+                        download_url = url.to_string();
+                        break;
+                    }
+                }
+            }
+        }
     }
 
-    let version = parts[0].trim_start_matches('v').to_string();
-    let download_url = parts[1].to_string();
+    if version.is_empty() || download_url.is_empty() {
+        return None;
+    }
 
     Some((version, download_url))
-}
-
-/// Download a file from URL to destination path using PowerShell
-fn download_file(url: &str, dest: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let dest_str = dest.to_string_lossy();
-    let ps_script = format!(
-        r#"Invoke-WebRequest -Uri '{}' -OutFile '{}' -UseBasicParsing"#,
-        url, dest_str
-    );
-
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", &ps_script])
-        .output()?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(format!("Download failed: {}", stderr).into())
-    }
 }
 
 /// Clean up any leftover temp files from previous updates
@@ -177,7 +323,7 @@ pub fn update_from_github(force: bool) -> Result<(), Box<dyn std::error::Error>>
     if !force && !is_newer_version(&latest_version, current_version) {
         println!("htop {} is already the latest version.", current_version);
         println!("\nUse --force to reinstall anyway.");
-        return Ok(());
+        return Ok(())
     }
 
     if force && !is_newer_version(&latest_version, current_version) {
@@ -191,7 +337,11 @@ pub fn update_from_github(force: bool) -> Result<(), Box<dyn std::error::Error>>
     let temp_dir = std::env::temp_dir();
     let temp_file = temp_dir.join("htop-win-update.exe");
 
-    download_file(&download_url, &temp_file)?;
+    let body = native_http_get(&download_url)?;
+    if body.is_empty() {
+        return Err("Downloaded update file is empty".into());
+    }
+    fs::write(&temp_file, body)?;
 
     println!("Download complete. Installing...");
 
@@ -223,7 +373,7 @@ pub fn do_install_update(update_file: &std::path::Path) -> Result<(), Box<dyn st
             return Err(e.into());
         }
 
-        // Clean up backup
+        // Clean up backup - ignore errors as running process might lock it
         let _ = fs::remove_file(&backup_path);
     } else {
         // No existing file, just copy
@@ -259,7 +409,14 @@ pub fn check_and_download_update() -> UpdateStatus {
 
     // If update already downloaded and pending, don't re-download
     if temp_file.exists() {
-        return UpdateStatus::None;
+        // Verify it's not empty
+        if let Ok(metadata) = fs::metadata(&temp_file) {
+            if metadata.len() > 0 {
+                return UpdateStatus::None;
+            }
+        }
+        // Invalid file, remove it
+        let _ = fs::remove_file(&temp_file);
     }
 
     let current_version = env!("CARGO_PKG_VERSION");
@@ -273,12 +430,18 @@ pub fn check_and_download_update() -> UpdateStatus {
         return UpdateStatus::None;
     }
 
-    match download_file(&download_url, &temp_file) {
-        Ok(()) => UpdateStatus::Downloaded {
-            version: latest_version,
-            path: temp_file,
+    match native_http_get(&download_url) {
+        Ok(body) if !body.is_empty() => {
+            if fs::write(&temp_file, body).is_ok() {
+                UpdateStatus::Downloaded {
+                    version: latest_version,
+                    path: temp_file,
+                }
+            } else {
+                UpdateStatus::None
+            }
         },
-        Err(_) => UpdateStatus::None,
+        _ => UpdateStatus::None,
     }
 }
 
@@ -312,7 +475,18 @@ pub fn apply_pending_update() -> bool {
     if !update_file.exists() {
         // Clean up any old backup files from previous updates
         let backup_path = current_exe.with_extension("exe.old");
+        // Only remove backup if it's not the running file (unlikely but safe)
         let _ = fs::remove_file(&backup_path);
+        return false;
+    }
+
+    // Verify update file integrity
+    if let Ok(metadata) = fs::metadata(&update_file) {
+        if metadata.len() == 0 {
+            let _ = fs::remove_file(&update_file);
+            return false;
+        }
+    } else {
         return false;
     }
 
@@ -347,8 +521,10 @@ pub fn apply_pending_update() -> bool {
         return true; // Return true to skip re-download
     }
 
-    // Clean up
+    // Clean up update file ONLY on success
     let _ = fs::remove_file(&update_file);
+    
+    // Try to remove backup, but ignore error if locked (it's the running executable)
     let _ = fs::remove_file(&backup_path);
 
     eprintln!("Update applied successfully!");

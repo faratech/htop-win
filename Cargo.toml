@@ -1,6 +1,6 @@
 [package]
 name = "htop-win"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "A Windows clone of htop - interactive process viewer"
 authors = ["htop-win contributors"]
@@ -22,17 +22,17 @@ windows = { version = "0.61", features = [
     "Win32_System_ProcessStatus",
     "Win32_Security",
     "Win32_System_Power",
-    "Win32_System_WindowsProgramming",
     "Win32_System_SystemInformation",
     "Win32_System_Performance",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_UI_Shell",
     "Win32_System_Com",
+    "Win32_Networking_WinHttp",
     "Wdk_System_SystemInformation",
 ] }
 
-[target.'cfg(windows)'.build-dependencies]
+[build-dependencies]
 embed-resource = "3"
 
 [profile.release]

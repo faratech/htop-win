@@ -1,8 +1,6 @@
 mod cpu;
 mod memory;
-#[cfg(windows)]
 mod native;
-#[cfg(windows)]
 pub mod cache;
 mod process;
 
@@ -13,8 +11,6 @@ pub use process::{
     get_process_io_counters, kill_process, set_efficiency_mode, set_priority_class,
     set_process_affinity, ProcessInfo,
 };
-#[cfg(windows)]
-pub use native::{query_all_processes, calculate_cpu_percentages};
 
 /// System metrics
 pub struct SystemMetrics {
@@ -45,9 +41,7 @@ pub struct SystemMetrics {
     prev_disk_read: u64,
     prev_disk_write: u64,
     // Native process enumeration state
-    #[cfg(windows)]
     prev_total_cpu_time: u64,
-    #[cfg(windows)]
     last_native_refresh: std::time::Instant,
 }
 
@@ -76,28 +70,19 @@ impl Default for SystemMetrics {
             prev_net_tx: 0,
             prev_disk_read: 0,
             prev_disk_write: 0,
-            #[cfg(windows)]
             prev_total_cpu_time: 0,
-            #[cfg(windows)]
             last_native_refresh: std::time::Instant::now(),
         }
     }
 }
 
 /// Get system uptime in seconds using native Windows API
-#[cfg(windows)]
 fn get_uptime() -> u64 {
     use windows::Win32::System::SystemInformation::GetTickCount64;
     unsafe { GetTickCount64() / 1000 }
 }
 
-#[cfg(not(windows))]
-fn get_uptime() -> u64 {
-    0
-}
-
 /// Get hostname using native Windows API
-#[cfg(windows)]
 fn get_hostname() -> String {
     use windows::Win32::System::SystemInformation::{GetComputerNameExW, ComputerNameDnsHostname};
     use windows::core::PWSTR;
@@ -126,20 +111,13 @@ fn get_hostname() -> String {
     }
 }
 
-#[cfg(not(windows))]
-fn get_hostname() -> String {
-    "unknown".to_string()
-}
-
 /// Network interface statistics
-#[cfg(windows)]
 struct NetworkStats {
     rx_bytes: u64,
     tx_bytes: u64,
 }
 
 /// Get network I/O stats using native Windows IP Helper API
-#[cfg(windows)]
 fn get_network_stats() -> NetworkStats {
     use windows::Win32::Foundation::WIN32_ERROR;
     use windows::Win32::NetworkManagement::IpHelper::{GetIfTable2, FreeMibTable, MIB_IF_TABLE2, IF_TYPE_SOFTWARE_LOOPBACK};
@@ -172,11 +150,6 @@ fn get_network_stats() -> NetworkStats {
     }
 }
 
-#[cfg(not(windows))]
-fn get_network_stats() -> (u64, u64) {
-    (0, 0)
-}
-
 impl SystemMetrics {
     /// Refresh system metrics (CPU, memory, uptime, hostname, battery, network)
     /// Does NOT refresh processes - use get_processes_native() for that
@@ -196,7 +169,6 @@ impl SystemMetrics {
         }
 
         // Update network I/O using native API
-        #[cfg(windows)]
         {
             let net_stats = get_network_stats();
             self.net_rx_rate = net_stats.rx_bytes.saturating_sub(self.prev_net_rx);
@@ -213,7 +185,6 @@ impl SystemMetrics {
 
     fn update_battery(&mut self) {
         // Use Windows API for battery status
-        #[cfg(windows)]
         {
             use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
             let mut status = SYSTEM_POWER_STATUS::default();
@@ -229,61 +200,111 @@ impl SystemMetrics {
                 }
             }
         }
-        #[cfg(not(windows))]
-        {
-            self.battery_percent = None;
-            self.battery_charging = false;
+    }
+
+    /// Update existing processes using native NtQuerySystemInformation
+    /// Reuse existing ProcessInfo structs to avoid memory allocation for strings
+    pub fn update_processes_native(&mut self, processes: &mut Vec<ProcessInfo>) {
+        use std::collections::{HashMap, HashSet};
+        use self::native::{with_process_list, calculate_cpu_percentages_from_iter, filetime_to_unix};
+        use self::cache::CACHE;
+
+        // Periodically clean up stale PIDs from caches
+        if CACHE.should_cleanup() {
+            let current_pids: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
+            self::process::cleanup_stale_caches(&current_pids);
         }
-    }
 
-    /// Get processes using native NtQuerySystemInformation (single syscall, much faster)
-    /// Returns processes with CPU percentages calculated from time deltas
-    #[cfg(windows)]
-    pub fn get_processes_native(&mut self) -> Vec<ProcessInfo> {
-        // Query all processes in a single syscall
-        let mut native_procs = query_all_processes();
+        with_process_list(|proc_list| {
+            // Update time tracking for CPU delta calculation
+            let now = std::time::Instant::now();
+            self.last_native_refresh = now;
 
-        // Update time tracking for CPU delta calculation
-        let now = std::time::Instant::now();
-        self.last_native_refresh = now;
+            // First pass: Calculate totals and CPU percentages
+            let mut total_cpu_time: u64 = 0;
+            let mut tasks_total = 0;
+            let mut threads_total = 0;
+            let mut total_disk_read: u64 = 0;
+            let mut total_disk_write: u64 = 0;
 
-        // Calculate total CPU time for all processes
-        let total_cpu_time: u64 = native_procs.iter()
-            .map(|p| p.kernel_time + p.user_time)
-            .sum();
+            for proc in proc_list.iter() {
+                total_cpu_time += proc.kernel_time() + proc.user_time();
+                tasks_total += 1;
+                threads_total += proc.thread_count() as usize;
+                total_disk_read += proc.read_bytes();
+                total_disk_write += proc.write_bytes();
+            }
 
-        // Calculate delta (100-nanosecond units)
-        let cpu_delta = total_cpu_time.saturating_sub(self.prev_total_cpu_time);
-        self.prev_total_cpu_time = total_cpu_time;
+            // Calculate delta (100-nanosecond units)
+            let cpu_delta = total_cpu_time.saturating_sub(self.prev_total_cpu_time);
+            self.prev_total_cpu_time = total_cpu_time;
 
-        // Get CPU percentages based on time deltas
-        let cpu_percentages = calculate_cpu_percentages(&mut native_procs, cpu_delta);
+            // Get CPU percentages based on time deltas
+            let cpu_percentages = calculate_cpu_percentages_from_iter(&proc_list, cpu_delta);
 
-        // Update task counts from native data
-        // On Windows, most processes are in "running/ready" state (no real sleep distinction like Linux)
-        self.tasks_total = native_procs.len();
-        self.tasks_running = self.tasks_total.saturating_sub(1); // Exclude System Idle Process
-        self.tasks_sleeping = 1; // Just the System Idle Process
-        self.threads_total = native_procs.iter().map(|p| p.thread_count as usize).sum();
+            // Update global stats
+            self.tasks_total = tasks_total;
+            self.tasks_running = self.tasks_total.saturating_sub(1); // Exclude System Idle Process
+            self.tasks_sleeping = 1;
+            self.threads_total = threads_total;
 
-        // Update disk I/O from native data
-        let total_disk_read: u64 = native_procs.iter().map(|p| p.read_bytes).sum();
-        let total_disk_write: u64 = native_procs.iter().map(|p| p.write_bytes).sum();
+            self.disk_read_rate = total_disk_read.saturating_sub(self.prev_disk_read);
+            self.disk_write_rate = total_disk_write.saturating_sub(self.prev_disk_write);
+            self.prev_disk_read = total_disk_read;
+            self.prev_disk_write = total_disk_write;
+            self.disk_read_bytes = total_disk_read;
+            self.disk_write_bytes = total_disk_write;
 
-        self.disk_read_rate = total_disk_read.saturating_sub(self.prev_disk_read);
-        self.disk_write_rate = total_disk_write.saturating_sub(self.prev_disk_write);
-        self.prev_disk_read = total_disk_read;
-        self.prev_disk_write = total_disk_write;
-        self.disk_read_bytes = total_disk_read;
-        self.disk_write_bytes = total_disk_write;
+            let total_mem = MemoryInfo::total_memory();
 
-        // Convert to ProcessInfo using native memory info for total_mem
-        let total_mem = MemoryInfo::total_memory();
-        ProcessInfo::from_native(&native_procs, &cpu_percentages, total_mem)
-    }
+            // Track which processes we've seen in this update
+            let mut seen_pids = HashSet::new();
 
-    #[cfg(not(windows))]
-    pub fn get_processes_native(&mut self) -> Vec<ProcessInfo> {
-        Vec::new()
+            // Process list is sorted by existing order usually, but new list is by PID
+            // We want to update existing entries and collect new ones
+            
+            // Build a map of existing processes index by PID for fast lookup
+            let existing_map: HashMap<u32, usize> = processes
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (p.pid, i))
+                .collect();
+
+            let mut new_processes = Vec::new();
+
+            // Iterate raw processes
+            for raw_proc in proc_list.iter() {
+                let pid = raw_proc.pid();
+                seen_pids.insert(pid);
+                
+                if let Some(&idx) = existing_map.get(&pid) {
+                    // Check if it's the same process instance (start time match)
+                    let native_start = filetime_to_unix(raw_proc.create_time());
+                    let existing_proc = &mut processes[idx];
+                    
+                    if (native_start as i64 - existing_proc.start_time as i64).abs() <= 1 {
+                        // Update existing process
+                        let cpu_pct = cpu_percentages.get(&pid).copied().unwrap_or(0.0);
+                        existing_proc.update_from_raw(&raw_proc, cpu_pct, total_mem);
+                    } else {
+                        // PID reuse: replace existing process
+                        let cpu_pct = cpu_percentages.get(&pid).copied().unwrap_or(0.0);
+                        *existing_proc = ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem);
+                    }
+                } else {
+                    // New process
+                    let cpu_pct = cpu_percentages.get(&pid).copied().unwrap_or(0.0);
+                    new_processes.push(ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem));
+                }
+            }
+
+            // Remove dead processes
+            processes.retain(|p| seen_pids.contains(&p.pid));
+
+            // Append new processes
+            if !new_processes.is_empty() {
+                processes.append(&mut new_processes);
+            }
+        });
     }
 }

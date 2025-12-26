@@ -1,6 +1,38 @@
 // Windows resource file for htop-win
-// Embeds the application icon into the executable
+// Embeds the application icon and version info into the executable
+
+#include <winver.h>
 
 // Icon with lowest ID value placed first to ensure application icon
 // remains consistent on all systems.
 1 ICON "htop.ico"
+
+// Version information
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     0,1,3,0
+PRODUCTVERSION  0,1,3,0
+FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
+FILEFLAGS       0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "htop-win contributors"
+            VALUE "FileDescription",  "Interactive process viewer for Windows"
+            VALUE "FileVersion",      "0.1.3"
+            VALUE "InternalName",     "htop-win"
+            VALUE "LegalCopyright",   "MIT License"
+            VALUE "OriginalFilename", "htop-win.exe"
+            VALUE "ProductName",      "htop-win"
+            VALUE "ProductVersion",   "0.1.3"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END

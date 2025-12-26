@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-#[cfg(windows)]
-use super::native::{NativeProcessInfo, filetime_to_unix};
+use super::native::{SystemProcess, filetime_to_unix};
 
 #[cfg(windows)]
 use windows::core::PWSTR;
@@ -131,7 +130,7 @@ fn intern_username_utf16(name: &[u16]) -> String {
 /// Clean up caches by removing entries for PIDs that no longer exist
 /// Delegates to unified cache module
 #[cfg(windows)]
-fn cleanup_stale_caches(current_pids: &std::collections::HashSet<u32>) {
+pub fn cleanup_stale_caches(current_pids: &std::collections::HashSet<u32>) {
     super::cache::CACHE.cleanup(current_pids);
 }
 
@@ -747,150 +746,148 @@ impl ProcessInfo {
         }
     }
 
-    /// Create ProcessInfo from native NtQuerySystemInformation data
-    /// This is significantly faster than sysinfo as it uses a single syscall for all processes.
-    /// Fields not available from NT API (exe_path, command, user, efficiency_mode, is_elevated, arch)
-    /// use cached values or defaults - call enrich_processes() for visible processes to fill them.
-    #[cfg(windows)]
-    pub fn from_native(
-        native_procs: &[NativeProcessInfo],
-        cpu_percentages: &HashMap<u32, f32>,
+    /// Update existing ProcessInfo from raw SystemProcess (avoids reallocation)
+    pub fn update_from_raw(
+        &mut self,
+        proc: &SystemProcess,
+        cpu_percent: f32,
         total_mem: u64,
-    ) -> Vec<ProcessInfo> {
+    ) {
+        self.cpu_percent = cpu_percent;
+        self.mem_percent = if total_mem > 0 {
+            (proc.working_set() as f64 / total_mem as f64 * 100.0) as f32
+        } else {
+            0.0
+        };
+
+        self.virtual_mem = proc.virtual_size();
+        self.resident_mem = proc.working_set();
+        self.shared_mem = proc.working_set().saturating_sub(proc.private_bytes());
+        self.priority = proc.base_priority();
+        self.thread_count = proc.thread_count();
+        self.handle_count = proc.handle_count();
+        self.io_read_bytes = proc.read_bytes();
+        self.io_write_bytes = proc.write_bytes();
+        
+        self.parent_pid = proc.parent_pid();
+
+        let total_100ns = proc.kernel_time() + proc.user_time();
+        self.cpu_time = Duration::new(
+            total_100ns / 10_000_000,
+            ((total_100ns % 10_000_000) * 100) as u32,
+        );
+
+        let (exe_updated, exe_deleted) = check_exe_status(&self.exe_path, self.start_time);
+        self.exe_updated = exe_updated;
+        self.exe_deleted = exe_deleted;
+    }
+
+    /// Create ProcessInfo from raw SystemProcess
+    pub fn from_raw(
+        proc: &SystemProcess,
+        cpu_percent: f32,
+        total_mem: u64,
+    ) -> Self {
         use super::cache::{CACHE, config};
-
-        // Periodically clean up stale PIDs from caches to prevent unbounded growth
-        if CACHE.should_cleanup() {
-            let current_pids: std::collections::HashSet<u32> =
-                native_procs.iter().map(|p| p.pid).collect();
-            cleanup_stale_caches(&current_pids);
-        }
-
-        // Use sequential iteration - the per-item work (cache reads, struct creation) is too
-        // lightweight for parallelization to help
-        // Cache current time once for all processes (avoids syscall per process)
+        
+        let pid = proc.pid();
         let now = std::time::Instant::now();
-
-        // Get unified cache snapshot (single lock acquisition)
         let cache_snapshot = CACHE.snapshot();
+        let cached_entry = cache_snapshot.get(&pid);
 
-        native_procs
-            .iter()
-            .map(|proc| {
-                let pid = proc.pid;
-
-                // Get cached entry from unified snapshot
-                let cached_entry = cache_snapshot.get(&pid);
-
-                // Get cached static info (is_elevated, arch, exe_path) if available
-                let (is_elevated, arch, cached_exe_path) = cached_entry
-                    .and_then(|e| {
-                        match (&e.is_elevated, &e.arch, &e.exe_path) {
-                            (Some(elev), Some(arch), Some(path)) => Some((*elev, *arch, path.clone())),
-                            _ => None,
-                        }
-                    })
-                    .unwrap_or((false, ProcessArch::Native, String::new()));
-
-                // Always use native data for priority/handle_count
-                // These come directly from NtQuerySystemInformation
-                let priority = proc.base_priority;
-                let handle_count = proc.handle_count;
-
-                // Get cached efficiency_mode if available (requires Windows API call to query)
-                let efficiency_mode = cached_entry
-                    .and_then(|e| {
-                        if let (Some(mode), Some(updated)) = (e.efficiency_mode, e.efficiency_updated)
-                            && now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS {
-                                return Some(mode);
-                            }
-                        None
-                    })
-                    .unwrap_or(false);
-
-                // Get cached user if available
-                let user = cached_entry
-                    .and_then(|e| e.user.clone())
-                    .unwrap_or_else(|| {
-                        // Special cases - use interned string
-                        if pid == 0 || pid == 4 {
-                            SYSTEM_STR.to_string()
-                        } else {
-                            "-".to_string()
-                        }
-                    });
-
-                // CPU percentage from pre-calculated delta
-                let cpu_percent = cpu_percentages.get(&pid).copied().unwrap_or(0.0);
-
-                // Memory percentage
-                let mem_percent = if total_mem > 0 {
-                    (proc.working_set as f64 / total_mem as f64 * 100.0) as f32
-                } else {
-                    0.0
-                };
-
-                // Convert kernel+user time to Duration
-                let total_100ns = proc.kernel_time + proc.user_time;
-                let cpu_time = Duration::new(
-                    total_100ns / 10_000_000,
-                    ((total_100ns % 10_000_000) * 100) as u32,
-                );
-
-                // Convert create_time to Unix timestamp
-                let start_time = filetime_to_unix(proc.create_time);
-
-                // Use cached exe_path if available, otherwise fall back to name
-                let (exe_path, command, command_lower) = if !cached_exe_path.is_empty() {
-                    let lower = cached_exe_path.to_lowercase();
-                    (cached_exe_path.clone(), cached_exe_path, lower)
-                } else {
-                    (String::new(), proc.name.clone(), proc.name.to_lowercase())
-                };
-
-                // Check if executable was modified or deleted (htop-style red highlighting)
-                let (exe_updated, exe_deleted) = check_exe_status(&exe_path, start_time);
-
-                // Pre-compute lowercase strings for filtering
-                let name_lower = proc.name.to_lowercase();
-                let user_lower = user.to_lowercase();
-
-                ProcessInfo {
-                    pid,
-                    parent_pid: proc.parent_pid,
-                    name: proc.name.clone(),
-                    exe_path,
-                    command,
-                    user,
-                    status: 'R', // NT API doesn't give us detailed status
-                    cpu_percent,
-                    mem_percent,
-                    virtual_mem: proc.virtual_size,
-                    resident_mem: proc.working_set,
-                    shared_mem: proc.working_set.saturating_sub(proc.private_bytes),
-                    priority,
-                    cpu_time,
-                    tree_depth: 0,
-                    tree_prefix: String::new(),
-                    has_children: false,
-                    is_collapsed: false,
-                    thread_count: proc.thread_count,
-                    start_time,
-                    handle_count,
-                    io_read_bytes: proc.read_bytes,
-                    io_write_bytes: proc.write_bytes,
-                    name_lower,
-                    command_lower,
-                    user_lower,
-                    matches_search: false,
-                    efficiency_mode,
-                    is_elevated,
-                    arch,
-                    exe_updated,
-                    exe_deleted,
+        // Get cached static info
+        let (is_elevated, arch, cached_exe_path) = cached_entry
+            .and_then(|e| {
+                match (&e.is_elevated, &e.arch, &e.exe_path) {
+                    (Some(elev), Some(arch), Some(path)) => Some((*elev, *arch, path.clone())),
+                    _ => None,
                 }
             })
-            .collect()
+            .unwrap_or((false, ProcessArch::Native, String::new()));
+
+        let efficiency_mode = cached_entry
+            .and_then(|e| {
+                if let (Some(mode), Some(updated)) = (e.efficiency_mode, e.efficiency_updated)
+                    && now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS {
+                        return Some(mode);
+                    }
+                None
+            })
+            .unwrap_or(false);
+
+        let user = cached_entry
+            .and_then(|e| e.user.clone())
+            .unwrap_or_else(|| {
+                if pid == 0 || pid == 4 {
+                    SYSTEM_STR.to_string()
+                } else {
+                    "-".to_string()
+                }
+            });
+
+        let mem_percent = if total_mem > 0 {
+            (proc.working_set() as f64 / total_mem as f64 * 100.0) as f32
+        } else {
+            0.0
+        };
+
+        let total_100ns = proc.kernel_time() + proc.user_time();
+        let cpu_time = Duration::new(
+            total_100ns / 10_000_000,
+            ((total_100ns % 10_000_000) * 100) as u32,
+        );
+
+        let start_time = filetime_to_unix(proc.create_time());
+
+        // Parse name only here (allocation)
+        let name = proc.name();
+        
+        let (exe_path, command, command_lower) = if !cached_exe_path.is_empty() {
+            let lower = cached_exe_path.to_lowercase();
+            (cached_exe_path.clone(), cached_exe_path, lower)
+        } else {
+            (String::new(), name.clone(), name.to_lowercase())
+        };
+
+        let (exe_updated, exe_deleted) = check_exe_status(&exe_path, start_time);
+
+        let name_lower = name.to_lowercase();
+        let user_lower = user.to_lowercase();
+
+        ProcessInfo {
+            pid,
+            parent_pid: proc.parent_pid(),
+            name,
+            exe_path,
+            command,
+            user,
+            status: 'R',
+            cpu_percent,
+            mem_percent,
+            virtual_mem: proc.virtual_size(),
+            resident_mem: proc.working_set(),
+            shared_mem: proc.working_set().saturating_sub(proc.private_bytes()),
+            priority: proc.base_priority(),
+            cpu_time,
+            tree_depth: 0,
+            tree_prefix: String::new(),
+            has_children: false,
+            is_collapsed: false,
+            thread_count: proc.thread_count(),
+            start_time,
+            handle_count: proc.handle_count(),
+            io_read_bytes: proc.read_bytes(),
+            io_write_bytes: proc.write_bytes(),
+            name_lower,
+            command_lower,
+            user_lower,
+            matches_search: false,
+            efficiency_mode,
+            is_elevated,
+            arch,
+            exe_updated,
+            exe_deleted,
+        }
     }
 }
 

@@ -824,7 +824,8 @@ impl App {
     pub fn refresh_system(&mut self) {
         // Use native Windows APIs for all system metrics
         self.system_metrics.refresh();
-        self.processes = self.system_metrics.get_processes_native();
+        // Update processes in-place to avoid re-allocating strings
+        self.system_metrics.update_processes_native(&mut self.processes);
         self.update_displayed_processes();
 
         // Update history for graph mode

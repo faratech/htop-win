@@ -8,23 +8,250 @@ use std::os::windows::ffi::OsStringExt;
 use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
 use windows::Win32::Foundation::{HANDLE, UNICODE_STRING};
 
-/// Raw process information from NtQuerySystemInformation
-#[derive(Clone, Debug)]
-pub struct NativeProcessInfo {
-    pub pid: u32,
-    pub parent_pid: u32,
-    pub name: String,
-    pub thread_count: u32,
-    pub handle_count: u32,
-    pub base_priority: i32,
-    pub working_set: u64,
-    pub private_bytes: u64,
-    pub virtual_size: u64,
-    pub kernel_time: u64,   // 100-nanosecond intervals
-    pub user_time: u64,     // 100-nanosecond intervals
-    pub create_time: u64,   // FILETIME as u64
-    pub read_bytes: u64,
-    pub write_bytes: u64,
+// Reusable buffer for NtQuerySystemInformation to avoid repeated allocations
+thread_local! {
+    static QUERY_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(1024 * 1024));
+}
+
+/// Wrapper around raw SystemProcessInfo to provide safe accessors
+pub struct SystemProcess<'a> {
+    info: &'a SystemProcessInfo,
+}
+
+impl<'a> SystemProcess<'a> {
+    pub fn pid(&self) -> u32 {
+        self.info.unique_process_id.0 as usize as u32
+    }
+
+    pub fn parent_pid(&self) -> u32 {
+        self.info.inherited_from_unique_process_id.0 as usize as u32
+    }
+
+    pub fn thread_count(&self) -> u32 {
+        self.info.number_of_threads
+    }
+
+    pub fn handle_count(&self) -> u32 {
+        self.info.handle_count
+    }
+
+    pub fn base_priority(&self) -> i32 {
+        self.info.base_priority
+    }
+
+    pub fn working_set(&self) -> u64 {
+        self.info.working_set_size as u64
+    }
+
+    pub fn private_bytes(&self) -> u64 {
+        self.info.private_page_count as u64
+    }
+
+    pub fn virtual_size(&self) -> u64 {
+        // Use pagefile_usage (committed memory) for VIRT
+        self.info.pagefile_usage as u64
+    }
+
+    pub fn kernel_time(&self) -> u64 {
+        self.info.kernel_time as u64
+    }
+
+    pub fn user_time(&self) -> u64 {
+        self.info.user_time as u64
+    }
+
+    pub fn create_time(&self) -> u64 {
+        self.info.create_time as u64
+    }
+
+    pub fn read_bytes(&self) -> u64 {
+        self.info.read_transfer_count as u64
+    }
+
+    pub fn write_bytes(&self) -> u64 {
+        self.info.write_transfer_count as u64
+    }
+
+    /// Extract name - allocates a new String
+    pub fn name(&self) -> String {
+        if self.info.image_name.Length > 0 && !self.info.image_name.Buffer.is_null() {
+            let slice = unsafe {
+                std::slice::from_raw_parts(
+                    self.info.image_name.Buffer.0,
+                    (self.info.image_name.Length / 2) as usize,
+                )
+            };
+            OsString::from_wide(slice).to_string_lossy().into_owned()
+        } else if self.info.unique_process_id.0 as usize == 0 {
+            "System Idle Process".to_string()
+        } else {
+            "System".to_string()
+        }
+    }
+}
+
+/// Iterator over system processes
+pub struct SystemProcessIterator<'a> {
+    buffer: &'a [u8],
+    offset: usize,
+    finished: bool,
+}
+
+impl<'a> Iterator for SystemProcessIterator<'a> {
+    type Item = SystemProcess<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+
+        if self.offset >= self.buffer.len() {
+            return None;
+        }
+
+        let proc_info = unsafe { &*(self.buffer.as_ptr().add(self.offset) as *const SystemProcessInfo) };
+
+        if proc_info.next_entry_offset == 0 {
+            self.finished = true;
+        } else {
+            self.offset += proc_info.next_entry_offset as usize;
+        }
+
+        Some(SystemProcess { info: proc_info })
+    }
+}
+
+/// Helper struct to access the process list
+pub struct SystemProcessList<'a> {
+    buffer: &'a [u8],
+}
+
+impl<'a> SystemProcessList<'a> {
+    pub fn iter(&self) -> SystemProcessIterator<'a> {
+        SystemProcessIterator {
+            buffer: self.buffer,
+            offset: 0,
+            finished: false,
+        }
+    }
+}
+
+/// Execute a closure with access to the system process list
+/// This handles buffer management and syscalls
+pub fn with_process_list<F, R>(f: F) -> R
+where
+    F: FnOnce(SystemProcessList) -> R,
+{
+    QUERY_BUFFER.with(|buf| {
+        let mut buffer = buf.borrow_mut();
+        // Clear buffer but keep capacity
+        buffer.clear();
+        let cap = buffer.capacity();
+        if cap < 1024 * 1024 {
+            buffer.reserve(1024 * 1024 - cap);
+        }
+        
+        // Ensure we have some zeroed space if resize is needed? 
+        // Actually resize will zero initialize.
+        // But we want to call with current capacity first? 
+        // No, standard pattern is to resize to expected size.
+        let new_cap = buffer.capacity();
+        buffer.resize(new_cap, 0);
+
+        let mut return_length: u32 = 0;
+
+        // Query system process information
+        loop {
+            let status = unsafe {
+                NtQuerySystemInformation(
+                    SystemProcessInformation,
+                    buffer.as_mut_ptr() as *mut _,
+                    buffer.len() as u32,
+                    &mut return_length,
+                )
+            };
+
+            if status.is_ok() {
+                break;
+            }
+
+            // STATUS_INFO_LENGTH_MISMATCH - need bigger buffer
+            if status.0 as u32 == 0xC0000004 {
+                buffer.resize(return_length as usize + 65536, 0);
+                continue;
+            }
+
+            // Other error - return empty result
+            // We pass an empty slice in this case
+            return f(SystemProcessList { buffer: &[] });
+        }
+
+        f(SystemProcessList { buffer: &buffer })
+    })
+}
+
+// Keep NativeProcessInfo for compatibility if needed, or remove if unused.
+// It was used in from_native, so we might need a version of it or update from_native.
+// We'll update from_native to use SystemProcess.
+
+// Helper for CPU calculation that works with iterator
+pub fn calculate_cpu_percentages_from_iter(
+    list: &SystemProcessList,
+    total_cpu_delta: u64,
+) -> HashMap<u32, f32> {
+    use super::cache::CACHE;
+
+    let now = std::time::Instant::now();
+    let mut cpu_percentages = HashMap::with_capacity(500); // Estimate
+
+    // Get snapshot of CPU times from unified cache
+    let cache_snapshot = CACHE.snapshot();
+    let mut updates = Vec::with_capacity(500);
+
+    for proc in list.iter() {
+        let pid = proc.pid();
+        
+        // System Idle Process (PID 0) represents idle CPU time, not actual work
+        if pid == 0 {
+            cpu_percentages.insert(0, 0.0);
+            continue;
+        }
+
+        let total_time = proc.kernel_time() + proc.user_time();
+
+        let cpu_percent = if let Some(entry) = cache_snapshot.get(&pid) {
+            let prev_total = entry.kernel_time + entry.user_time;
+            let time_delta = total_time.saturating_sub(prev_total);
+            let elapsed = now.duration_since(entry.cpu_time_updated).as_nanos() as u64;
+
+            if elapsed > 0 && total_cpu_delta > 0 {
+                // CPU percentage relative to total system CPU time
+                (time_delta as f64 / total_cpu_delta as f64 * 100.0) as f32
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+
+        cpu_percentages.insert(pid, cpu_percent);
+        
+        updates.push((pid, proc.kernel_time(), proc.user_time(), proc.create_time()));
+    }
+
+    // Batch update cache
+    CACHE.update_cpu_times_batch(&updates);
+
+    cpu_percentages
+}
+
+/// Convert FILETIME (100-ns intervals since 1601) to Unix timestamp
+#[inline]
+pub fn filetime_to_unix(filetime: u64) -> u64 {
+    // FILETIME epoch: January 1, 1601
+    // Unix epoch: January 1, 1970
+    // Difference: 116444736000000000 100-nanosecond intervals
+    filetime.saturating_sub(116444736000000000) / 10_000_000
 }
 
 // SYSTEM_PROCESS_INFORMATION with actual field layout
@@ -66,174 +293,5 @@ struct SystemProcessInfo {
     read_transfer_count: i64,
     write_transfer_count: i64,
     other_transfer_count: i64,
-}
-
-// CPU time cache is now in cache.rs module
-
-// Reusable buffer for NtQuerySystemInformation to avoid repeated allocations
-thread_local! {
-    static QUERY_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(1024 * 1024));
-}
-
-/// Query all processes using NtQuerySystemInformation (single syscall)
-pub fn query_all_processes() -> Vec<NativeProcessInfo> {
-    QUERY_BUFFER.with(|buf| {
-        let mut buffer = buf.borrow_mut();
-        // Clear the buffer to ensure fresh data on each call
-        // This is critical - without clearing, stale data from previous calls may persist
-        buffer.clear();
-        let cap = buffer.capacity();
-        if cap < 1024 * 1024 {
-            buffer.reserve(1024 * 1024 - cap);
-        }
-        let new_cap = buffer.capacity();
-        buffer.resize(new_cap, 0);
-        query_all_processes_with_buffer(&mut buffer)
-    })
-}
-
-fn query_all_processes_with_buffer(buffer: &mut Vec<u8>) -> Vec<NativeProcessInfo> {
-    let mut return_length: u32 = 0;
-
-    // Query system process information
-    loop {
-        let status = unsafe {
-            NtQuerySystemInformation(
-                SystemProcessInformation,
-                buffer.as_mut_ptr() as *mut _,
-                buffer.len() as u32,
-                &mut return_length,
-            )
-        };
-
-        if status.is_ok() {
-            break;
-        }
-
-        // STATUS_INFO_LENGTH_MISMATCH - need bigger buffer
-        if status.0 as u32 == 0xC0000004 {
-            buffer.resize(return_length as usize + 65536, 0);
-            continue;
-        }
-
-        // Other error
-        return Vec::new();
-    }
-
-    let mut processes = Vec::with_capacity(500);
-    let mut offset: usize = 0;
-
-    loop {
-        let proc_info = unsafe { &*(buffer.as_ptr().add(offset) as *const SystemProcessInfo) };
-
-        // Extract process name from UNICODE_STRING
-        let name = if proc_info.image_name.Length > 0 && !proc_info.image_name.Buffer.is_null() {
-            let slice = unsafe {
-                std::slice::from_raw_parts(
-                    proc_info.image_name.Buffer.0,
-                    (proc_info.image_name.Length / 2) as usize,
-                )
-            };
-            OsString::from_wide(slice).to_string_lossy().into_owned()
-        } else if proc_info.unique_process_id.0 as usize == 0 {
-            "System Idle Process".to_string()
-        } else {
-            "System".to_string()
-        };
-
-        let pid = proc_info.unique_process_id.0 as usize as u32;
-        let parent_pid = proc_info.inherited_from_unique_process_id.0 as usize as u32;
-
-        let kernel_time = proc_info.kernel_time as u64;
-        let user_time = proc_info.user_time as u64;
-
-        processes.push(NativeProcessInfo {
-            pid,
-            parent_pid,
-            name,
-            thread_count: proc_info.number_of_threads,
-            handle_count: proc_info.handle_count,
-            base_priority: proc_info.base_priority,
-            working_set: proc_info.working_set_size as u64,
-            private_bytes: proc_info.private_page_count as u64,
-            // Use pagefile_usage (committed memory) for VIRT, not virtual_size (total address space)
-            // virtual_size can be 2TB+ on 64-bit which confuses users
-            // pagefile_usage matches Task Manager's "Commit size"
-            virtual_size: proc_info.pagefile_usage as u64,
-            kernel_time,
-            user_time,
-            create_time: proc_info.create_time as u64,
-            read_bytes: proc_info.read_transfer_count as u64,
-            write_bytes: proc_info.write_transfer_count as u64,
-        });
-
-        if proc_info.next_entry_offset == 0 {
-            break;
-        }
-        offset += proc_info.next_entry_offset as usize;
-    }
-
-    processes
-}
-
-/// Calculate CPU percentage using delta from previous measurement
-pub fn calculate_cpu_percentages(
-    processes: &mut [NativeProcessInfo],
-    total_cpu_delta: u64,
-) -> HashMap<u32, f32> {
-    use super::cache::CACHE;
-
-    let now = std::time::Instant::now();
-    let mut cpu_percentages = HashMap::with_capacity(processes.len());
-
-    // Get snapshot of CPU times from unified cache
-    let cache_snapshot = CACHE.snapshot();
-
-    for proc in processes.iter() {
-        // System Idle Process (PID 0) represents idle CPU time, not actual work
-        if proc.pid == 0 {
-            cpu_percentages.insert(0, 0.0);
-            continue;
-        }
-
-        let total_time = proc.kernel_time + proc.user_time;
-
-        let cpu_percent = if let Some(entry) = cache_snapshot.get(&proc.pid) {
-            let prev_total = entry.kernel_time + entry.user_time;
-            let time_delta = total_time.saturating_sub(prev_total);
-            let elapsed = now.duration_since(entry.cpu_time_updated).as_nanos() as u64;
-
-            if elapsed > 0 && total_cpu_delta > 0 {
-                // CPU percentage relative to total system CPU time
-                (time_delta as f64 / total_cpu_delta as f64 * 100.0) as f32
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
-
-        cpu_percentages.insert(proc.pid, cpu_percent);
-    }
-
-    // Batch update cache with current times (single lock acquisition)
-    // Include create_time to detect PID reuse
-    let updates: Vec<(u32, u64, u64, u64)> = processes
-        .iter()
-        .map(|p| (p.pid, p.kernel_time, p.user_time, p.create_time))
-        .collect();
-    CACHE.update_cpu_times_batch(&updates);
-
-    cpu_percentages
-}
-
-
-/// Convert FILETIME (100-ns intervals since 1601) to Unix timestamp
-#[inline]
-pub fn filetime_to_unix(filetime: u64) -> u64 {
-    // FILETIME epoch: January 1, 1601
-    // Unix epoch: January 1, 1970
-    // Difference: 116444736000000000 100-nanosecond intervals
-    filetime.saturating_sub(116444736000000000) / 10_000_000
 }
 
