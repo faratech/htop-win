@@ -269,13 +269,20 @@ pub fn get_latest_release() -> Option<(String, String)> {
 
     // Find asset URL
     // Look for "browser_download_url": "..." that ends with target_suffix
+    // Note: Can't split on ':' because URLs contain "https:"
     let mut download_url = String::new();
     for part in json_text.split("\"browser_download_url\"") {
-        if let Some(url_part) = part.split(':').nth(1) {
-            if let Some(url) = url_part.split("\"").nth(1) {
-                if url.ends_with(&target_suffix) {
-                    download_url = url.to_string();
-                    break;
+        // Part starts with: ": "https://..." or similar
+        // Extract the first quoted string after the colon-space separator
+        if let Some(after_colon) = part.split_once(':') {
+            // after_colon.1 is everything after the first ':', e.g. ' "https://...foo.exe",...'
+            let rest = after_colon.1.trim();
+            if rest.starts_with('"') {
+                if let Some(url) = rest[1..].split('"').next() {
+                    if url.ends_with(&target_suffix) {
+                        download_url = url.to_string();
+                        break;
+                    }
                 }
             }
         }
@@ -284,11 +291,14 @@ pub fn get_latest_release() -> Option<(String, String)> {
     // Fallback: if specific arch not found, try any .exe
     if download_url.is_empty() {
         for part in json_text.split("\"browser_download_url\"") {
-            if let Some(url_part) = part.split(':').nth(1) {
-                if let Some(url) = url_part.split("\"").nth(1) {
-                    if url.ends_with(".exe") {
-                        download_url = url.to_string();
-                        break;
+            if let Some(after_colon) = part.split_once(':') {
+                let rest = after_colon.1.trim();
+                if rest.starts_with('"') {
+                    if let Some(url) = rest[1..].split('"').next() {
+                        if url.ends_with(".exe") {
+                            download_url = url.to_string();
+                            break;
+                        }
                     }
                 }
             }
