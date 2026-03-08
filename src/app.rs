@@ -437,7 +437,7 @@ impl SortColumn {
             SortColumn::Arch => 5,
             SortColumn::Efficiency => 4,
             SortColumn::HandleCount => 6,
-            SortColumn::IoRate => 7,
+            SortColumn::IoRate => 8,
             SortColumn::IoReadRate => 7,
             SortColumn::IoWriteRate => 7,
             SortColumn::IoRead => 7,
