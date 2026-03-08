@@ -715,10 +715,6 @@ impl App {
 
     /// Update the cached visible columns from the active screen tab
     pub fn update_visible_columns_cache(&mut self) {
-        // Sync config.visible_columns to the active tab (column config dialog modifies config)
-        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
-            tab.columns = self.config.visible_columns.clone();
-        }
         let columns = if let Some(tab) = self.screen_tabs.get(self.active_tab) {
             &tab.columns
         } else {
@@ -728,6 +724,83 @@ impl App {
             .iter()
             .filter_map(|name| SortColumn::from_name(name))
             .collect();
+    }
+
+    /// Get the active tab's columns (for column config dialog)
+    pub fn active_tab_columns(&self) -> &[String] {
+        if let Some(tab) = self.screen_tabs.get(self.active_tab) {
+            &tab.columns
+        } else {
+            &self.config.visible_columns
+        }
+    }
+
+    /// Check if a column is visible in the active tab
+    pub fn is_column_visible_in_active_tab(&self, column: &str) -> bool {
+        self.active_tab_columns().iter().any(|c| c == column)
+    }
+
+    /// Get the position of a column in the active tab's visible order
+    pub fn column_position_in_active_tab(&self, column: &str) -> Option<usize> {
+        self.active_tab_columns().iter().position(|c| c == column)
+    }
+
+    /// Toggle a column's visibility in the active tab
+    pub fn toggle_column_in_active_tab(&mut self, column: &str) {
+        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
+            if let Some(pos) = tab.columns.iter().position(|c| c == column) {
+                tab.columns.remove(pos);
+            } else {
+                tab.columns.push(column.to_string());
+            }
+        }
+        self.sync_config_from_active_tab();
+        self.update_visible_columns_cache();
+    }
+
+    /// Move a column up in the active tab's order
+    pub fn move_column_up_in_active_tab(&mut self, column: &str) -> bool {
+        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
+            if let Some(pos) = tab.columns.iter().position(|c| c == column)
+                && pos > 0 {
+                    tab.columns.swap(pos, pos - 1);
+                    self.sync_config_from_active_tab();
+                    self.update_visible_columns_cache();
+                    return true;
+                }
+        }
+        false
+    }
+
+    /// Move a column down in the active tab's order
+    pub fn move_column_down_in_active_tab(&mut self, column: &str) -> bool {
+        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
+            if let Some(pos) = tab.columns.iter().position(|c| c == column)
+                && pos < tab.columns.len() - 1 {
+                    tab.columns.swap(pos, pos + 1);
+                    self.sync_config_from_active_tab();
+                    self.update_visible_columns_cache();
+                    return true;
+                }
+        }
+        false
+    }
+
+    /// Sync config.visible_columns from the active tab (for backward compat with config file)
+    fn sync_config_from_active_tab(&mut self) {
+        if let Some(tab) = self.screen_tabs.get(self.active_tab) {
+            self.config.visible_columns = tab.columns.clone();
+        }
+    }
+
+    /// Reset screen tabs to defaults and apply
+    pub fn reset_screen_tabs(&mut self) {
+        self.screen_tabs = vec![
+            ScreenTab::default_main(&Config::default()),
+            ScreenTab::default_io(),
+        ];
+        self.active_tab = 0;
+        self.apply_active_tab();
     }
 
     /// Update the color theme from config
@@ -741,8 +814,8 @@ impl App {
         if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
             tab.sort_column = self.sort_column;
             tab.sort_ascending = self.sort_ascending;
-            tab.columns = self.config.visible_columns.clone();
         }
+        self.sync_config_from_active_tab();
         self.config.screen_tabs = Some(self.screen_tabs.clone());
         if let Err(e) = self.config.save() {
             eprintln!("Failed to save config: {}", e);

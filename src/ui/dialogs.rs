@@ -879,10 +879,10 @@ pub fn draw_column_config(frame: &mut Frame, app: &App) {
         .enumerate()
         .map(|(idx, col)| {
             let col_name = col.name();
-            let is_visible = app.config.is_column_visible(col_name);
+            let is_visible = app.is_column_visible_in_active_tab(col_name);
             let checkbox = if is_visible { "[✓]" } else { "[ ]" };
             // Show position in visible order if visible
-            let order_str = if let Some(pos) = app.config.column_position(col_name) {
+            let order_str = if let Some(pos) = app.column_position_in_active_tab(col_name) {
                 format!("{:>2}", pos + 1)
             } else {
                 "  ".to_string()

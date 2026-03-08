@@ -603,6 +603,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                 12 => {
                     // Reset all settings to defaults
                     app.config.reset_to_defaults();
+                    app.reset_screen_tabs();
                     app.update_theme();
                     app.update_visible_columns_cache();
                     app.save_config();
@@ -796,8 +797,7 @@ fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
                 // Shift+Up: Move column up in order
                 if let Some(col) = all_columns.get(app.column_config_index) {
                     let col_name = col.name().to_string();
-                    if app.config.move_column_up(&col_name) {
-                        app.update_visible_columns_cache();
+                    if app.move_column_up_in_active_tab(&col_name) {
                         app.save_config();
                     }
                 }
@@ -813,8 +813,7 @@ fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
                 // Shift+Down: Move column down in order
                 if let Some(col) = all_columns.get(app.column_config_index) {
                     let col_name = col.name().to_string();
-                    if app.config.move_column_down(&col_name) {
-                        app.update_visible_columns_cache();
+                    if app.move_column_down_in_active_tab(&col_name) {
                         app.save_config();
                     }
                 }
@@ -826,11 +825,10 @@ fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
             }
         }
         KeyCode::Char(' ') | KeyCode::Enter => {
-            // Toggle column visibility
+            // Toggle column visibility in active tab
             if let Some(col) = all_columns.get(app.column_config_index) {
                 let col_name = col.name().to_string();
-                app.config.toggle_column(&col_name);
-                app.update_visible_columns_cache();
+                app.toggle_column_in_active_tab(&col_name);
                 app.save_config();
             }
         }

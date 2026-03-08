@@ -466,45 +466,6 @@ impl Config {
         Value::Object(map)
     }
 
-    /// Check if a column should be visible
-    pub fn is_column_visible(&self, column: &str) -> bool {
-        self.visible_columns.iter().any(|c| c == column)
-    }
-
-    /// Toggle a column's visibility
-    pub fn toggle_column(&mut self, column: &str) {
-        if let Some(pos) = self.visible_columns.iter().position(|c| c == column) {
-            self.visible_columns.remove(pos);
-        } else {
-            self.visible_columns.push(column.to_string());
-        }
-    }
-
-    /// Move a visible column up in the order (returns true if moved)
-    pub fn move_column_up(&mut self, column: &str) -> bool {
-        if let Some(pos) = self.visible_columns.iter().position(|c| c == column)
-            && pos > 0 {
-                self.visible_columns.swap(pos, pos - 1);
-                return true;
-            }
-        false
-    }
-
-    /// Move a visible column down in the order (returns true if moved)
-    pub fn move_column_down(&mut self, column: &str) -> bool {
-        if let Some(pos) = self.visible_columns.iter().position(|c| c == column)
-            && pos < self.visible_columns.len() - 1 {
-                self.visible_columns.swap(pos, pos + 1);
-                return true;
-            }
-        false
-    }
-
-    /// Get the position of a column in the visible order (None if not visible)
-    pub fn column_position(&self, column: &str) -> Option<usize> {
-        self.visible_columns.iter().position(|c| c == column)
-    }
-
     /// Reset all settings to defaults
     pub fn reset_to_defaults(&mut self) {
         *self = Self::default();
