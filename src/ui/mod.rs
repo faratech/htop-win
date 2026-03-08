@@ -5,7 +5,7 @@ mod header;
 mod process_list;
 
 use crate::terminal::{
-    Block, Constraint, Direction, Frame, Layout, Rect, Style,
+    Block, Constraint, Direction, Frame, Layout, Line, Modifier, Paragraph, Rect, Span, Style,
 };
 
 use crate::app::{App, ColumnBounds, SortColumn, ViewMode};
@@ -22,18 +22,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let bg_block = Block::default().style(Style::default().bg(theme.background));
     frame.render_widget(bg_block, size);
 
-    // Main layout: header, process list, footer
+    // Main layout: header, tab bar, process list, footer
     // Header is hidden if app.show_header is false
     let header_height = if app.show_header {
         header::calculate_header_height(app)
     } else {
         0
     };
+    let tab_bar_height = if app.screen_tabs.len() > 1 { 1 } else { 0 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(header_height),
+            Constraint::Length(tab_bar_height),
             Constraint::Min(5),
             Constraint::Length(2),
         ])
@@ -42,27 +44,34 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Update UI bounds for mouse/keyboard navigation
     app.ui_bounds.header_y_start = 0;
     app.ui_bounds.header_y_end = if app.show_header { chunks[0].y + chunks[0].height } else { 0 };
-    app.ui_bounds.column_header_y = chunks[1].y;
-    app.ui_bounds.process_list_y_start = chunks[1].y + 1; // +1 to skip header row
-    app.ui_bounds.process_list_y_end = chunks[1].y + chunks[1].height;
-    app.ui_bounds.footer_y_start = chunks[2].y;
+    app.ui_bounds.tab_bar_y = chunks[1].y;
+    app.ui_bounds.tab_bar_visible = tab_bar_height > 0;
+    app.ui_bounds.column_header_y = chunks[2].y;
+    app.ui_bounds.process_list_y_start = chunks[2].y + 1; // +1 to skip header row
+    app.ui_bounds.process_list_y_end = chunks[2].y + chunks[2].height;
+    app.ui_bounds.footer_y_start = chunks[3].y;
 
     // Calculate column bounds using the same constraint resolution as the Table widget
-    app.ui_bounds.columns = calculate_column_bounds(&app.cached_visible_columns, chunks[1]);
+    app.ui_bounds.columns = calculate_column_bounds(&app.cached_visible_columns, chunks[2]);
 
     // Draw header (CPU bars, memory, etc.) if visible
     if app.show_header {
         header::draw(frame, app, chunks[0]);
     }
 
+    // Draw tab bar (if multiple tabs)
+    if tab_bar_height > 0 {
+        draw_tab_bar(frame, app, chunks[1]);
+    }
+
     // Store visible height for scrolling calculations
-    app.visible_height = chunks[1].height.saturating_sub(1) as usize;
+    app.visible_height = chunks[2].height.saturating_sub(1) as usize;
 
     // Draw process list
-    process_list::draw(frame, app, chunks[1]);
+    process_list::draw(frame, app, chunks[2]);
 
     // Draw footer (function keys)
-    footer::draw(frame, app, chunks[2]);
+    footer::draw(frame, app, chunks[3]);
 
     // Draw dialog overlays if needed
     match app.view_mode {
@@ -89,6 +98,55 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         && time.elapsed() < std::time::Duration::from_secs(5) {
             dialogs::draw_error(frame, error);
         }
+}
+
+/// Draw the screen tab bar (like htop's [Main] [I/O] tabs)
+fn draw_tab_bar(frame: &mut Frame, app: &mut App, area: Rect) {
+    use crate::app::{UIElement, UIRegion};
+    let theme = &app.theme;
+    let mut spans: Vec<Span> = Vec::new();
+    let mut x_pos = area.x + 1; // Start after leading space
+
+    // Add a leading space
+    spans.push(Span::raw(" "));
+
+    for (i, tab) in app.screen_tabs.iter().enumerate() {
+        let is_active = i == app.active_tab;
+        let label = format!("[{}]", tab.name);
+        let label_width = label.len() as u16;
+
+        if is_active {
+            // Active tab: same as htop - bold with selection colors
+            spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(theme.selection_fg)
+                    .bg(theme.selection_bg)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            // Inactive tab: dim
+            spans.push(Span::styled(
+                label,
+                Style::default()
+                    .fg(theme.text_dim)
+                    .bg(theme.background),
+            ));
+        }
+
+        // Register click region for this tab
+        app.ui_bounds.add_region(UIRegion::new(
+            UIElement::ScreenTab(i),
+            x_pos, area.y, label_width, 1,
+        ));
+
+        x_pos += label_width + 1; // +1 for space separator
+        spans.push(Span::raw(" "));
+    }
+
+    let line = Line::from(spans);
+    let paragraph = Paragraph::new(line).style(Style::default().bg(theme.background));
+    frame.render_widget(paragraph, area);
 }
 
 /// Center a rectangle within another

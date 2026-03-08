@@ -62,16 +62,16 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::F(10) | KeyCode::Char('q') | KeyCode::Char('Q') => return true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
 
-        // Tab navigation between regions
+        // Tab: switch screen tabs (like htop's Main/I/O tabs)
         KeyCode::Tab => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
-                app.cycle_focus_prev();
+                app.prev_screen_tab();
             } else {
-                app.cycle_focus_next();
+                app.next_screen_tab();
             }
         }
         KeyCode::BackTab => {
-            app.cycle_focus_prev();
+            app.prev_screen_tab();
         }
 
         // Redraw screen (Ctrl+L)
@@ -1146,6 +1146,19 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
                     app.selected_index = actual_index;
                     // Open kill dialog
                     app.enter_kill_mode();
+                }
+            }
+
+            // Screen tab click - switch tab
+            (UIElement::ScreenTab(tab_index), UIAction::Click) => {
+                if *tab_index != app.active_tab {
+                    // Save current tab state
+                    if let Some(tab) = app.screen_tabs.get_mut(app.active_tab) {
+                        tab.sort_column = app.sort_column;
+                        tab.sort_ascending = app.sort_ascending;
+                    }
+                    app.active_tab = *tab_index;
+                    app.apply_active_tab();
                 }
             }
 

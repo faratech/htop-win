@@ -23,6 +23,8 @@ pub enum UIElement {
     ProcessRow { index: usize, pid: u32 },
     /// Footer function key (F1-F10)
     FunctionKey(u8),
+    /// Screen tab (index in screen_tabs array)
+    ScreenTab(usize),
     /// Generic header area
     Header,
     /// Generic footer area
@@ -44,6 +46,7 @@ pub enum UIAction {
 
 /// Major UI regions for keyboard navigation
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[allow(dead_code)]
 pub enum FocusRegion {
     /// Header meters (CPU, Memory, Swap)
     Header,
@@ -174,6 +177,11 @@ pub struct UIBounds {
     pub header_y_start: u16,
     pub header_y_end: u16,
 
+    /// Tab bar row (y coordinate, 0 if no tab bar)
+    pub tab_bar_y: u16,
+    /// Whether tab bar is visible
+    pub tab_bar_visible: bool,
+
     /// Process list column headers
     pub column_header_y: u16,
     pub columns: Vec<ColumnBounds>,
@@ -232,6 +240,8 @@ impl UIBounds {
         if y < self.header_y_end {
             return Some(UIElement::Header);
         }
+
+        // Tab bar area is handled by registered regions (checked above)
 
         if y == self.column_header_y
             && let Some(col) = self.column_at_x(x) {
@@ -302,9 +312,16 @@ pub enum SortColumn {
     StartTime,
     Command,
     // Windows-specific sort columns
-    Elevated,   // Running as admin
-    Arch,       // Process architecture (x86/x64/ARM)
-    Efficiency, // Efficiency mode (EcoQoS)
+    Elevated,    // Running as admin
+    Arch,        // Process architecture (x86/x64/ARM)
+    Efficiency,  // Efficiency mode (EcoQoS)
+    // I/O columns
+    HandleCount, // Number of open handles
+    IoRate,      // Combined I/O rate (read + write per refresh)
+    IoReadRate,  // I/O read bytes per refresh
+    IoWriteRate, // I/O write bytes per refresh
+    IoRead,      // Cumulative I/O read bytes
+    IoWrite,     // Cumulative I/O write bytes
 }
 
 impl SortColumn {
@@ -328,6 +345,12 @@ impl SortColumn {
             SortColumn::Elevated,
             SortColumn::Arch,
             SortColumn::Efficiency,
+            SortColumn::HandleCount,
+            SortColumn::IoRate,
+            SortColumn::IoReadRate,
+            SortColumn::IoWriteRate,
+            SortColumn::IoRead,
+            SortColumn::IoWrite,
         ]
     }
 
@@ -351,6 +374,12 @@ impl SortColumn {
             SortColumn::Elevated => "ELEV",
             SortColumn::Arch => "ARCH",
             SortColumn::Efficiency => "ECO",
+            SortColumn::HandleCount => "HNDL",
+            SortColumn::IoRate => "IO_RATE",
+            SortColumn::IoReadRate => "IO_R/s",
+            SortColumn::IoWriteRate => "IO_W/s",
+            SortColumn::IoRead => "IO_RD",
+            SortColumn::IoWrite => "IO_WR",
         }
     }
 
@@ -376,6 +405,12 @@ impl SortColumn {
             "ELEV" => Some(SortColumn::Elevated),
             "ARCH" => Some(SortColumn::Arch),
             "ECO" => Some(SortColumn::Efficiency),
+            "HNDL" => Some(SortColumn::HandleCount),
+            "IO_RATE" => Some(SortColumn::IoRate),
+            "IO_R/s" => Some(SortColumn::IoReadRate),
+            "IO_W/s" => Some(SortColumn::IoWriteRate),
+            "IO_RD" => Some(SortColumn::IoRead),
+            "IO_WR" => Some(SortColumn::IoWrite),
             _ => None,
         }
     }
@@ -401,6 +436,43 @@ impl SortColumn {
             SortColumn::Elevated => 4,
             SortColumn::Arch => 5,
             SortColumn::Efficiency => 4,
+            SortColumn::HandleCount => 6,
+            SortColumn::IoRate => 7,
+            SortColumn::IoReadRate => 7,
+            SortColumn::IoWriteRate => 7,
+            SortColumn::IoRead => 7,
+            SortColumn::IoWrite => 7,
+        }
+    }
+}
+
+/// A screen tab with its own column set and sort settings (like htop's Main/I/O tabs)
+#[derive(Clone, Debug)]
+pub struct ScreenTab {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub sort_column: SortColumn,
+    pub sort_ascending: bool,
+}
+
+impl ScreenTab {
+    pub fn default_main(config: &Config) -> Self {
+        Self {
+            name: "Main".to_string(),
+            columns: config.visible_columns.clone(),
+            sort_column: SortColumn::Cpu,
+            sort_ascending: false,
+        }
+    }
+
+    pub fn default_io() -> Self {
+        Self {
+            name: "I/O".to_string(),
+            columns: vec![
+                "PID", "USER", "IO_RATE", "IO_R/s", "IO_W/s", "HNDL", "Command",
+            ].into_iter().map(String::from).collect(),
+            sort_column: SortColumn::IoRate,
+            sort_ascending: false,
         }
     }
 }
@@ -449,6 +521,10 @@ pub struct App {
     pub sort_column: SortColumn,
     /// Sort ascending
     pub sort_ascending: bool,
+    /// Screen tabs (like htop's Main/I/O tabs)
+    pub screen_tabs: Vec<ScreenTab>,
+    /// Active screen tab index
+    pub active_tab: usize,
     /// Tree view enabled
     pub tree_view: bool,
     /// Search string
@@ -559,6 +635,10 @@ impl App {
         let theme = config.theme();
         let tree_view = config.tree_view_default;
         let visible_columns = Self::compute_visible_columns(&config);
+        let screen_tabs = config.screen_tabs.clone().unwrap_or_else(|| vec![
+            ScreenTab::default_main(&config),
+            ScreenTab::default_io(),
+        ]);
         Self {
             config,
             theme,
@@ -619,6 +699,8 @@ impl App {
             update_checked: false,
             focus_region: FocusRegion::default(),
             focus_index: 0,
+            screen_tabs,
+            active_tab: 0,
         }
     }
 
@@ -631,9 +713,21 @@ impl App {
             .collect()
     }
 
-    /// Update the cached visible columns (call when column config changes)
+    /// Update the cached visible columns from the active screen tab
     pub fn update_visible_columns_cache(&mut self) {
-        self.cached_visible_columns = Self::compute_visible_columns(&self.config);
+        // Sync config.visible_columns to the active tab (column config dialog modifies config)
+        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
+            tab.columns = self.config.visible_columns.clone();
+        }
+        let columns = if let Some(tab) = self.screen_tabs.get(self.active_tab) {
+            &tab.columns
+        } else {
+            &self.config.visible_columns
+        };
+        self.cached_visible_columns = columns
+            .iter()
+            .filter_map(|name| SortColumn::from_name(name))
+            .collect();
     }
 
     /// Update the color theme from config
@@ -641,35 +735,68 @@ impl App {
         self.theme = self.config.theme();
     }
 
-    /// Save the current configuration
-    pub fn save_config(&self) {
+    /// Save the current configuration (syncs screen tab state first)
+    pub fn save_config(&mut self) {
+        // Sync current sort settings to active tab before saving
+        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
+            tab.sort_column = self.sort_column;
+            tab.sort_ascending = self.sort_ascending;
+            tab.columns = self.config.visible_columns.clone();
+        }
+        self.config.screen_tabs = Some(self.screen_tabs.clone());
         if let Err(e) = self.config.save() {
             eprintln!("Failed to save config: {}", e);
         }
     }
 
     // =========================================================================
-    // Keyboard Navigation
+    // Screen Tab Navigation
     // =========================================================================
 
-    /// Cycle focus to the next UI region (Tab key)
-    pub fn cycle_focus_next(&mut self) {
-        self.focus_region = match self.focus_region {
-            FocusRegion::Header => FocusRegion::ProcessList,
-            FocusRegion::ProcessList => FocusRegion::Footer,
-            FocusRegion::Footer => FocusRegion::Header,
-        };
-        self.focus_index = 0;
+    /// Switch to next screen tab (Tab key, like htop)
+    pub fn next_screen_tab(&mut self) {
+        if self.screen_tabs.len() <= 1 {
+            return;
+        }
+        // Save current sort settings to active tab
+        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
+            tab.sort_column = self.sort_column;
+            tab.sort_ascending = self.sort_ascending;
+        }
+        self.active_tab = (self.active_tab + 1) % self.screen_tabs.len();
+        self.apply_active_tab();
     }
 
-    /// Cycle focus to the previous UI region (Shift+Tab key)
-    pub fn cycle_focus_prev(&mut self) {
-        self.focus_region = match self.focus_region {
-            FocusRegion::Header => FocusRegion::Footer,
-            FocusRegion::ProcessList => FocusRegion::Header,
-            FocusRegion::Footer => FocusRegion::ProcessList,
+    /// Switch to previous screen tab (Shift+Tab key, like htop)
+    pub fn prev_screen_tab(&mut self) {
+        if self.screen_tabs.len() <= 1 {
+            return;
+        }
+        // Save current sort settings to active tab
+        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
+            tab.sort_column = self.sort_column;
+            tab.sort_ascending = self.sort_ascending;
+        }
+        self.active_tab = if self.active_tab == 0 {
+            self.screen_tabs.len() - 1
+        } else {
+            self.active_tab - 1
         };
-        self.focus_index = 0;
+        self.apply_active_tab();
+    }
+
+    /// Apply the active tab's settings (sort, columns)
+    pub fn apply_active_tab(&mut self) {
+        if let Some(tab) = self.screen_tabs.get(self.active_tab) {
+            self.sort_column = tab.sort_column;
+            self.sort_ascending = tab.sort_ascending;
+            // Sync config.visible_columns so column config dialog shows the right columns
+            self.config.visible_columns = tab.columns.clone();
+        }
+        self.cached_visible_columns = self.config.visible_columns
+            .iter()
+            .filter_map(|name| SortColumn::from_name(name))
+            .collect();
     }
 
     /// Navigate left within the current focus region
@@ -1034,6 +1161,12 @@ impl App {
                         SortColumn::Elevated => a.is_elevated.cmp(&b.is_elevated),
                         SortColumn::Arch => a.arch.as_str().cmp(b.arch.as_str()),
                         SortColumn::Efficiency => a.efficiency_mode.cmp(&b.efficiency_mode),
+                        SortColumn::HandleCount => a.handle_count.cmp(&b.handle_count),
+                        SortColumn::IoRate => (a.io_read_rate + a.io_write_rate).cmp(&(b.io_read_rate + b.io_write_rate)),
+                        SortColumn::IoReadRate => a.io_read_rate.cmp(&b.io_read_rate),
+                        SortColumn::IoWriteRate => a.io_write_rate.cmp(&b.io_write_rate),
+                        SortColumn::IoRead => a.io_read_bytes.cmp(&b.io_read_bytes),
+                        SortColumn::IoWrite => a.io_write_bytes.cmp(&b.io_write_bytes),
                         // Already handled above
                         SortColumn::Cpu | SortColumn::Mem | SortColumn::Pid | SortColumn::Res | SortColumn::Time => Ordering::Equal,
                     };

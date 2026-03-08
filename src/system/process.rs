@@ -710,8 +710,10 @@ pub struct ProcessInfo {
     pub thread_count: u32,   // Number of threads
     pub start_time: u64,     // Process start time (Unix timestamp)
     pub handle_count: u32,   // Number of handles (Windows)
-    pub io_read_bytes: u64,  // I/O bytes read
-    pub io_write_bytes: u64, // I/O bytes written
+    pub io_read_bytes: u64,  // I/O bytes read (cumulative)
+    pub io_write_bytes: u64, // I/O bytes written (cumulative)
+    pub io_read_rate: u64,   // I/O read bytes since last refresh
+    pub io_write_rate: u64,  // I/O write bytes since last refresh
     // Pre-computed lowercase strings for efficient filtering (avoid per-filter allocations)
     pub name_lower: String,
     pub command_lower: String,
@@ -878,6 +880,8 @@ impl ProcessInfo {
             handle_count: proc.handle_count(),
             io_read_bytes: proc.read_bytes(),
             io_write_bytes: proc.write_bytes(),
+            io_read_rate: 0,
+            io_write_rate: 0,
             name_lower,
             command_lower,
             user_lower,

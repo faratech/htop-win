@@ -52,8 +52,8 @@ pub fn draw_help(frame: &mut Frame, app: &App) {
         "  ─────────────────────────────────────────────────────────────",
         "  NAVIGATION",
         "  ─────────────────────────────────────────────────────────────",
-        "    Tab                Cycle focus: Process List → Footer → Header",
-        "    Shift+Tab          Cycle focus backwards",
+        "    Tab                Switch to next screen tab (Main / I/O)",
+        "    Shift+Tab          Switch to previous screen tab",
         "    Up/Down, j/k       Move selection up/down",
         "    Left/Right         Navigate within focused region",
         "    Enter              Activate focused element",
@@ -560,10 +560,12 @@ pub fn draw_process_info(frame: &mut Frame, app: &App) {
              \n\
              ───────────────────────────────────────────────────────\n\
              \n\
-             DISK I/O (cumulative)\n\
+             DISK I/O\n\
              \n\
-             Read            {}\n\
-             Write           {}\n\
+             Read Rate       {}/s\n\
+             Write Rate      {}/s\n\
+             Read (total)    {}\n\
+             Write (total)   {}\n\
              \n\
              ───────────────────────────────────────────────────────\n\
              \n\
@@ -592,6 +594,8 @@ pub fn draw_process_info(frame: &mut Frame, app: &App) {
             format_bytes(proc.resident_mem),
             format_bytes(proc.shared_mem),
             proc.format_cpu_time(),
+            format_bytes(proc.io_read_rate),
+            format_bytes(proc.io_write_rate),
             format_bytes(proc.io_read_bytes),
             format_bytes(proc.io_write_bytes),
             exe_display,

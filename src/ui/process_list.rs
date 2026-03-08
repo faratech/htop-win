@@ -513,6 +513,43 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             (if proc.efficiency_mode { "🌿" } else { " " }).to_string(),
                             if is_selected { theme.selection_fg } else { theme.process_low_priority }  // Green for eco mode
                         ),
+                        SortColumn::HandleCount => {
+                            let color = if is_selected {
+                                theme.selection_fg
+                            } else if proc.handle_count == 0 {
+                                theme.process_shadow
+                            } else {
+                                theme.process
+                            };
+                            (format!("{:>5}", proc.handle_count), color)
+                        }
+                        SortColumn::IoRate => {
+                            let bytes = proc.io_read_rate + proc.io_write_rate;
+                            if bytes == 0 {
+                                let color = if is_selected { theme.selection_fg } else { theme.process_shadow };
+                                return Cell::from(Span::styled(format!("{:>6}", 0), Style::default().fg(color)));
+                            }
+                            let spans = format_bytes_colored(bytes, theme, is_selected, app.config.highlight_large_numbers);
+                            return Cell::from(Line::from(spans));
+                        }
+                        SortColumn::IoReadRate | SortColumn::IoWriteRate => {
+                            let bytes = if *col == SortColumn::IoReadRate { proc.io_read_rate } else { proc.io_write_rate };
+                            if bytes == 0 {
+                                let color = if is_selected { theme.selection_fg } else { theme.process_shadow };
+                                return Cell::from(Span::styled(format!("{:>6}", 0), Style::default().fg(color)));
+                            }
+                            let spans = format_bytes_colored(bytes, theme, is_selected, app.config.highlight_large_numbers);
+                            return Cell::from(Line::from(spans));
+                        }
+                        SortColumn::IoRead | SortColumn::IoWrite => {
+                            let bytes = if *col == SortColumn::IoRead { proc.io_read_bytes } else { proc.io_write_bytes };
+                            if bytes == 0 {
+                                let color = if is_selected { theme.selection_fg } else { theme.process_shadow };
+                                return Cell::from(Span::styled(format!("{:>6}", 0), Style::default().fg(color)));
+                            }
+                            let spans = format_bytes_colored(bytes, theme, is_selected, app.config.highlight_large_numbers);
+                            return Cell::from(Line::from(spans));
+                        }
                     };
                     // Add bold modifier matching htop's A_BOLD usage:
                     // - High CPU (>50%) - bold for visibility

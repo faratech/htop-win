@@ -97,6 +97,9 @@ pub struct Config {
     // Column visibility (which columns to show in process list)
     pub visible_columns: Vec<String>,
 
+    // Screen tabs (like htop's Main/I/O tabs)
+    pub screen_tabs: Option<Vec<crate::app::ScreenTab>>,
+
     // Mouse settings
     pub mouse_enabled: bool,
 
@@ -159,6 +162,8 @@ impl Default for Config {
                 "TIME+".to_string(),
                 "Command".to_string(),
             ],
+
+            screen_tabs: None, // Use defaults from ScreenTab::default_main/default_io
 
             mouse_enabled: true,
             readonly: false,
@@ -299,6 +304,31 @@ impl Config {
 
             visible_columns,
 
+            // Parse screen_tabs array
+            screen_tabs: v.get("screen_tabs").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter().filter_map(|tab_val| {
+                    let name = tab_val.get("name")?.as_str()?.to_string();
+                    let columns: Vec<String> = tab_val.get("columns")?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|c| c.as_str().map(String::from))
+                        .collect();
+                    let sort_key = tab_val.get("sort_key")
+                        .and_then(|v| v.as_str())
+                        .and_then(crate::app::SortColumn::from_name)
+                        .unwrap_or(crate::app::SortColumn::Cpu);
+                    let sort_ascending = tab_val.get("sort_ascending")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    Some(crate::app::ScreenTab {
+                        name,
+                        columns,
+                        sort_column: sort_key,
+                        sort_ascending,
+                    })
+                }).collect()
+            }),
+
             mouse_enabled: get_bool("mouse_enabled", defaults.mouse_enabled),
             readonly: get_bool("readonly", defaults.readonly),
             confirm_kill: get_bool("confirm_kill", defaults.confirm_kill),
@@ -410,6 +440,21 @@ impl Config {
                     .collect(),
             ),
         );
+
+        // Serialize screen_tabs if present
+        if let Some(ref tabs) = self.screen_tabs {
+            let tabs_json: Vec<Value> = tabs.iter().map(|tab| {
+                let mut tab_map = HashMap::new();
+                tab_map.insert("name".to_string(), Value::String(tab.name.clone()));
+                tab_map.insert("columns".to_string(), Value::Array(
+                    tab.columns.iter().map(|c| Value::String(c.clone())).collect(),
+                ));
+                tab_map.insert("sort_key".to_string(), Value::String(tab.sort_column.name().to_string()));
+                tab_map.insert("sort_ascending".to_string(), Value::Bool(tab.sort_ascending));
+                Value::Object(tab_map)
+            }).collect();
+            map.insert("screen_tabs".to_string(), Value::Array(tabs_json));
+        }
 
         map.insert(
             "mouse_enabled".to_string(),

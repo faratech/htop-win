@@ -283,9 +283,13 @@ impl SystemMetrics {
                     let existing_proc = &mut processes[idx];
                     
                     if (native_start as i64 - existing_proc.start_time as i64).abs() <= 1 {
-                        // Update existing process
+                        // Update existing process - capture IO before update for rate calc
+                        let prev_io_read = existing_proc.io_read_bytes;
+                        let prev_io_write = existing_proc.io_write_bytes;
                         let cpu_pct = cpu_percentages.get(&pid).copied().unwrap_or(0.0);
                         existing_proc.update_from_raw(&raw_proc, cpu_pct, total_mem);
+                        existing_proc.io_read_rate = existing_proc.io_read_bytes.saturating_sub(prev_io_read);
+                        existing_proc.io_write_rate = existing_proc.io_write_bytes.saturating_sub(prev_io_write);
                     } else {
                         // PID reuse: replace existing process
                         let cpu_pct = cpu_percentages.get(&pid).copied().unwrap_or(0.0);
