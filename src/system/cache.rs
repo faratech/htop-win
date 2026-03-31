@@ -306,6 +306,21 @@ impl ProcessCache {
             .unwrap_or_default()
     }
 
+    /// Execute a closure with read access to the cache, avoiding a full clone.
+    /// The lock is held for the duration of the callback.
+    pub fn with_read<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&HashMap<u32, ProcessCacheEntry>) -> R,
+    {
+        static EMPTY: std::sync::LazyLock<HashMap<u32, ProcessCacheEntry>> =
+            std::sync::LazyLock::new(HashMap::new);
+        let guard = self.entries.read();
+        match guard {
+            Ok(cache) => f(&cache),
+            Err(_) => f(&EMPTY),
+        }
+    }
+
     /// Get snapshot of specific fields for specific PIDs
     #[allow(dead_code)]
     pub fn snapshot_for_pids(&self, pids: &[u32]) -> HashMap<u32, ProcessCacheEntry> {

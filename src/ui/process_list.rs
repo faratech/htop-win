@@ -241,13 +241,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             let is_tagged = app.tagged_pids.contains(&proc.pid);
             let matches_search = proc.matches_search;
 
-            // Tree prefix for tree view
-            let tree_prefix = if app.tree_view {
+            // Tree prefix for tree view (avoid allocation when not in tree mode)
+            let tree_prefix: std::borrow::Cow<str> = if app.tree_view {
                 if proc.has_children {
-                    if proc.is_collapsed { format!("{}[+]", proc.tree_prefix) }
-                    else { format!("{}[-]", proc.tree_prefix) }
-                } else { proc.tree_prefix.clone() }
-            } else { String::new() };
+                    if proc.is_collapsed { format!("{}[+]", proc.tree_prefix).into() }
+                    else { format!("{}[-]", proc.tree_prefix).into() }
+                } else { std::borrow::Cow::Borrowed(&proc.tree_prefix) }
+            } else { std::borrow::Cow::Borrowed("") };
 
             // Choose between full command path or just the program name
             let display_command = if app.config.show_program_path {
@@ -294,7 +294,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                         // Tree prefix with tree color (avoid clone when empty)
                         if !tree_prefix.is_empty() {
                             spans.push(Span::styled(
-                                tree_prefix.clone(),
+                                tree_prefix.to_string(),
                                 Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_tree })
                             ));
                         }
@@ -500,19 +500,23 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             (format!("{:>7}", time_str), if is_selected { theme.selection_fg } else { theme.process })
                         }
                         SortColumn::Command => unreachable!(), // Handled above
-                        // Windows-specific columns (use theme colors, static strings for emoji)
-                        SortColumn::Elevated => (
-                            (if proc.is_elevated { "🛡️" } else { " " }).to_string(),
-                            if is_selected { theme.selection_fg } else { theme.process_priv }  // Magenta for privileged
-                        ),
+                        // Windows-specific columns (use theme colors, static &str to avoid allocation)
+                        SortColumn::Elevated => {
+                            let s: &str = if proc.is_elevated { "🛡️" } else { " " };
+                            return Cell::from(Span::styled(s, Style::default().fg(
+                                if is_selected { theme.selection_fg } else { theme.process_priv }
+                            )));
+                        }
                         SortColumn::Arch => (
                             format!("{:>4}", proc.arch.as_str()),
                             if is_selected { theme.selection_fg } else { theme.process_megabytes }  // Cyan for info
                         ),
-                        SortColumn::Efficiency => (
-                            (if proc.efficiency_mode { "🌿" } else { " " }).to_string(),
-                            if is_selected { theme.selection_fg } else { theme.process_low_priority }  // Green for eco mode
-                        ),
+                        SortColumn::Efficiency => {
+                            let s: &str = if proc.efficiency_mode { "🌿" } else { " " };
+                            return Cell::from(Span::styled(s, Style::default().fg(
+                                if is_selected { theme.selection_fg } else { theme.process_low_priority }
+                            )));
+                        }
                         SortColumn::HandleCount => {
                             let color = if is_selected {
                                 theme.selection_fg

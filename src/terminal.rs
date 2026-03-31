@@ -822,7 +822,19 @@ impl Terminal {
         let mut last_bg = Color::Reset;
         let mut last_modifier = Modifier::empty();
 
+        let width = current.area.width as usize;
+
         for y in current.area.y..current.area.bottom() {
+            // Skip entire row if unchanged from previous frame
+            let row_start = current.index_of(current.area.x, y);
+            let row_end = row_start + width;
+            if row_end <= current.content.len()
+                && row_end <= previous.content.len()
+                && current.content[row_start..row_end] == previous.content[row_start..row_end]
+            {
+                continue;
+            }
+
             let mut skip = 0;
             for x in current.area.x..current.area.right() {
                 let idx = current.index_of(x, y);
@@ -859,26 +871,38 @@ impl Terminal {
                     last_bg = cell.bg;
                 }
                 if cell.modifier != last_modifier {
-                    // Reset first, then apply
-                    self.backend.stdout.queue(SetAttribute(Attribute::Reset))?;
-                    if cell.modifier.contains(Modifier::BOLD) {
+                    // Only reset if we're removing attributes; add new ones directly
+                    let removed = last_modifier.difference(cell.modifier);
+                    if !removed.is_empty() {
+                        // Must reset to remove attributes, then re-apply what's needed
+                        self.backend.stdout.queue(SetAttribute(Attribute::Reset))?;
+                        // Re-apply colors after reset
+                        self.backend.stdout.queue(SetForegroundColor(cell.fg.to_crossterm()))?;
+                        self.backend.stdout.queue(SetBackgroundColor(cell.bg.to_crossterm()))?;
+                        last_fg = cell.fg;
+                        last_bg = cell.bg;
+                    }
+                    // Apply active modifiers (only new ones if no reset, all if reset occurred)
+                    let to_apply = if removed.is_empty() {
+                        cell.modifier.difference(last_modifier) // only newly added
+                    } else {
+                        cell.modifier // all active (after reset)
+                    };
+                    if to_apply.contains(Modifier::BOLD) {
                         self.backend.stdout.queue(SetAttribute(Attribute::Bold))?;
                     }
-                    if cell.modifier.contains(Modifier::DIM) {
+                    if to_apply.contains(Modifier::DIM) {
                         self.backend.stdout.queue(SetAttribute(Attribute::Dim))?;
                     }
-                    if cell.modifier.contains(Modifier::ITALIC) {
+                    if to_apply.contains(Modifier::ITALIC) {
                         self.backend.stdout.queue(SetAttribute(Attribute::Italic))?;
                     }
-                    if cell.modifier.contains(Modifier::UNDERLINED) {
+                    if to_apply.contains(Modifier::UNDERLINED) {
                         self.backend.stdout.queue(SetAttribute(Attribute::Underlined))?;
                     }
-                    if cell.modifier.contains(Modifier::REVERSED) {
+                    if to_apply.contains(Modifier::REVERSED) {
                         self.backend.stdout.queue(SetAttribute(Attribute::Reverse))?;
                     }
-                    // Re-apply colors after reset
-                    self.backend.stdout.queue(SetForegroundColor(cell.fg.to_crossterm()))?;
-                    self.backend.stdout.queue(SetBackgroundColor(cell.bg.to_crossterm()))?;
                     last_modifier = cell.modifier;
                 }
 

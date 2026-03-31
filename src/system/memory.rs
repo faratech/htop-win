@@ -219,23 +219,27 @@ impl MemoryInfo {
         Self::default()
     }
 
-    /// Get total memory (for ProcessInfo calculations)
+    /// Get total memory (for ProcessInfo calculations).
+    /// Cached with OnceLock since total physical memory never changes at runtime.
     #[cfg(windows)]
     pub fn total_memory() -> u64 {
+        use std::sync::OnceLock;
         use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
-        let mut status = MEMORYSTATUSEX {
-            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
-            ..Default::default()
-        };
-
-        unsafe {
-            if GlobalMemoryStatusEx(&mut status).is_ok() {
-                status.ullTotalPhys
-            } else {
-                0
+        static TOTAL_MEM: OnceLock<u64> = OnceLock::new();
+        *TOTAL_MEM.get_or_init(|| {
+            let mut status = MEMORYSTATUSEX {
+                dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+                ..Default::default()
+            };
+            unsafe {
+                if GlobalMemoryStatusEx(&mut status).is_ok() {
+                    status.ullTotalPhys
+                } else {
+                    0
+                }
             }
-        }
+        })
     }
 
     #[cfg(not(windows))]

@@ -202,41 +202,44 @@ pub fn calculate_cpu_percentages_from_iter(
     use super::cache::CACHE;
 
     let now = std::time::Instant::now();
-    let mut cpu_percentages = HashMap::with_capacity(500); // Estimate
-
-    // Get snapshot of CPU times from unified cache
-    let cache_snapshot = CACHE.snapshot();
     let mut updates = Vec::with_capacity(500);
 
-    for proc in list.iter() {
-        let pid = proc.pid();
-        
-        // System Idle Process (PID 0) represents idle CPU time, not actual work
-        if pid == 0 {
-            cpu_percentages.insert(0, 0.0);
-            continue;
-        }
+    // Read cache under lock without cloning the entire HashMap
+    let cpu_percentages = CACHE.with_read(|cache_snapshot| {
+        let mut percentages = HashMap::with_capacity(500);
 
-        let total_time = proc.kernel_time() + proc.user_time();
+        for proc in list.iter() {
+            let pid = proc.pid();
 
-        let cpu_percent = if let Some(entry) = cache_snapshot.get(&pid) {
-            let prev_total = entry.kernel_time + entry.user_time;
-            let time_delta = total_time.saturating_sub(prev_total);
+            // System Idle Process (PID 0) represents idle CPU time, not actual work
+            if pid == 0 {
+                percentages.insert(0, 0.0);
+                continue;
+            }
 
-            if now > entry.cpu_time_updated && total_cpu_delta > 0 {
-                // CPU percentage relative to total system CPU time
-                (time_delta as f64 / total_cpu_delta as f64 * 100.0) as f32
+            let total_time = proc.kernel_time() + proc.user_time();
+
+            let cpu_percent = if let Some(entry) = cache_snapshot.get(&pid) {
+                let prev_total = entry.kernel_time + entry.user_time;
+                let time_delta = total_time.saturating_sub(prev_total);
+
+                if now > entry.cpu_time_updated && total_cpu_delta > 0 {
+                    // CPU percentage relative to total system CPU time
+                    (time_delta as f64 / total_cpu_delta as f64 * 100.0) as f32
+                } else {
+                    0.0
+                }
             } else {
                 0.0
-            }
-        } else {
-            0.0
-        };
+            };
 
-        cpu_percentages.insert(pid, cpu_percent);
-        
-        updates.push((pid, proc.kernel_time(), proc.user_time(), proc.create_time()));
-    }
+            percentages.insert(pid, cpu_percent);
+
+            updates.push((pid, proc.kernel_time(), proc.user_time(), proc.create_time()));
+        }
+
+        percentages
+    });
 
     // Batch update cache
     CACHE.update_cpu_times_batch(&updates);

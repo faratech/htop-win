@@ -259,7 +259,7 @@ impl Config {
             .unwrap_or_else(|| defaults.visible_columns.clone());
 
         Self {
-            refresh_rate_ms: get_u64("refresh_rate_ms", defaults.refresh_rate_ms),
+            refresh_rate_ms: get_u64("refresh_rate_ms", defaults.refresh_rate_ms).max(100),
             tree_view_default: get_bool("tree_view_default", defaults.tree_view_default),
             color_scheme: ColorScheme::from_str(&get_str(
                 "color_scheme",

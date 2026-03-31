@@ -285,6 +285,8 @@ fn write_value(out: &mut String, value: &Value, indent: usize) {
                 match c {
                     '"' => out.push_str("\\\""),
                     '\\' => out.push_str("\\\\"),
+                    '\x08' => out.push_str("\\b"),
+                    '\x0c' => out.push_str("\\f"),
                     '\n' => out.push_str("\\n"),
                     '\r' => out.push_str("\\r"),
                     '\t' => out.push_str("\\t"),

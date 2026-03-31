@@ -1074,12 +1074,21 @@ impl App {
         let has_filter = !self.filter_string_lower.is_empty();
         let has_search = !self.search_string_lower.is_empty();
 
+        // Pre-format PID filter check to avoid per-process allocation
+        let filter_as_pid: Option<u32> = if has_filter {
+            self.filter_string_lower.parse().ok()
+        } else {
+            None
+        };
+
         // Filter-then-clone: only clone processes that pass all filters
         // Also set matches_search flag during this pass to avoid recomputing in render
         let show_kernel = self.config.show_kernel_threads;
         let show_user = self.config.show_user_threads;
+        let process_count = self.processes.len();
 
-        let mut processes: Vec<ProcessInfo> = self.processes
+        let mut processes: Vec<ProcessInfo> = Vec::with_capacity(process_count);
+        processes.extend(self.processes
             .iter()
             .filter(|p| {
                 // Kernel/System threads filter
@@ -1113,15 +1122,14 @@ impl App {
                 if has_filter
                     && !(p.name_lower.contains(&self.filter_string_lower)
                         || p.command_lower.contains(&self.filter_string_lower)
-                        || p.pid.to_string().contains(&self.filter_string_lower)
+                        || filter_as_pid.is_some_and(|n| p.pid == n)
                         || p.user_lower.contains(&self.filter_string_lower))
                     {
                         return false;
                     }
                 true
             })
-            .cloned()
-            .collect();
+            .cloned());
 
         // Set matches_search flag on each process (for render-time highlighting)
         if has_search {
@@ -1257,8 +1265,9 @@ impl App {
         let all_pids: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
 
         // Build parent-child relationships
-        let mut children_map: HashMap<u32, Vec<ProcessInfo>> = HashMap::new();
-        let mut root_processes: Vec<ProcessInfo> = Vec::new();
+        let process_count = processes.len();
+        let mut children_map: HashMap<u32, Vec<ProcessInfo>> = HashMap::with_capacity(process_count / 4);
+        let mut root_processes: Vec<ProcessInfo> = Vec::with_capacity(process_count / 8);
 
         // Group by parent - a process is a root if:
         // 1. parent_pid == 0 (no parent)
@@ -1284,20 +1293,17 @@ impl App {
         let root_count = root_processes.len();
         for (idx, root) in root_processes.into_iter().enumerate() {
             let is_last = idx == root_count - 1;
-            self.add_tree_node(&mut result, root, &children_map, 0, is_last, String::new());
+            self.add_tree_node(&mut result, root, &mut children_map, 0, is_last, String::new());
         }
 
         // Collect orphaned processes (e.g. from PID reuse cycles) that weren't
-        // reached from any root and add them as top-level entries
-        let placed_pids: std::collections::HashSet<u32> = result.iter().map(|p| p.pid).collect();
-        for children in children_map.values() {
-            for child in children {
-                if !placed_pids.contains(&child.pid) {
-                    let mut orphan = child.clone();
-                    orphan.tree_depth = 0;
-                    orphan.tree_prefix = String::new();
-                    result.push(orphan);
-                }
+        // reached from any root and add them as top-level entries.
+        // After tree traversal, only unreached entries remain in the map.
+        for (_, children) in children_map.drain() {
+            for mut orphan in children {
+                orphan.tree_depth = 0;
+                orphan.tree_prefix = String::new();
+                result.push(orphan);
             }
         }
 
@@ -1308,7 +1314,7 @@ impl App {
         &self,
         result: &mut Vec<ProcessInfo>,
         mut process: ProcessInfo,
-        children_map: &std::collections::HashMap<u32, Vec<ProcessInfo>>,
+        children_map: &mut std::collections::HashMap<u32, Vec<ProcessInfo>>,
         depth: usize,
         is_last: bool,
         parent_prefix: String,
@@ -1340,10 +1346,9 @@ impl App {
 
         result.push(process);
 
-        // Only add children if not collapsed
+        // Only add children if not collapsed - take ownership to avoid cloning
         if !is_collapsed
-            && let Some(children) = children_map.get(&pid) {
-                let mut sorted_children = children.clone();
+            && let Some(mut sorted_children) = children_map.remove(&pid) {
                 sorted_children.sort_by(|a, b| a.pid.cmp(&b.pid));
                 let child_count = sorted_children.len();
 
