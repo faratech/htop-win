@@ -639,10 +639,25 @@ pub fn draw_error(frame: &mut Frame, error: &str) {
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    use unicode_width::UnicodeWidthStr;
+
+    if s.width() <= max_len {
         s.to_string()
+    } else if max_len == 0 {
+        String::new()
     } else {
-        format!("{}...", &s[..max_len - 3])
+        let mut result = String::with_capacity(max_len + 3);
+        let mut current_width = 0;
+        for c in s.chars() {
+            let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+            if current_width + char_width >= max_len {
+                result.push('\u{2026}'); // ellipsis
+                break;
+            }
+            result.push(c);
+            current_width += char_width;
+        }
+        result
     }
 }
 

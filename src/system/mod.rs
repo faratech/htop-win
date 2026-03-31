@@ -244,8 +244,10 @@ impl SystemMetrics {
 
             // Update global stats
             self.tasks_total = tasks_total;
-            self.tasks_running = self.tasks_total.saturating_sub(1); // Exclude System Idle Process
-            self.tasks_sleeping = 1;
+            // Windows doesn't expose per-process running/sleeping state like Linux.
+            // Exclude System Idle Process (PID 0) from task count; don't fabricate sleep counts.
+            self.tasks_running = self.tasks_total.saturating_sub(1);
+            self.tasks_sleeping = 0;
             self.threads_total = threads_total;
 
             self.disk_read_rate = total_disk_read.saturating_sub(self.prev_disk_read);

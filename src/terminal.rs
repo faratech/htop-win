@@ -147,8 +147,11 @@ impl Layout {
 
     pub fn split(&self, area: Rect) -> Vec<Rect> {
         let area = area.inner(self.margin);
-        if self.constraints.is_empty() || area.is_empty() {
+        if self.constraints.is_empty() {
             return vec![area];
+        }
+        if area.is_empty() {
+            return vec![Rect::default(); self.constraints.len()];
         }
 
         // Account for spacing between elements

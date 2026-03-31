@@ -105,7 +105,7 @@ impl<'a> Iterator for SystemProcessIterator<'a> {
             return None;
         }
 
-        if self.offset >= self.buffer.len() {
+        if self.offset + std::mem::size_of::<SystemProcessInfo>() > self.buffer.len() {
             return None;
         }
 
@@ -222,9 +222,8 @@ pub fn calculate_cpu_percentages_from_iter(
         let cpu_percent = if let Some(entry) = cache_snapshot.get(&pid) {
             let prev_total = entry.kernel_time + entry.user_time;
             let time_delta = total_time.saturating_sub(prev_total);
-            let elapsed = now.duration_since(entry.cpu_time_updated).as_nanos() as u64;
 
-            if elapsed > 0 && total_cpu_delta > 0 {
+            if now > entry.cpu_time_updated && total_cpu_delta > 0 {
                 // CPU percentage relative to total system CPU time
                 (time_delta as f64 / total_cpu_delta as f64 * 100.0) as f32
             } else {

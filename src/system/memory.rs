@@ -149,7 +149,8 @@ impl MemoryInfo {
                     page_file_name: [u16; 260], // UNICODE_STRING follows but we don't need it
                 }
 
-                let mut pagefile_info: [u8; 512] = [0; 512];
+                let pf_struct_size = std::mem::size_of::<SystemPageFileInfo>();
+                let mut pagefile_info: [u8; 4096] = [0; 4096];
                 let mut return_length: u32 = 0;
                 let pf_status = NtQuerySystemInformation(
                     SYSTEM_INFORMATION_CLASS(18), // SystemPageFileInformation
@@ -158,14 +159,15 @@ impl MemoryInfo {
                     &mut return_length,
                 );
 
-                let (swap_total, swap_used) = if pf_status.is_ok() && return_length >= 16 {
+                let (swap_total, swap_used) = if pf_status.is_ok() && return_length as usize >= pf_struct_size {
                     // Parse the page file info - may have multiple page files
                     let mut total_size: u64 = 0;
                     let mut total_in_use: u64 = 0;
                     let mut offset = 0usize;
+                    let buf_len = (return_length as usize).min(pagefile_info.len());
 
                     loop {
-                        if offset + 16 > pagefile_info.len() {
+                        if offset + pf_struct_size > buf_len {
                             break;
                         }
                         let info = &*(pagefile_info.as_ptr().add(offset) as *const SystemPageFileInfo);
@@ -175,7 +177,11 @@ impl MemoryInfo {
                         if info.next_entry_offset == 0 {
                             break;
                         }
-                        offset += info.next_entry_offset as usize;
+                        let next = offset + info.next_entry_offset as usize;
+                        if next <= offset || next + pf_struct_size > buf_len {
+                            break; // Prevent infinite loop or out-of-bounds
+                        }
+                        offset = next;
                     }
                     (total_size, total_in_use)
                 } else {
