@@ -260,17 +260,13 @@ impl SystemMetrics {
             let total_mem = MemoryInfo::total_memory();
 
             // Track which processes we've seen in this update
-            let mut seen_pids = HashSet::new();
+            let mut seen_pids = HashSet::with_capacity(processes.len());
 
-            // Process list is sorted by existing order usually, but new list is by PID
-            // We want to update existing entries and collect new ones
-            
             // Build a map of existing processes index by PID for fast lookup
-            let existing_map: HashMap<u32, usize> = processes
-                .iter()
-                .enumerate()
-                .map(|(i, p)| (p.pid, i))
-                .collect();
+            let mut existing_map: HashMap<u32, usize> = HashMap::with_capacity(processes.len());
+            for (i, p) in processes.iter().enumerate() {
+                existing_map.insert(p.pid, i);
+            }
 
             let mut new_processes = Vec::new();
 

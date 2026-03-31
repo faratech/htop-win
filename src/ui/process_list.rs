@@ -229,6 +229,21 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
+    // Reusable format buffer to avoid per-cell String allocations.
+    // write!() reuses the buffer's capacity across clear() calls.
+    use std::fmt::Write;
+    let mut fmt_buf = String::with_capacity(32);
+
+    // Macro to format into the reusable buffer and return an owned String.
+    // Avoids format!()'s internal allocation of a fresh String::new() per call.
+    macro_rules! fmt {
+        ($($arg:tt)*) => {{
+            fmt_buf.clear();
+            write!(fmt_buf, $($arg)*).unwrap();
+            fmt_buf.clone()
+        }};
+    }
+
     // Build rows
     let rows: Vec<Row> = app
         .displayed_processes
@@ -389,11 +404,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
                     let (text, color) = match col {
                         SortColumn::Pid => (
-                            if is_selected { format!("▶{:>5}", proc.pid) } else { format!("{:>6}", proc.pid) },
+                            if is_selected { fmt!("▶{:>5}", proc.pid) } else { fmt!("{:>6}", proc.pid) },
                             if is_selected { theme.selection_fg } else { theme.pid_color }
                         ),
                         SortColumn::PPid => (
-                            format!("{:>6}", proc.parent_pid),
+                            fmt!("{:>6}", proc.parent_pid),
                             if is_selected { theme.selection_fg } else { theme.text_dim }
                         ),
                         SortColumn::User => {
@@ -408,10 +423,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 theme.user_color
                             };
-                            (format!("{:10}", truncate_str(&proc.user, 10)), user_color)
+                            (fmt!("{:10}", truncate_str(&proc.user, 10)), user_color)
                         }
                         SortColumn::Priority => (
-                            format!("{:>3}", proc.priority),
+                            fmt!("{:>3}", proc.priority),
                             if is_selected { theme.selection_fg } else { theme.process }  // htop uses default color
                         ),
                         SortColumn::PriorityClass => {
@@ -427,7 +442,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                                     _ => theme.process_shadow,
                                 }
                             };
-                            (format!("{:>6}", priority_class.short_name()), color)
+                            (fmt!("{:>6}", priority_class.short_name()), color)
                         }
                         SortColumn::Threads => {
                             // htop: If nlwp == 1, use PROCESS_SHADOW (dimmed)
@@ -438,7 +453,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 theme.threads_color
                             };
-                            (format!("{:>3}", proc.thread_count), color)
+                            (fmt!("{:>3}", proc.thread_count), color)
                         }
                         SortColumn::Virt => {
                             // htop: Multi-colored memory values (when highlight_large_numbers enabled)
@@ -459,9 +474,9 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             // Show status char + leaf emoji for efficiency mode
                             // htop: Running processes are green and bold
                             let status_str = if proc.efficiency_mode {
-                                format!("{}🌿", proc.status)  // e.g., "R🌿" for Running+Efficiency
+                                fmt!("{}🌿", proc.status)  // e.g., "R🌿" for Running+Efficiency
                             } else {
-                                format!("{}  ", proc.status)
+                                fmt!("{}  ", proc.status)
                             };
                             (
                                 status_str,
@@ -477,7 +492,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 theme.process  // htop uses default/white for normal values
                             };
-                            (format!("{:>5.1}", proc.cpu_percent), color)
+                            (fmt!("{:>5.1}", proc.cpu_percent), color)
                         }
                         SortColumn::Mem => {
                             // htop Row_printPercentage: default color, >= 99.9% is cyan (when highlight_large_numbers)
@@ -488,7 +503,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 theme.process  // htop uses default/white for normal values
                             };
-                            (format!("{:>5.1}", proc.mem_percent), color)
+                            (fmt!("{:>5.1}", proc.mem_percent), color)
                         }
                         SortColumn::Time => {
                             // htop: Multi-colored time display (when highlight_large_numbers enabled)
@@ -497,7 +512,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                         }
                         SortColumn::StartTime => {
                             let time_str = format_start_time(proc.start_time, now_secs);
-                            (format!("{:>7}", time_str), if is_selected { theme.selection_fg } else { theme.process })
+                            (fmt!("{:>7}", time_str), if is_selected { theme.selection_fg } else { theme.process })
                         }
                         SortColumn::Command => unreachable!(), // Handled above
                         // Windows-specific columns (use theme colors, static &str to avoid allocation)
@@ -508,7 +523,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             )));
                         }
                         SortColumn::Arch => (
-                            format!("{:>4}", proc.arch.as_str()),
+                            fmt!("{:>4}", proc.arch.as_str()),
                             if is_selected { theme.selection_fg } else { theme.process_megabytes }  // Cyan for info
                         ),
                         SortColumn::Efficiency => {
@@ -525,13 +540,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 theme.process
                             };
-                            (format!("{:>5}", proc.handle_count), color)
+                            (fmt!("{:>5}", proc.handle_count), color)
                         }
                         SortColumn::IoRate => {
                             let bytes = proc.io_read_rate + proc.io_write_rate;
                             if bytes == 0 {
                                 let color = if is_selected { theme.selection_fg } else { theme.process_shadow };
-                                return Cell::from(Span::styled(format!("{:>6}", 0), Style::default().fg(color)));
+                                return Cell::from(Span::styled(fmt!("{:>6}", 0), Style::default().fg(color)));
                             }
                             let spans = format_bytes_colored(bytes, theme, is_selected, app.config.highlight_large_numbers);
                             return Cell::from(Line::from(spans));
@@ -540,7 +555,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             let bytes = if *col == SortColumn::IoReadRate { proc.io_read_rate } else { proc.io_write_rate };
                             if bytes == 0 {
                                 let color = if is_selected { theme.selection_fg } else { theme.process_shadow };
-                                return Cell::from(Span::styled(format!("{:>6}", 0), Style::default().fg(color)));
+                                return Cell::from(Span::styled(fmt!("{:>6}", 0), Style::default().fg(color)));
                             }
                             let spans = format_bytes_colored(bytes, theme, is_selected, app.config.highlight_large_numbers);
                             return Cell::from(Line::from(spans));
@@ -549,7 +564,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             let bytes = if *col == SortColumn::IoRead { proc.io_read_bytes } else { proc.io_write_bytes };
                             if bytes == 0 {
                                 let color = if is_selected { theme.selection_fg } else { theme.process_shadow };
-                                return Cell::from(Span::styled(format!("{:>6}", 0), Style::default().fg(color)));
+                                return Cell::from(Span::styled(fmt!("{:>6}", 0), Style::default().fg(color)));
                             }
                             let spans = format_bytes_colored(bytes, theme, is_selected, app.config.highlight_large_numbers);
                             return Cell::from(Line::from(spans));

@@ -635,11 +635,13 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             proc.is_elevated = data.is_elevated;
             proc.arch = data.arch;
             if let Some(ref user) = data.user {
-                proc.user = user.clone();
-                proc.user_lower = user.to_lowercase();
+                if *user != proc.user {
+                    proc.user = user.clone();
+                    proc.user_lower = user.to_lowercase();
+                }
             }
             // Update exe_path and command if we got a valid path
-            if !data.exe_path.is_empty() {
+            if !data.exe_path.is_empty() && data.exe_path != proc.exe_path {
                 proc.exe_path = data.exe_path.clone();
                 proc.command = data.exe_path.clone();
                 proc.command_lower = data.exe_path.to_lowercase();

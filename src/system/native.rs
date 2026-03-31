@@ -144,19 +144,16 @@ where
 {
     QUERY_BUFFER.with(|buf| {
         let mut buffer = buf.borrow_mut();
-        // Clear buffer but keep capacity
-        buffer.clear();
         let cap = buffer.capacity();
         if cap < 1024 * 1024 {
             buffer.reserve(1024 * 1024 - cap);
         }
-        
-        // Ensure we have some zeroed space if resize is needed? 
-        // Actually resize will zero initialize.
-        // But we want to call with current capacity first? 
-        // No, standard pattern is to resize to expected size.
+        // Only resize (zeroing) when the buffer needs to grow;
+        // NtQuerySystemInformation overwrites the buffer contents.
         let new_cap = buffer.capacity();
-        buffer.resize(new_cap, 0);
+        if buffer.len() < new_cap {
+            buffer.resize(new_cap, 0);
+        }
 
         let mut return_length: u32 = 0;
 
