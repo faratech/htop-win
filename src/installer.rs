@@ -526,7 +526,9 @@ pub fn apply_pending_update() -> bool {
     if let Err(e) = fs::copy(&update_file, &install_path) {
         // Failed to copy, restore backup
         eprintln!("Update failed (copy error: {}), restoring backup", e);
-        let _ = fs::rename(&backup_path, &install_path);
+        if let Err(e2) = fs::rename(&backup_path, &install_path) {
+            eprintln!("CRITICAL: Failed to restore backup: {}. Working executable is at: {:?}", e2, backup_path);
+        }
         // Keep update file for retry
         return true; // Return true to skip re-download
     }

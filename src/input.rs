@@ -344,8 +344,9 @@ fn handle_filter_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Backspace => {
             app.input_backspace();
-            // Live filter
+            // Live filter - update both string and lowercase cache
             app.filter_string = app.input_buffer.clone();
+            app.filter_string_lower = app.filter_string.to_lowercase();
             app.update_displayed_processes();
         }
         KeyCode::Delete => {
@@ -359,8 +360,9 @@ fn handle_filter_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char(c) => {
             app.input_char(c);
-            // Live filter
+            // Live filter - update both string and lowercase cache
             app.filter_string = app.input_buffer.clone();
+            app.filter_string_lower = app.filter_string.to_lowercase();
             app.update_displayed_processes();
         }
         _ => {}
@@ -1032,9 +1034,19 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
                     ViewMode::Help => app.help_scroll += 3,
                     ViewMode::ProcessInfo | ViewMode::Environment => app.env_scroll += 3,
                     ViewMode::CommandWrap => app.command_wrap_scroll += 3,
-                    ViewMode::SortSelect => app.sort_select_index += 3,
-                    ViewMode::UserSelect => app.user_select_index += 3,
-                    ViewMode::SignalSelect => app.signal_select_index += 3,
+                    ViewMode::SortSelect => {
+                        let max = SortColumn::all().len().saturating_sub(1);
+                        app.sort_select_index = (app.sort_select_index + 3).min(max);
+                    }
+                    ViewMode::UserSelect => {
+                        let max = app.user_list.len(); // index 0 = "All users", so max = list.len()
+                        app.user_select_index = (app.user_select_index + 3).min(max);
+                    }
+                    ViewMode::SignalSelect => {
+                        use crate::ui::dialogs::signal_count;
+                        let max = signal_count().saturating_sub(1);
+                        app.signal_select_index = (app.signal_select_index + 3).min(max);
+                    }
                     _ => {}
                 }
             } else {

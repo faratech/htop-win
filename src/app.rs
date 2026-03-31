@@ -1287,6 +1287,20 @@ impl App {
             self.add_tree_node(&mut result, root, &children_map, 0, is_last, String::new());
         }
 
+        // Collect orphaned processes (e.g. from PID reuse cycles) that weren't
+        // reached from any root and add them as top-level entries
+        let placed_pids: std::collections::HashSet<u32> = result.iter().map(|p| p.pid).collect();
+        for children in children_map.values() {
+            for child in children {
+                if !placed_pids.contains(&child.pid) {
+                    let mut orphan = child.clone();
+                    orphan.tree_depth = 0;
+                    orphan.tree_prefix = String::new();
+                    result.push(orphan);
+                }
+            }
+        }
+
         result
     }
 
@@ -1299,6 +1313,12 @@ impl App {
         is_last: bool,
         parent_prefix: String,
     ) {
+        // Guard against cycles from PID reuse and excessively deep trees
+        const MAX_TREE_DEPTH: usize = 64;
+        if depth >= MAX_TREE_DEPTH {
+            return;
+        }
+
         process.tree_depth = depth;
         let pid = process.pid;
         let has_children = children_map.contains_key(&pid);
@@ -1452,8 +1472,8 @@ impl App {
     pub fn tag_all_by_name(&mut self) {
         if let Some(proc) = self.selected_process() {
             let name = proc.name.clone();
-            // Find all processes with the same name and tag them
-            let pids_to_tag: Vec<u32> = self.processes
+            // Find all visible processes with the same name and tag them
+            let pids_to_tag: Vec<u32> = self.displayed_processes
                 .iter()
                 .filter(|p| p.name == name)
                 .map(|p| p.pid)
