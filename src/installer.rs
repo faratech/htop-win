@@ -245,21 +245,21 @@ const GITHUB_REPO: &str = "faratech/htop-win";
 
 /// Get the latest version info from GitHub
 /// Returns (version, download_url) or None if check fails
-pub fn get_latest_release() -> Option<(String, String)> {
+pub fn get_latest_release() -> Result<(String, String), Box<dyn std::error::Error>> {
     let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
-    
+
     // Fetch JSON from GitHub API
-    let body = native_http_get(&url).ok()?;
-    let json_text = String::from_utf8(body).ok()?;
-    
+    let body = native_http_get(&url)?;
+    let json_text = String::from_utf8(body)
+        .map_err(|_| "GitHub API returned invalid UTF-8")?;
+
     // Parse JSON manually to avoid complex deps
     // We look for "tag_name": "vX.Y.Z"
     let version = json_text.split("\"tag_name\"")
-        .nth(1)?
-        .split(':')
-        .nth(1)?
-        .split("\"")
-        .nth(1)?
+        .nth(1)
+        .and_then(|s| s.split(':').nth(1))
+        .and_then(|s| s.split("\"").nth(1))
+        .ok_or_else(|| format!("Failed to parse tag_name from GitHub API response (body length: {} bytes)", json_text.len()))?
         .trim_start_matches('v')
         .to_string();
 
@@ -306,10 +306,10 @@ pub fn get_latest_release() -> Option<(String, String)> {
     }
 
     if version.is_empty() || download_url.is_empty() {
-        return None;
+        return Err(format!("Could not find download URL for this architecture (version={}, url_empty={})", version, download_url.is_empty()).into());
     }
 
-    Some((version, download_url))
+    Ok((version, download_url))
 }
 
 /// Clean up any leftover temp files from previous updates
@@ -325,8 +325,10 @@ pub fn update_from_github(force: bool) -> Result<(), Box<dyn std::error::Error>>
 
     println!("Checking for updates...");
 
-    let (latest_version, download_url) = get_latest_release()
-        .ok_or("Failed to check for updates. Check your internet connection.")?;
+    let (latest_version, download_url) = match get_latest_release() {
+        Ok(v) => v,
+        Err(e) => return Err(format!("Failed to check for updates: {}", e).into()),
+    };
 
     let current_version = env!("CARGO_PKG_VERSION");
 
@@ -422,7 +424,7 @@ pub fn check_and_download_update() -> UpdateStatus {
         if let Ok(metadata) = fs::metadata(&temp_file) {
             if metadata.len() > 0 {
                 // Check what version is on GitHub to report correctly
-                if let Some((latest_version, _)) = get_latest_release() {
+                if let Ok((latest_version, _)) = get_latest_release() {
                     let current_version = env!("CARGO_PKG_VERSION");
                     if is_newer_version(&latest_version, current_version) {
                         return UpdateStatus::Downloaded {
@@ -442,8 +444,8 @@ pub fn check_and_download_update() -> UpdateStatus {
     let current_version = env!("CARGO_PKG_VERSION");
 
     let (latest_version, download_url) = match get_latest_release() {
-        Some(v) => v,
-        None => return UpdateStatus::None,
+        Ok(v) => v,
+        Err(_) => return UpdateStatus::None,
     };
 
     if !is_newer_version(&latest_version, current_version) {
