@@ -417,16 +417,26 @@ pub fn check_and_download_update() -> UpdateStatus {
     let temp_dir = std::env::temp_dir();
     let temp_file = temp_dir.join("htop-win-update.exe");
 
-    // If update already downloaded and pending, don't re-download
+    // If update already downloaded and pending, report it without re-downloading
     if temp_file.exists() {
-        // Verify it's not empty
         if let Ok(metadata) = fs::metadata(&temp_file) {
             if metadata.len() > 0 {
-                return UpdateStatus::None;
+                // Check what version is on GitHub to report correctly
+                if let Some((latest_version, _)) = get_latest_release() {
+                    let current_version = env!("CARGO_PKG_VERSION");
+                    if is_newer_version(&latest_version, current_version) {
+                        return UpdateStatus::Downloaded {
+                            version: latest_version,
+                            path: temp_file,
+                        };
+                    }
+                }
+                // Same version or can't check -- clean up stale temp file
+                let _ = fs::remove_file(&temp_file);
+            } else {
+                let _ = fs::remove_file(&temp_file);
             }
         }
-        // Invalid file, remove it
-        let _ = fs::remove_file(&temp_file);
     }
 
     let current_version = env!("CARGO_PKG_VERSION");
