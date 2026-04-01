@@ -36,6 +36,10 @@ pub struct ProcessCacheEntry {
     pub user_time: u64,
     pub cpu_time_updated: Instant,
 
+    // I/O tracking (for rate delta calculation)
+    pub prev_io_read: u64,
+    pub prev_io_write: u64,
+
     // User info (never changes for a PID)
     pub user: Option<String>,
 
@@ -56,6 +60,8 @@ impl Default for ProcessCacheEntry {
             kernel_time: 0,
             user_time: 0,
             cpu_time_updated: Instant::now(),
+            prev_io_read: 0,
+            prev_io_write: 0,
             user: None,
             is_elevated: None,
             arch: None,
@@ -97,37 +103,17 @@ impl ProcessCache {
         }
     }
 
-    // ========== CPU Time Methods ==========
-
-    /// Get CPU times for a PID (for delta calculation)
-    /// Returns (kernel_time, user_time, last_update_instant)
-    #[allow(dead_code)]
-    pub fn get_cpu_times(&self, pid: u32) -> Option<(u64, u64, Instant)> {
-        self.entries
-            .read()
-            .ok()
-            .and_then(|cache| {
-                cache.get(&pid).map(|e| (e.kernel_time, e.user_time, e.cpu_time_updated))
-            })
-    }
-
-    /// Update CPU times for a PID
-    #[allow(dead_code)]
-    pub fn update_cpu_times(&self, pid: u32, kernel_time: u64, user_time: u64) {
-        if let Ok(mut cache) = self.entries.write() {
-            let entry = cache.entry(pid).or_default();
-            entry.kernel_time = kernel_time;
-            entry.user_time = user_time;
-            entry.cpu_time_updated = Instant::now();
-        }
-    }
-
-    /// Batch update CPU times for multiple PIDs (single lock acquisition)
-    /// Tuple: (pid, kernel_time, user_time, create_time)
-    pub fn update_cpu_times_batch(&self, updates: &[(u32, u64, u64, u64)]) {
+    /// Batch update CPU times and I/O bytes for multiple PIDs (single lock acquisition)
+    /// Tuple: (pid, kernel_time, user_time, create_time, io_read, io_write)
+    /// Returns a map of PID → (io_read_rate, io_write_rate) computed from cache deltas
+    pub fn update_times_batch(
+        &self,
+        updates: &[(u32, u64, u64, u64, u64, u64)],
+    ) -> HashMap<u32, (u64, u64)> {
+        let mut io_rates = HashMap::with_capacity(updates.len());
         if let Ok(mut cache) = self.entries.write() {
             let now = Instant::now();
-            for &(pid, kernel_time, user_time, create_time) in updates {
+            for &(pid, kernel_time, user_time, create_time, io_read, io_write) in updates {
                 let entry = cache.entry(pid).or_default();
                 // Detect PID reuse: if create_time changed, invalidate static fields
                 if entry.create_time != 0 && entry.create_time != create_time {
@@ -137,24 +123,24 @@ impl ProcessCache {
                     entry.exe_path = None;
                     entry.efficiency_mode = None;
                     entry.efficiency_updated = None;
+                    entry.prev_io_read = 0;
+                    entry.prev_io_write = 0;
                 }
+                // First appearance (new PID or PID reuse): rate = 0, not a delta
+                let is_first = entry.create_time == 0 || entry.create_time != create_time;
+                let read_rate = if is_first { 0 } else { io_read.saturating_sub(entry.prev_io_read) };
+                let write_rate = if is_first { 0 } else { io_write.saturating_sub(entry.prev_io_write) };
+                io_rates.insert(pid, (read_rate, write_rate));
+
                 entry.create_time = create_time;
                 entry.kernel_time = kernel_time;
                 entry.user_time = user_time;
                 entry.cpu_time_updated = now;
+                entry.prev_io_read = io_read;
+                entry.prev_io_write = io_write;
             }
         }
-    }
-
-    // ========== User Cache Methods ==========
-
-    /// Get cached username for a PID
-    #[allow(dead_code)]
-    pub fn get_user(&self, pid: u32) -> Option<String> {
-        self.entries
-            .read()
-            .ok()
-            .and_then(|cache| cache.get(&pid).and_then(|e| e.user.clone()))
+        io_rates
     }
 
     /// Cache username for a PID
@@ -163,72 +149,6 @@ impl ProcessCache {
             let entry = cache.entry(pid).or_default();
             entry.user = Some(user);
         }
-    }
-
-    // ========== Static Info Methods ==========
-
-    /// Get cached static info (is_elevated, arch, exe_path)
-    #[allow(dead_code)]
-    pub fn get_static_info(&self, pid: u32) -> Option<(bool, ProcessArch, String)> {
-        self.entries
-            .read()
-            .ok()
-            .and_then(|cache| {
-                cache.get(&pid).and_then(|e| {
-                    match (&e.is_elevated, &e.arch, &e.exe_path) {
-                        (Some(elev), Some(arch), Some(path)) => Some((*elev, *arch, path.clone())),
-                        _ => None,
-                    }
-                })
-            })
-    }
-
-    /// Cache static info for a PID
-    #[allow(dead_code)]
-    pub fn set_static_info(&self, pid: u32, is_elevated: bool, arch: ProcessArch, exe_path: String) {
-        if let Ok(mut cache) = self.entries.write() {
-            let entry = cache.entry(pid).or_default();
-            entry.is_elevated = Some(is_elevated);
-            entry.arch = Some(arch);
-            entry.exe_path = Some(exe_path);
-        }
-    }
-
-    // ========== Efficiency Mode Methods ==========
-
-    /// Get cached efficiency mode if still valid (within TTL)
-    #[allow(dead_code)]
-    pub fn get_efficiency_mode(&self, pid: u32) -> Option<bool> {
-        let now = Instant::now();
-        self.entries
-            .read()
-            .ok()
-            .and_then(|cache| {
-                cache.get(&pid).and_then(|e| {
-                    if let (Some(mode), Some(updated)) = (e.efficiency_mode, e.efficiency_updated)
-                        && now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS {
-                            return Some(mode);
-                        }
-                    None
-                })
-            })
-    }
-
-    /// Check if efficiency mode cache is stale
-    #[allow(dead_code)]
-    pub fn is_efficiency_stale(&self, pid: u32) -> bool {
-        let now = Instant::now();
-        self.entries
-            .read()
-            .ok()
-            .map(|cache| {
-                cache.get(&pid).is_none_or(|e| {
-                    e.efficiency_updated.is_none_or(|updated| {
-                        now.duration_since(updated).as_millis() >= config::EFFICIENCY_TTL_MS
-                    })
-                })
-            })
-            .unwrap_or(true)
     }
 
     /// Cache efficiency mode for a PID
@@ -321,19 +241,6 @@ impl ProcessCache {
         }
     }
 
-    /// Get snapshot of specific fields for specific PIDs
-    #[allow(dead_code)]
-    pub fn snapshot_for_pids(&self, pids: &[u32]) -> HashMap<u32, ProcessCacheEntry> {
-        self.entries
-            .read()
-            .map(|cache| {
-                pids.iter()
-                    .filter_map(|pid| cache.get(pid).map(|e| (*pid, e.clone())))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     // ========== Cleanup Methods ==========
 
     /// Check if cleanup should run (every CLEANUP_INTERVAL refreshes)
@@ -350,18 +257,6 @@ impl ProcessCache {
 
         // Exe status cache uses size-based cleanup (in check_exe_status)
         // No PID-based cleanup needed since keys are (path, start_time)
-    }
-
-    /// Force clear all caches (for testing or reset)
-    #[allow(dead_code)]
-    pub fn clear(&self) {
-        if let Ok(mut cache) = self.entries.write() {
-            cache.clear();
-        }
-        if let Ok(mut cache) = self.exe_status.write() {
-            cache.clear();
-        }
-        self.cleanup_counter.store(0, Ordering::Relaxed);
     }
 
     // ========== Batch Update Methods ==========
@@ -391,46 +286,56 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cpu_times() {
+    fn test_batch_update_and_io_rates() {
         let cache = ProcessCache::new();
-        assert!(cache.get_cpu_times(123).is_none());
 
-        cache.update_cpu_times(123, 1000, 2000);
-        let (k, u, _) = cache.get_cpu_times(123).unwrap();
-        assert_eq!(k, 1000);
-        assert_eq!(u, 2000);
+        // First tick: new process, rate should be 0
+        let rates = cache.update_times_batch(&[(100, 500, 600, 9999, 1000, 2000)]);
+        assert_eq!(rates[&100], (0, 0)); // First appearance → zero rate
+
+        // Second tick: delta-based rate
+        let rates = cache.update_times_batch(&[(100, 700, 800, 9999, 1500, 2800)]);
+        assert_eq!(rates[&100], (500, 800)); // 1500-1000, 2800-2000
+
+        // PID reuse (different create_time): rate resets to 0
+        let rates = cache.update_times_batch(&[(100, 10, 20, 5555, 300, 400)]);
+        assert_eq!(rates[&100], (0, 0));
     }
 
     #[test]
     fn test_user_cache() {
         let cache = ProcessCache::new();
-        assert!(cache.get_user(123).is_none());
-
         cache.set_user(123, "testuser".to_string());
-        assert_eq!(cache.get_user(123), Some("testuser".to_string()));
+        let snap = cache.snapshot();
+        assert_eq!(snap[&123].user, Some("testuser".to_string()));
     }
 
     #[test]
     fn test_cleanup() {
         let cache = ProcessCache::new();
-        cache.update_cpu_times(1, 100, 200);
-        cache.update_cpu_times(2, 100, 200);
-        cache.update_cpu_times(3, 100, 200);
+        cache.update_times_batch(&[
+            (1, 100, 200, 1, 0, 0),
+            (2, 100, 200, 2, 0, 0),
+            (3, 100, 200, 3, 0, 0),
+        ]);
 
         let current_pids: HashSet<u32> = [1, 3].into_iter().collect();
         cache.cleanup(&current_pids);
 
-        assert!(cache.get_cpu_times(1).is_some());
-        assert!(cache.get_cpu_times(2).is_none()); // Cleaned up
-        assert!(cache.get_cpu_times(3).is_some());
+        let snap = cache.snapshot();
+        assert!(snap.contains_key(&1));
+        assert!(!snap.contains_key(&2)); // Cleaned up
+        assert!(snap.contains_key(&3));
     }
 
     #[test]
     fn test_snapshot() {
         let cache = ProcessCache::new();
-        cache.update_cpu_times(1, 100, 200);
+        cache.update_times_batch(&[
+            (1, 100, 200, 1, 0, 0),
+            (2, 300, 400, 2, 0, 0),
+        ]);
         cache.set_user(1, "user1".to_string());
-        cache.update_cpu_times(2, 300, 400);
 
         let snapshot = cache.snapshot();
         assert_eq!(snapshot.len(), 2);

@@ -8,7 +8,7 @@ use crate::terminal::{
     Block, Constraint, Direction, Frame, Layout, Line, Modifier, Paragraph, Rect, Span, Style,
 };
 
-use crate::app::{App, ColumnBounds, SortColumn, ViewMode};
+use crate::app::{App, ColumnBounds, DialogState, SortColumn};
 
 /// Draw the entire UI
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -74,23 +74,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     footer::draw(frame, app, chunks[3]);
 
     // Draw dialog overlays if needed
-    match app.view_mode {
-        ViewMode::Help => dialogs::draw_help(frame, app),
-        ViewMode::Search => dialogs::draw_search(frame, app),
-        ViewMode::Filter => dialogs::draw_filter(frame, app),
-        ViewMode::SortSelect => dialogs::draw_sort_select(frame, app),
-        ViewMode::Kill => dialogs::draw_kill_confirm(frame, app),
-        ViewMode::SignalSelect => dialogs::draw_signal_select(frame, app),
-        ViewMode::Priority => dialogs::draw_priority(frame, app),
-        ViewMode::Setup => dialogs::draw_setup(frame, app),
-        ViewMode::ProcessInfo => dialogs::draw_process_info(frame, app),
-        ViewMode::UserSelect => dialogs::draw_user_select(frame, app),
-        ViewMode::Environment => dialogs::draw_environment(frame, app),
-        ViewMode::ColorScheme => dialogs::draw_color_scheme(frame, app),
-        ViewMode::CommandWrap => dialogs::draw_command_wrap(frame, app),
-        ViewMode::ColumnConfig => dialogs::draw_column_config(frame, app),
-        ViewMode::Affinity => dialogs::draw_affinity(frame, app),
-        ViewMode::Normal => {}
+    match &app.dialog {
+        DialogState::Help { .. } => dialogs::draw_help(frame, app),
+        DialogState::Search { .. } => dialogs::draw_search(frame, app),
+        DialogState::Filter { .. } => dialogs::draw_filter(frame, app),
+        DialogState::SortSelect { .. } => dialogs::draw_sort_select(frame, app),
+        DialogState::Kill { .. } => dialogs::draw_kill_confirm(frame, app),
+        DialogState::SignalSelect { .. } => dialogs::draw_signal_select(frame, app),
+        DialogState::Priority { .. } => dialogs::draw_priority(frame, app),
+        DialogState::Setup { .. } => dialogs::draw_setup(frame, app),
+        DialogState::ProcessInfo { .. } => dialogs::draw_process_info(frame, app),
+        DialogState::UserSelect { .. } => dialogs::draw_user_select(frame, app),
+        DialogState::Environment { .. } => dialogs::draw_environment(frame, app),
+        DialogState::ColorScheme { .. } => dialogs::draw_color_scheme(frame, app),
+        DialogState::CommandWrap { .. } => dialogs::draw_command_wrap(frame, app),
+        DialogState::ColumnConfig { .. } => dialogs::draw_column_config(frame, app),
+        DialogState::Affinity { .. } => dialogs::draw_affinity(frame, app),
+        DialogState::None => {}
     }
 
     // Draw error message if present (within expiry window)

@@ -3,7 +3,7 @@ use crate::terminal::{
     Scrollbar, ScrollbarOrientation, ScrollbarState, Span, Style, Wrap,
 };
 
-use crate::app::{App, SortColumn};
+use crate::app::{App, DialogState, SortColumn};
 use crate::system::format_bytes;
 use crate::ui::{centered_rect, centered_rect_fixed};
 use crate::ui::colors::ColorScheme;
@@ -43,6 +43,7 @@ const SIGNALS: &[(u32, &str, &str)] = &[
 
 /// Draw help dialog
 pub fn draw_help(frame: &mut Frame, app: &App) {
+    let DialogState::Help { scroll } = &app.dialog else { return; };
     let area = centered_rect(80, 80, frame.area());
 
     let help_text = vec![
@@ -169,7 +170,7 @@ pub fn draw_help(frame: &mut Frame, app: &App) {
 
     let items: Vec<ListItem> = help_text
         .iter()
-        .skip(app.help_scroll)
+        .skip(*scroll)
         .map(|line| ListItem::new(Line::from(*line)))
         .collect();
 
@@ -194,7 +195,7 @@ pub fn draw_help(frame: &mut Frame, app: &App) {
             area.height.saturating_sub(2),
         );
         let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_lines))
-            .position(app.help_scroll);
+            .position(*scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray));
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
@@ -203,9 +204,13 @@ pub fn draw_help(frame: &mut Frame, app: &App) {
 
 /// Draw search dialog
 pub fn draw_search(frame: &mut Frame, app: &App) {
+    let (buffer, cursor) = match app.dialog.input_buffer() {
+        Some((b, c)) => (b, c),
+        None => return,
+    };
     let area = centered_rect_fixed(50, 3, frame.area());
 
-    let input = Paragraph::new(format!("/{}", app.input_buffer))
+    let input = Paragraph::new(format!("/{}", buffer))
         .block(
             Block::default()
                 .title(" Search ")
@@ -218,14 +223,18 @@ pub fn draw_search(frame: &mut Frame, app: &App) {
     frame.render_widget(input, area);
 
     // Set cursor position
-    frame.set_cursor_position((area.x + 1 + app.input_cursor as u16 + 1, area.y + 1));
+    frame.set_cursor_position((area.x + 1 + cursor as u16 + 1, area.y + 1));
 }
 
 /// Draw filter dialog
 pub fn draw_filter(frame: &mut Frame, app: &App) {
+    let (buffer, cursor) = match app.dialog.input_buffer() {
+        Some((b, c)) => (b, c),
+        None => return,
+    };
     let area = centered_rect_fixed(50, 3, frame.area());
 
-    let input = Paragraph::new(format!("Filter: {}", app.input_buffer))
+    let input = Paragraph::new(format!("Filter: {}", buffer))
         .block(
             Block::default()
                 .title(" Filter ")
@@ -238,11 +247,12 @@ pub fn draw_filter(frame: &mut Frame, app: &App) {
     frame.render_widget(input, area);
 
     // Set cursor position
-    frame.set_cursor_position((area.x + 9 + app.input_cursor as u16, area.y + 1));
+    frame.set_cursor_position((area.x + 9 + cursor as u16, area.y + 1));
 }
 
 /// Draw sort selection dialog
 pub fn draw_sort_select(frame: &mut Frame, app: &App) {
+    let DialogState::SortSelect { index } = &app.dialog else { return; };
     let theme = &app.theme;
     let columns = SortColumn::all();
     let area = centered_rect_fixed(30, (columns.len() + 2) as u16, frame.area());
@@ -258,7 +268,7 @@ pub fn draw_sort_select(frame: &mut Frame, app: &App) {
             };
 
             ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:<12}{}", col.name(), indicator), item_style(idx == app.sort_select_index, theme)),
+                Span::styled(format!(" {:<12}{}", col.name(), indicator), item_style(idx == *index, theme)),
             ]))
         })
         .collect();
@@ -279,6 +289,7 @@ pub fn draw_sort_select(frame: &mut Frame, app: &App) {
 
 /// Draw kill confirmation dialog
 pub fn draw_kill_confirm(frame: &mut Frame, app: &App) {
+    let DialogState::Kill { pid, name, command } = &app.dialog else { return; };
     let tagged_count = app.tagged_pids.len();
 
     // Determine dialog height based on tagged processes
@@ -301,7 +312,7 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &App) {
         lines.push(Line::from(""));
 
         // List tagged processes (show up to 8)
-        for (shown, pid) in app.tagged_pids.iter().enumerate() {
+        for (shown, tagged_pid) in app.tagged_pids.iter().enumerate() {
             if shown >= 8 {
                 lines.push(Line::from(Span::styled(
                     format!("  ... and {} more", tagged_count - 8),
@@ -310,14 +321,14 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &App) {
                 break;
             }
             // Try to find process name
-            let name = app.displayed_processes
+            let proc_name = app.displayed_processes
                 .iter()
-                .find(|p| p.pid == *pid)
+                .find(|p| p.pid == *tagged_pid)
                 .map(|p| p.name.as_str())
                 .unwrap_or("(unknown)");
             lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", pid), Style::default().fg(Color::Yellow)),
-                Span::styled(name, Style::default().fg(theme.text)),
+                Span::styled(format!("  {} ", tagged_pid), Style::default().fg(Color::Yellow)),
+                Span::styled(proc_name, Style::default().fg(theme.text)),
             ]));
         }
     } else {
@@ -328,22 +339,18 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &App) {
         )));
         lines.push(Line::from(""));
 
-        if let Some((pid, ref name, ref command)) = app.kill_target {
-            lines.push(Line::from(vec![
-                Span::styled("PID:  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(format!("{}", pid), Style::default().fg(Color::Yellow)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("Name: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(name.clone(), Style::default().fg(theme.text)),
-            ]));
-            lines.push(Line::from(vec![
-                Span::styled("Cmd:  ", Style::default().fg(Color::DarkGray)),
-                Span::styled(truncate_str(command, 42), Style::default().fg(Color::DarkGray)),
-            ]));
-        } else {
-            lines.push(Line::from("No process selected"));
-        }
+        lines.push(Line::from(vec![
+            Span::styled("PID:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}", pid), Style::default().fg(Color::Yellow)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Name: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(name.clone(), Style::default().fg(theme.text)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Cmd:  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(truncate_str(command, 42), Style::default().fg(Color::DarkGray)),
+        ]));
     }
 
     lines.push(Line::from(""));
@@ -372,20 +379,15 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &App) {
 pub fn draw_priority(frame: &mut Frame, app: &App) {
     use crate::app::WindowsPriorityClass;
 
+    let DialogState::Priority { class_index, pid, name, .. } = &app.dialog else { return; };
     let classes = WindowsPriorityClass::all();
     let area = centered_rect_fixed(55, (classes.len() + 8) as u16, frame.area());
     let theme = &app.theme;
 
-    // Use captured kill_target for consistency (Priority shares target with Kill)
-    let process_info = if let Some((pid, ref name, _)) = app.kill_target {
-        format!("PID: {} - {}", pid, name)
-    } else {
-        "No process selected".to_string()
-    };
+    let process_info = format!("PID: {} - {}", pid, name);
 
-    // Get efficiency mode status from process_info_target or selected process
-    let efficiency_mode = app.process_info_target.as_ref()
-        .or_else(|| app.selected_process())
+    // Get efficiency mode status from selected process
+    let efficiency_mode = app.selected_process()
         .map(|p| p.efficiency_mode)
         .unwrap_or(false);
 
@@ -394,8 +396,8 @@ pub fn draw_priority(frame: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(idx, class)| {
-            let indicator = if idx == app.priority_class_index { "▶ " } else { "  " };
-            let style = if idx == app.priority_class_index {
+            let indicator = if idx == *class_index { "▶ " } else { "  " };
+            let style = if idx == *class_index {
                 selected_style(theme)
             } else {
                 normal_style(theme)
@@ -437,6 +439,7 @@ pub fn draw_priority(frame: &mut Frame, app: &App) {
 
 /// Draw setup menu
 pub fn draw_setup(frame: &mut Frame, app: &App) {
+    let DialogState::Setup { selected } = &app.dialog else { return; };
     let theme = &app.theme;
     let area = centered_rect(60, 60, frame.area());
 
@@ -462,7 +465,7 @@ pub fn draw_setup(frame: &mut Frame, app: &App) {
         .enumerate()
         .map(|(idx, (label, value))| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:<30} ", label), item_style(idx == app.setup_selected, theme)),
+                Span::styled(format!(" {:<30} ", label), item_style(idx == *selected, theme)),
                 Span::styled(value.to_string(), Style::default().fg(Color::Green)),
             ]))
         })
@@ -498,11 +501,13 @@ fn meter_mode_str(mode: crate::config::MeterMode) -> String {
 
 /// Draw process info dialog
 pub fn draw_process_info(frame: &mut Frame, app: &App) {
+    let DialogState::ProcessInfo { target } = &app.dialog else { return; };
     let theme = &app.theme;
     let area = centered_rect(70, 80, frame.area());
 
-    // Use captured process_info_target to prevent race condition with list refresh
-    let content = if let Some(ref proc) = app.process_info_target {
+    // Use captured target to prevent race condition with list refresh
+    let content = {
+        let proc = target;
         let status_desc = match proc.status {
             'R' => "Running",
             'S' => "Sleeping",
@@ -601,14 +606,12 @@ pub fn draw_process_info(frame: &mut Frame, app: &App) {
             exe_display,
             proc.command,
         )
-    } else {
-        "No process selected".to_string()
     };
 
     let dialog = Paragraph::new(content)
         .block(
             Block::default()
-                .title(format!(" {} ", app.process_info_target.as_ref().map(|p| p.name.as_str()).unwrap_or("Process Details")))
+                .title(format!(" {} ", target.name))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan))
                 .style(Style::default().bg(theme.background)),
@@ -663,27 +666,24 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
 /// Draw signal selection dialog
 pub fn draw_signal_select(frame: &mut Frame, app: &App) {
+    let DialogState::SignalSelect { index, pid, name, .. } = &app.dialog else { return; };
     let theme = &app.theme;
     let area = centered_rect_fixed(40, (SIGNALS.len() + 4) as u16, frame.area());
 
     let items: Vec<ListItem> = SIGNALS
         .iter()
         .enumerate()
-        .map(|(idx, (num, name, desc))| {
-            let style = item_style(idx == app.signal_select_index, theme);
+        .map(|(idx, (num, sig_name, desc))| {
+            let style = item_style(idx == *index, theme);
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {:2} ", num), style),
-                Span::styled(format!("{:<10}", name), style),
+                Span::styled(format!("{:<10}", sig_name), style),
                 Span::styled(desc.to_string(), style),
             ]))
         })
         .collect();
 
-    let title = if let Some((pid, ref name, _)) = app.kill_target {
-        format!(" Send Signal to {} ({}) ", name, pid)
-    } else {
-        " Send Signal ".to_string()
-    };
+    let title = format!(" Send Signal to {} ({}) ", name, pid);
 
     let block = Block::default()
         .title(title)
@@ -701,8 +701,9 @@ pub fn draw_signal_select(frame: &mut Frame, app: &App) {
 
 /// Draw user selection dialog
 pub fn draw_user_select(frame: &mut Frame, app: &App) {
+    let DialogState::UserSelect { index, users } = &app.dialog else { return; };
     let theme = &app.theme;
-    let num_items = app.user_list.len() + 1; // +1 for "All users"
+    let num_items = users.len() + 1; // +1 for "All users"
     let area = centered_rect_fixed(35, (num_items + 2).min(20) as u16, frame.area());
 
     let mut items: Vec<ListItem> = Vec::with_capacity(num_items);
@@ -710,14 +711,14 @@ pub fn draw_user_select(frame: &mut Frame, app: &App) {
     // "All users" option
     items.push(ListItem::new(Line::from(Span::styled(
         " [All users]",
-        item_style(app.user_select_index == 0, theme),
+        item_style(*index == 0, theme),
     ))));
 
     // Individual users
-    for (idx, user) in app.user_list.iter().enumerate() {
+    for (idx, user) in users.iter().enumerate() {
         items.push(ListItem::new(Line::from(Span::styled(
             format!(" {}", user),
-            item_style(idx + 1 == app.user_select_index, theme),
+            item_style(idx + 1 == *index, theme),
         ))));
     }
 
@@ -737,10 +738,10 @@ pub fn draw_user_select(frame: &mut Frame, app: &App) {
 
 /// Draw environment variables dialog
 pub fn draw_environment(frame: &mut Frame, app: &App) {
+    let DialogState::Environment { scroll: _ } = &app.dialog else { return; };
     let area = centered_rect(80, 80, frame.area());
 
-    let content = app.process_info_target.as_ref()
-        .or_else(|| app.selected_process())
+    let content = app.selected_process()
         .map(|proc| format!(
             "Environment Variables for {} (PID: {})\n\n\
              Note: Environment variables cannot be read from \n\
@@ -767,6 +768,7 @@ pub fn draw_environment(frame: &mut Frame, app: &App) {
 
 /// Draw color scheme selection dialog
 pub fn draw_color_scheme(frame: &mut Frame, app: &App) {
+    let DialogState::ColorScheme { index } = &app.dialog else { return; };
     let theme = &app.theme;
     let schemes = ColorScheme::all();
     let area = centered_rect_fixed(30, (schemes.len() + 2) as u16, frame.area());
@@ -777,7 +779,7 @@ pub fn draw_color_scheme(frame: &mut Frame, app: &App) {
         .map(|(idx, scheme)| {
             let indicator = if *scheme == app.config.color_scheme { " ●" } else { "  " };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{} {}", indicator, scheme.name()), item_style(idx == app.color_scheme_index, theme)),
+                Span::styled(format!("{} {}", indicator, scheme.name()), item_style(idx == *index, theme)),
             ]))
         })
         .collect();
@@ -808,6 +810,7 @@ pub fn signal_count() -> usize {
 
 /// Draw wrapped command display dialog
 pub fn draw_command_wrap(frame: &mut Frame, app: &App) {
+    let DialogState::CommandWrap { scroll } = &app.dialog else { return; };
     let area = centered_rect(80, 70, frame.area());
 
     let content = if let Some(proc) = app.selected_process() {
@@ -853,7 +856,7 @@ pub fn draw_command_wrap(frame: &mut Frame, app: &App) {
 
     let items: Vec<ListItem> = content
         .lines()
-        .skip(app.command_wrap_scroll)
+        .skip(*scroll)
         .map(|line| ListItem::new(Line::from(line.to_string())))
         .collect();
 
@@ -876,7 +879,7 @@ pub fn draw_command_wrap(frame: &mut Frame, app: &App) {
             area.height.saturating_sub(2),
         );
         let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_lines))
-            .position(app.command_wrap_scroll);
+            .position(*scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray));
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
@@ -885,6 +888,7 @@ pub fn draw_command_wrap(frame: &mut Frame, app: &App) {
 
 /// Draw column configuration dialog
 pub fn draw_column_config(frame: &mut Frame, app: &App) {
+    let DialogState::ColumnConfig { index } = &app.dialog else { return; };
     let theme = &app.theme;
     let columns = SortColumn::all();
     let area = centered_rect_fixed(50, (columns.len() + 4) as u16, frame.area());
@@ -902,7 +906,7 @@ pub fn draw_column_config(frame: &mut Frame, app: &App) {
             } else {
                 "  ".to_string()
             };
-            let style = if idx == app.column_config_index {
+            let style = if idx == *index {
                 selected_style(theme)
             } else if is_visible {
                 Style::default().fg(Color::Green).bg(theme.background)
@@ -938,6 +942,7 @@ pub fn draw_column_config(frame: &mut Frame, app: &App) {
 
 /// Draw CPU affinity dialog
 pub fn draw_affinity(frame: &mut Frame, app: &App) {
+    let DialogState::Affinity { mask, selected } = &app.dialog else { return; };
     let theme = &app.theme;
     let cpu_count = app.system_metrics.cpu.core_usage.len();
     let height = (cpu_count + 4).min(20) as u16;
@@ -955,9 +960,9 @@ pub fn draw_affinity(frame: &mut Frame, app: &App) {
     items.push(ListItem::new(Line::from("")));
 
     for cpu_idx in 0..cpu_count {
-        let is_set = (app.affinity_mask & (1u64 << cpu_idx)) != 0;
+        let is_set = (mask & (1u64 << cpu_idx)) != 0;
         let checkbox = if is_set { "[✓]" } else { "[ ]" };
-        let style = if cpu_idx == app.affinity_selected {
+        let style = if cpu_idx == *selected {
             selected_style(theme)
         } else if is_set {
             Style::default().fg(Color::Green).bg(theme.background)

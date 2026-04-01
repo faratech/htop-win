@@ -191,24 +191,28 @@ where
 // It was used in from_native, so we might need a version of it or update from_native.
 // We'll update from_native to use SystemProcess.
 
-// Helper for CPU calculation that works with iterator
-pub fn calculate_cpu_percentages_from_iter(
+/// CPU and I/O rate data computed from cache deltas
+pub struct ProcessRates {
+    pub cpu_percentages: HashMap<u32, f32>,
+    pub io_rates: HashMap<u32, (u64, u64)>, // (read_rate, write_rate)
+}
+
+/// Calculate CPU percentages and I/O rates for all processes using cache deltas
+pub fn calculate_process_rates(
     list: &SystemProcessList,
     total_cpu_delta: u64,
-) -> HashMap<u32, f32> {
+) -> ProcessRates {
     use super::cache::CACHE;
 
     let now = std::time::Instant::now();
     let mut updates = Vec::with_capacity(500);
 
-    // Read cache under lock without cloning the entire HashMap
     let cpu_percentages = CACHE.with_read(|cache_snapshot| {
         let mut percentages = HashMap::with_capacity(500);
 
         for proc in list.iter() {
             let pid = proc.pid();
 
-            // System Idle Process (PID 0) represents idle CPU time, not actual work
             if pid == 0 {
                 percentages.insert(0, 0.0);
                 continue;
@@ -221,7 +225,6 @@ pub fn calculate_cpu_percentages_from_iter(
                 let time_delta = total_time.saturating_sub(prev_total);
 
                 if now > entry.cpu_time_updated && total_cpu_delta > 0 {
-                    // CPU percentage relative to total system CPU time
                     (time_delta as f64 / total_cpu_delta as f64 * 100.0) as f32
                 } else {
                     0.0
@@ -232,16 +235,23 @@ pub fn calculate_cpu_percentages_from_iter(
 
             percentages.insert(pid, cpu_percent);
 
-            updates.push((pid, proc.kernel_time(), proc.user_time(), proc.create_time()));
+            updates.push((
+                pid,
+                proc.kernel_time(),
+                proc.user_time(),
+                proc.create_time(),
+                proc.read_bytes(),
+                proc.write_bytes(),
+            ));
         }
 
         percentages
     });
 
-    // Batch update cache
-    CACHE.update_cpu_times_batch(&updates);
+    // Batch update cache and get I/O rates back
+    let io_rates = CACHE.update_times_batch(&updates);
 
-    cpu_percentages
+    ProcessRates { cpu_percentages, io_rates }
 }
 
 /// Convert FILETIME (100-ns intervals since 1601) to Unix timestamp

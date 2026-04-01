@@ -2,7 +2,7 @@ use crate::terminal::{
     Color, Frame, Line, Modifier, Paragraph, Rect, Span, Style,
 };
 
-use crate::app::{App, FocusRegion, ViewMode};
+use crate::app::{App, DialogState, FocusRegion};
 
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let function_keys = get_function_keys_with_num(app);
@@ -82,8 +82,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
 /// Returns function keys with: (Option<function_key_number>, key_text, label)
 /// The function key number is used for registering click regions (e.g., Some(1) for F1)
 fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'static str)> {
-    match app.view_mode {
-        ViewMode::Help => vec![
+    match &app.dialog {
+        DialogState::Help { .. } => vec![
             (Some(1), "F1", ""),
             (Some(2), "F2", ""),
             (Some(3), "F3", ""),
@@ -95,7 +95,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (Some(9), "F9", ""),
             (Some(10), "F10", "Quit"),
         ],
-        ViewMode::Search => vec![
+        DialogState::Search { .. } => vec![
             (None, "Enter", "Done"),
             (None, "Esc", "Cancel"),
             (Some(3), "F3", "Next"),
@@ -107,7 +107,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        ViewMode::Filter => vec![
+        DialogState::Filter { .. } => vec![
             (None, "Enter", "Done"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
@@ -119,7 +119,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        ViewMode::SortSelect => vec![
+        DialogState::SortSelect { .. } => vec![
             (None, "Enter", "Select"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
@@ -131,7 +131,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        ViewMode::Kill => vec![
+        DialogState::Kill { .. } => vec![
             (None, "Enter", "Kill"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
@@ -143,7 +143,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        ViewMode::Priority => vec![
+        DialogState::Priority { .. } => vec![
             (None, "↑/↓", "Select"),
             (None, "Enter", "Set"),
             (None, "Esc", "Cancel"),
@@ -155,7 +155,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        ViewMode::SignalSelect => vec![
+        DialogState::SignalSelect { .. } => vec![
             (None, "Enter", "Kill"),
             (None, "Esc", "Back"),
             (None, "", ""),
@@ -167,7 +167,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        ViewMode::UserSelect => vec![
+        DialogState::UserSelect { .. } => vec![
             (None, "Enter", "Select"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
@@ -179,7 +179,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        ViewMode::Environment => vec![
+        DialogState::Environment { .. } => vec![
             (None, "Esc", "Close"),
             (None, "↑↓", "Scroll"),
             (None, "", ""),
@@ -191,7 +191,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        ViewMode::ColorScheme => vec![
+        DialogState::ColorScheme { .. } => vec![
             (None, "Enter", "Select"),
             (None, "Esc", "Back"),
             (None, "", ""),
@@ -203,7 +203,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        ViewMode::CommandWrap => vec![
+        DialogState::CommandWrap { .. } => vec![
             (None, "Esc", "Close"),
             (None, "↑↓", "Scroll"),
             (None, "", ""),
@@ -215,7 +215,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        ViewMode::ColumnConfig => vec![
+        DialogState::ColumnConfig { .. } => vec![
             (None, "Space", "Toggle"),
             (None, "Shift+↑↓", "Order"),
             (None, "Esc", "Done"),
@@ -227,7 +227,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        ViewMode::Affinity => vec![
+        DialogState::Affinity { .. } => vec![
             (None, "Space", "Toggle"),
             (None, "a", "All"),
             (None, "n", "None"),
@@ -239,7 +239,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        ViewMode::Normal | ViewMode::Setup | ViewMode::ProcessInfo => vec![
+        DialogState::None | DialogState::Setup { .. } | DialogState::ProcessInfo { .. } => vec![
             (Some(1), "F1", "Help"),
             (Some(2), "F2", "Setup"),
             (Some(3), "F3", "Search"),

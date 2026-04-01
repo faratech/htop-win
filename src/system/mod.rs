@@ -13,6 +13,7 @@ pub use process::{
 };
 
 /// System metrics
+#[derive(Clone)]
 pub struct SystemMetrics {
     pub cpu: CpuInfo,
     pub memory: MemoryInfo,
@@ -206,7 +207,7 @@ impl SystemMetrics {
     /// Reuse existing ProcessInfo structs to avoid memory allocation for strings
     pub fn update_processes_native(&mut self, processes: &mut Vec<ProcessInfo>) {
         use std::collections::{HashMap, HashSet};
-        use self::native::{with_process_list, calculate_cpu_percentages_from_iter, filetime_to_unix};
+        use self::native::{with_process_list, calculate_process_rates, filetime_to_unix};
         use self::cache::CACHE;
 
         // Periodically clean up stale PIDs from caches
@@ -239,8 +240,8 @@ impl SystemMetrics {
             let cpu_delta = total_cpu_time.saturating_sub(self.prev_total_cpu_time);
             self.prev_total_cpu_time = total_cpu_time;
 
-            // Get CPU percentages based on time deltas
-            let cpu_percentages = calculate_cpu_percentages_from_iter(&proc_list, cpu_delta);
+            // Get CPU percentages and I/O rates based on cache deltas
+            let rates = calculate_process_rates(&proc_list, cpu_delta);
 
             // Update global stats
             self.tasks_total = tasks_total;
@@ -274,29 +275,27 @@ impl SystemMetrics {
             for raw_proc in proc_list.iter() {
                 let pid = raw_proc.pid();
                 seen_pids.insert(pid);
-                
+                let cpu_pct = rates.cpu_percentages.get(&pid).copied().unwrap_or(0.0);
+                let (io_read_rate, io_write_rate) = rates.io_rates.get(&pid).copied().unwrap_or((0, 0));
+
                 if let Some(&idx) = existing_map.get(&pid) {
-                    // Check if it's the same process instance (start time match)
                     let native_start = filetime_to_unix(raw_proc.create_time());
                     let existing_proc = &mut processes[idx];
-                    
+
                     if (native_start as i64 - existing_proc.start_time as i64).abs() <= 1 {
-                        // Update existing process - capture IO before update for rate calc
-                        let prev_io_read = existing_proc.io_read_bytes;
-                        let prev_io_write = existing_proc.io_write_bytes;
-                        let cpu_pct = cpu_percentages.get(&pid).copied().unwrap_or(0.0);
+                        // Update existing process (reuses string allocations)
                         existing_proc.update_from_raw(&raw_proc, cpu_pct, total_mem);
-                        existing_proc.io_read_rate = existing_proc.io_read_bytes.saturating_sub(prev_io_read);
-                        existing_proc.io_write_rate = existing_proc.io_write_bytes.saturating_sub(prev_io_write);
                     } else {
-                        // PID reuse: replace existing process
-                        let cpu_pct = cpu_percentages.get(&pid).copied().unwrap_or(0.0);
+                        // PID reuse: replace entirely
                         *existing_proc = ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem);
                     }
+                    existing_proc.io_read_rate = io_read_rate;
+                    existing_proc.io_write_rate = io_write_rate;
                 } else {
-                    // New process
-                    let cpu_pct = cpu_percentages.get(&pid).copied().unwrap_or(0.0);
-                    new_processes.push(ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem));
+                    let mut proc_info = ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem);
+                    proc_info.io_read_rate = io_read_rate;
+                    proc_info.io_write_rate = io_write_rate;
+                    new_processes.push(proc_info);
                 }
             }
 

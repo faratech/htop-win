@@ -477,26 +477,53 @@ impl ScreenTab {
     }
 }
 
-/// Current view mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum ViewMode {
-    Normal,
-    Help,
-    Search,
-    Filter,
-    SortSelect,
-    Kill,
-    SignalSelect,  // Select signal for kill
-    Priority,      // Set process priority
-    Setup,
-    ProcessInfo,
-    UserSelect,    // Select user to filter by
-    Environment,   // View process environment variables
-    ColorScheme,   // Select color scheme
-    CommandWrap,   // View wrapped command line
-    ColumnConfig,  // Configure visible columns
-    Affinity,      // Set CPU affinity
+/// Dialog/view state - encapsulates per-dialog state into enum variants
+/// Replaces the previous flat ViewMode enum + scattered dialog fields
+#[derive(Debug, Clone)]
+pub enum DialogState {
+    /// Normal process list view (no dialog open)
+    None,
+    Help { scroll: usize },
+    Search { buffer: String, cursor: usize },
+    Filter { buffer: String, cursor: usize },
+    SortSelect { index: usize },
+    Kill { pid: u32, name: String, command: String },
+    SignalSelect { index: usize, pid: u32, name: String, command: String },
+    Priority { class_index: usize, pid: u32, name: String },
+    Setup { selected: usize },
+    ProcessInfo { target: Box<ProcessInfo> },
+    UserSelect { index: usize, users: Vec<String> },
+    Environment { scroll: usize },
+    ColorScheme { index: usize },
+    CommandWrap { scroll: usize },
+    ColumnConfig { index: usize },
+    Affinity { mask: u64, selected: usize },
+}
+
+impl Default for DialogState {
+    fn default() -> Self {
+        DialogState::None
+    }
+}
+
+impl DialogState {
+    /// Get mutable reference to input buffer and cursor (Search/Filter dialogs)
+    pub fn input_buffer_mut(&mut self) -> Option<(&mut String, &mut usize)> {
+        match self {
+            DialogState::Search { buffer, cursor }
+            | DialogState::Filter { buffer, cursor } => Some((buffer, cursor)),
+            _ => None,
+        }
+    }
+
+    /// Get input buffer contents (Search/Filter dialogs)
+    pub fn input_buffer(&self) -> Option<(&str, usize)> {
+        match self {
+            DialogState::Search { buffer, cursor }
+            | DialogState::Filter { buffer, cursor } => Some((buffer, *cursor)),
+            _ => None,
+        }
+    }
 }
 
 /// Application state
@@ -505,8 +532,8 @@ pub struct App {
     pub config: Config,
     /// Current color theme (derived from config)
     pub theme: Theme,
-    /// Current view mode
-    pub view_mode: ViewMode,
+    /// Current dialog/view state
+    pub dialog: DialogState,
     /// System metrics (CPU, memory, etc.)
     pub system_metrics: SystemMetrics,
     /// All processes
@@ -541,64 +568,29 @@ pub struct App {
     pub pid_filter: Option<HashSet<u32>>,
     /// Tagged process PIDs
     pub tagged_pids: HashSet<u32>,
-    /// Input buffer for dialogs
-    pub input_buffer: String,
-    /// Cursor position in input buffer
-    pub input_cursor: usize,
-    /// Selected sort column index (for sort select dialog)
-    pub sort_select_index: usize,
     /// Process list visible height (set during render)
     pub visible_height: usize,
-    /// Help scroll offset
-    pub help_scroll: usize,
-    /// Setup menu selected item
-    pub setup_selected: usize,
-    /// Priority class index for priority dialog (0=Idle, 5=Realtime)
-    pub priority_class_index: usize,
     /// Last error message with timestamp for auto-expiry
     pub last_error: Option<(String, Instant)>,
     /// Status message (success/info) with timestamp for auto-expiry
     pub status_message: Option<(String, Instant)>,
-    /// Kill target (captured when entering Kill mode to prevent race conditions)
-    pub kill_target: Option<(u32, String, String)>,  // (pid, name, command)
-    /// Process info target (captured when entering ProcessInfo mode)
-    pub process_info_target: Option<crate::system::ProcessInfo>,
 
-    // New fields for additional features
     /// Collapsed PIDs in tree view
     pub collapsed_pids: HashSet<u32>,
     /// Follow mode: PID to follow across refreshes
     pub follow_pid: Option<u32>,
     /// Pause updates
     pub paused: bool,
-    /// Selected signal index for kill dialog
-    pub signal_select_index: usize,
-    /// Selected user index for user filter dialog
-    pub user_select_index: usize,
-    /// List of unique users (populated for user select dialog)
-    pub user_list: Vec<String>,
-    /// Color scheme select index
-    pub color_scheme_index: usize,
-    /// Environment variables scroll offset
-    pub env_scroll: usize,
     /// PID search buffer (for incremental PID search with digits)
     pub pid_search_buffer: String,
     /// Last PID search time (for timeout)
     pub pid_search_time: Option<Instant>,
     /// Show header meters
     pub show_header: bool,
-    /// Command wrap scroll offset
-    pub command_wrap_scroll: usize,
     /// Maximum iterations before exit (for -n option)
     pub max_iterations: Option<u64>,
     /// Current iteration count
     pub iteration_count: u64,
-    /// Column config scroll/selection
-    pub column_config_index: usize,
-    /// CPU affinity mask for affinity dialog
-    pub affinity_mask: u64,
-    /// Selected CPU in affinity dialog
-    pub affinity_selected: usize,
     /// CPU usage history for graph mode (per core, last N samples)
     pub cpu_history: Vec<VecDeque<f32>>,
     /// Memory usage history for graph mode (last N samples)
@@ -606,6 +598,8 @@ pub struct App {
     pub swap_history: VecDeque<f32>,
     /// Cached visible columns (updated when column config changes)
     pub cached_visible_columns: Vec<SortColumn>,
+    /// Deferred process list update flag (flushed once before each render)
+    pub needs_process_update: bool,
     /// UI layout bounds (populated during render for accurate mouse/keyboard navigation)
     pub ui_bounds: UIBounds,
 
@@ -642,7 +636,7 @@ impl App {
         Self {
             config,
             theme,
-            view_mode: ViewMode::Normal,
+            dialog: DialogState::None,
             system_metrics: SystemMetrics::default(),
             processes: Vec::new(),
             displayed_processes: Vec::new(),
@@ -658,39 +652,22 @@ impl App {
             user_filter: None,
             pid_filter: None,
             tagged_pids: HashSet::new(),
-            input_buffer: String::new(),
-            input_cursor: 0,
-            sort_select_index: 0,
             visible_height: 20,
-            help_scroll: 0,
-            setup_selected: 0,
-            priority_class_index: 2, // Default to Normal
             last_error: None,
             status_message: None,
-            kill_target: None,
-            process_info_target: None,
-            // New fields
             collapsed_pids: HashSet::new(),
             follow_pid: None,
             paused: false,
-            signal_select_index: 0,
-            user_select_index: 0,
-            user_list: Vec::new(),
-            color_scheme_index: 0,
-            env_scroll: 0,
             pid_search_buffer: String::new(),
             pid_search_time: None,
             show_header: true,
-            command_wrap_scroll: 0,
             max_iterations: None,
             iteration_count: 0,
-            column_config_index: 0,
-            affinity_mask: 0,
-            affinity_selected: 0,
             cpu_history: Vec::new(),
             mem_history: VecDeque::new(),
             swap_history: VecDeque::new(),
             cached_visible_columns: visible_columns,
+            needs_process_update: false,
             ui_bounds: UIBounds::default(),
             last_click_pos: None,
             last_click_time: None,
@@ -943,12 +920,12 @@ impl App {
     /// Handle function key press (used by both keyboard and mouse)
     pub fn handle_function_key(&mut self, key: u8) {
         match key {
-            1 => self.view_mode = ViewMode::Help,
-            2 => self.view_mode = ViewMode::Setup,
-            3 => self.view_mode = ViewMode::Search,
-            4 => self.view_mode = ViewMode::Filter,
+            1 => self.dialog = DialogState::Help { scroll: 0 },
+            2 => self.dialog = DialogState::Setup { selected: 0 },
+            3 => self.start_search(),
+            4 => self.start_filter(),
             5 => self.tree_view = !self.tree_view,
-            6 => self.view_mode = ViewMode::SortSelect,
+            6 => self.dialog = DialogState::SortSelect { index: 0 },
             7 => self.enter_priority_mode(),
             8 => self.enter_priority_mode(),
             9 => self.enter_kill_mode(),
@@ -959,19 +936,17 @@ impl App {
     /// Enter kill mode and capture the target process
     pub fn enter_kill_mode(&mut self) {
         if let Some(proc) = self.selected_process() {
-            self.kill_target = Some((proc.pid, proc.name.clone(), proc.command.clone()));
+            let (pid, name, command) = (proc.pid, proc.name.clone(), proc.command.clone());
 
             // Skip confirmation dialog if disabled in settings
             if !self.config.confirm_kill {
-                // Kill immediately without confirmation
                 if !self.tagged_pids.is_empty() {
                     self.kill_tagged(15);
                 } else {
-                    self.kill_target_process(15);
+                    self.kill_process_by(pid, &name, 15);
                 }
-                self.kill_target = None;
             } else {
-                self.view_mode = ViewMode::Kill;
+                self.dialog = DialogState::Kill { pid, name, command };
             }
         }
     }
@@ -979,14 +954,12 @@ impl App {
     /// Enter priority mode and capture the target process
     pub fn enter_priority_mode(&mut self) {
         if let Some(proc) = self.selected_process() {
-            // Extract all values before modifying self to satisfy borrow checker
-            let target = (proc.pid, proc.name.clone(), proc.command.clone());
-            // Convert base priority to priority class index
-            let priority_class = WindowsPriorityClass::from_base_priority(proc.priority);
-
-            self.kill_target = Some(target);
-            self.priority_class_index = priority_class.index();
-            self.view_mode = ViewMode::Priority;
+            let class_index = WindowsPriorityClass::from_base_priority(proc.priority).index();
+            self.dialog = DialogState::Priority {
+                class_index,
+                pid: proc.pid,
+                name: proc.name.clone(),
+            };
         }
     }
 
@@ -994,11 +967,9 @@ impl App {
     pub fn enter_process_info_mode(&mut self) {
         if let Some(proc) = self.selected_process() {
             let mut proc_copy = proc.clone();
-            // Query I/O counters on-demand (skipped during normal refresh for performance)
             let (io_read, io_write) = crate::system::get_process_io_counters(proc.pid);
             proc_copy.io_read_bytes = io_read;
             proc_copy.io_write_bytes = io_write;
-            // Query exe path on-demand if not already available
             if proc_copy.exe_path.is_empty() {
                 let exe_path = crate::system::get_process_exe_path(proc.pid);
                 if !exe_path.is_empty() {
@@ -1006,21 +977,20 @@ impl App {
                     proc_copy.command = exe_path;
                 }
             }
-            self.process_info_target = Some(proc_copy);
-            self.view_mode = ViewMode::ProcessInfo;
+            self.dialog = DialogState::ProcessInfo { target: Box::new(proc_copy) };
         }
     }
 
     /// Refresh I/O counters for process info dialog (called during tick when dialog is open)
     pub fn refresh_process_info_io(&mut self) {
-        if let Some(ref mut proc) = self.process_info_target {
-            let (io_read, io_write) = crate::system::get_process_io_counters(proc.pid);
-            proc.io_read_bytes = io_read;
-            proc.io_write_bytes = io_write;
+        if let DialogState::ProcessInfo { ref mut target } = self.dialog {
+            let (io_read, io_write) = crate::system::get_process_io_counters(target.pid);
+            target.io_read_bytes = io_read;
+            target.io_write_bytes = io_write;
         }
     }
 
-    /// Refresh system data
+    /// Refresh system data (synchronous, used for initial refresh fallback)
     pub fn refresh_system(&mut self) {
         // Use native Windows APIs for all system metrics
         self.system_metrics.refresh();
@@ -1029,6 +999,14 @@ impl App {
         self.update_displayed_processes();
 
         // Update history for graph mode
+        self.update_meter_history();
+    }
+
+    /// Apply a snapshot from the background data collector
+    pub fn apply_snapshot(&mut self, snapshot: crate::data::SystemSnapshot) {
+        self.system_metrics = snapshot.metrics;
+        self.processes = snapshot.processes;
+        self.update_displayed_processes();
         self.update_meter_history();
     }
 
@@ -1376,7 +1354,7 @@ impl App {
         let pid = self.selected_process().map(|p| p.pid);
         if let Some(pid) = pid {
             self.collapsed_pids.insert(pid);
-            self.update_displayed_processes();
+            self.needs_process_update = true;
         }
     }
 
@@ -1385,7 +1363,7 @@ impl App {
         let pid = self.selected_process().map(|p| p.pid);
         if let Some(pid) = pid {
             self.collapsed_pids.remove(&pid);
-            self.update_displayed_processes();
+            self.needs_process_update = true;
         }
     }
 
@@ -1395,13 +1373,13 @@ impl App {
         for proc in &self.processes {
             self.collapsed_pids.insert(proc.pid);
         }
-        self.update_displayed_processes();
+        self.needs_process_update = true;
     }
 
     /// Expand all tree branches
     pub fn expand_all(&mut self) {
         self.collapsed_pids.clear();
-        self.update_displayed_processes();
+        self.needs_process_update = true;
     }
 
     /// Move selection up
@@ -1517,7 +1495,7 @@ impl App {
     /// Toggle tree view
     pub fn toggle_tree_view(&mut self) {
         self.tree_view = !self.tree_view;
-        self.update_displayed_processes();
+        self.needs_process_update = true;
     }
 
     /// Set sort column
@@ -1528,19 +1506,25 @@ impl App {
             self.sort_column = column;
             self.sort_ascending = false;
         }
-        self.update_displayed_processes();
+        self.needs_process_update = true;
     }
 
-    /// Apply filter from input buffer
+    /// Apply filter from dialog input buffer
     pub fn apply_filter(&mut self) {
-        self.filter_string = self.input_buffer.clone();
-        self.filter_string_lower = self.filter_string.to_lowercase();
-        self.update_displayed_processes();
+        if let DialogState::Filter { ref buffer, .. } = self.dialog {
+            self.filter_string = buffer.clone();
+            self.filter_string_lower = self.filter_string.to_lowercase();
+            self.needs_process_update = true;
+        }
     }
 
-    /// Apply search from input buffer
+    /// Apply search from dialog input buffer
     pub fn apply_search(&mut self) {
-        self.search_string = self.input_buffer.clone();
+        if let DialogState::Search { ref buffer, .. } = self.dialog {
+            self.search_string = buffer.clone();
+        } else {
+            return;
+        }
         self.search_string_lower = self.search_string.to_lowercase();
         // Find first matching process using pre-computed lowercase strings
         if !self.search_string_lower.is_empty()
@@ -1552,7 +1536,7 @@ impl App {
                 self.ensure_visible();
             }
         // Update matches_search flags for highlighting
-        self.update_displayed_processes();
+        self.needs_process_update = true;
     }
 
     /// Find next search match
@@ -1577,17 +1561,25 @@ impl App {
 
     /// Kill the captured target process (used by kill confirmation dialog)
     pub fn kill_target_process(&mut self, signal: u32) {
-        if let Some((pid, ref name, _)) = self.kill_target.clone() {
-            match crate::system::kill_process(pid, signal) {
-                Ok(_) => {
-                    self.status_message = Some((
-                        format!("Killed {} (PID {})", name, pid),
-                        Instant::now(),
-                    ));
-                }
-                Err(e) => {
-                    self.last_error = Some((format!("Failed to kill {} ({}): {}", name, pid, e), Instant::now()));
-                }
+        let (pid, name) = match &self.dialog {
+            DialogState::Kill { pid, name, .. }
+            | DialogState::SignalSelect { pid, name, .. } => (*pid, name.clone()),
+            _ => return,
+        };
+        self.kill_process_by(pid, &name, signal);
+    }
+
+    /// Kill a process by PID (direct, no dialog needed)
+    fn kill_process_by(&mut self, pid: u32, name: &str, signal: u32) {
+        match crate::system::kill_process(pid, signal) {
+            Ok(_) => {
+                self.status_message = Some((
+                    format!("Killed {} (PID {})", name, pid),
+                    Instant::now(),
+                ));
+            }
+            Err(e) => {
+                self.last_error = Some((format!("Failed to kill {} ({}): {}", name, pid, e), Instant::now()));
             }
         }
     }
@@ -1626,47 +1618,48 @@ impl App {
 
     /// Set priority class for selected process
     pub fn set_priority_selected(&mut self, priority_class: WindowsPriorityClass) {
-        if let Some((pid, _, _)) = &self.kill_target {
-            let pid = *pid;
-            if let Err(e) = crate::system::set_priority_class(pid, priority_class) {
-                self.last_error = Some((format!("Failed to set priority for {}: {}", pid, e), Instant::now()));
-            }
+        let pid = match &self.dialog {
+            DialogState::Priority { pid, .. } => *pid,
+            _ => return,
+        };
+        if let Err(e) = crate::system::set_priority_class(pid, priority_class) {
+            self.last_error = Some((format!("Failed to set priority for {}: {}", pid, e), Instant::now()));
         }
     }
 
     /// Toggle efficiency mode for selected process
     pub fn toggle_efficiency_mode(&mut self) {
-        if let Some((pid, ref name, _)) = self.kill_target.clone() {
-            // Get current efficiency mode status
-            let current = self.selected_process()
-                .map(|p| p.efficiency_mode)
-                .unwrap_or(false);
-            let new_state = !current;
-            // Toggle it
-            match crate::system::set_efficiency_mode(pid, new_state) {
-                Ok(_) => {
-                    let state_str = if new_state { "enabled" } else { "disabled" };
-                    self.status_message = Some((
-                        format!("Efficiency mode {} for {}", state_str, name),
-                        Instant::now(),
-                    ));
-                    // Update the process in displayed_processes immediately for visual feedback
-                    for proc in &mut self.displayed_processes {
-                        if proc.pid == pid {
-                            proc.efficiency_mode = new_state;
-                            break;
-                        }
-                    }
-                    for proc in &mut self.processes {
-                        if proc.pid == pid {
-                            proc.efficiency_mode = new_state;
-                            break;
-                        }
+        let (pid, name) = match &self.dialog {
+            DialogState::Priority { pid, name, .. } => (*pid, name.clone()),
+            _ => return,
+        };
+        // Get current efficiency mode status
+        let current = self.selected_process()
+            .map(|p| p.efficiency_mode)
+            .unwrap_or(false);
+        let new_state = !current;
+        match crate::system::set_efficiency_mode(pid, new_state) {
+            Ok(_) => {
+                let state_str = if new_state { "enabled" } else { "disabled" };
+                self.status_message = Some((
+                    format!("Efficiency mode {} for {}", state_str, name),
+                    Instant::now(),
+                ));
+                for proc in &mut self.displayed_processes {
+                    if proc.pid == pid {
+                        proc.efficiency_mode = new_state;
+                        break;
                     }
                 }
-                Err(e) => {
-                    self.last_error = Some((format!("Failed to set efficiency mode: {}", e), Instant::now()));
+                for proc in &mut self.processes {
+                    if proc.pid == pid {
+                        proc.efficiency_mode = new_state;
+                        break;
+                    }
                 }
+            }
+            Err(e) => {
+                self.last_error = Some((format!("Failed to set efficiency mode: {}", e), Instant::now()));
             }
         }
     }
@@ -1678,63 +1671,66 @@ impl App {
 
     /// Add character to input buffer
     pub fn input_char(&mut self, c: char) {
-        self.input_buffer.insert(self.input_cursor, c);
-        self.input_cursor += 1;
+        if let Some((buffer, cursor)) = self.dialog.input_buffer_mut() {
+            buffer.insert(*cursor, c);
+            *cursor += 1;
+        }
     }
 
     /// Delete character before cursor
     pub fn input_backspace(&mut self) {
-        if self.input_cursor > 0 {
-            self.input_cursor -= 1;
-            self.input_buffer.remove(self.input_cursor);
+        if let Some((buffer, cursor)) = self.dialog.input_buffer_mut() {
+            if *cursor > 0 {
+                *cursor -= 1;
+                buffer.remove(*cursor);
+            }
         }
     }
 
     /// Delete character at cursor
     pub fn input_delete(&mut self) {
-        if self.input_cursor < self.input_buffer.len() {
-            self.input_buffer.remove(self.input_cursor);
+        if let Some((buffer, cursor)) = self.dialog.input_buffer_mut() {
+            if *cursor < buffer.len() {
+                buffer.remove(*cursor);
+            }
         }
     }
 
     /// Move cursor left
     pub fn input_left(&mut self) {
-        if self.input_cursor > 0 {
-            self.input_cursor -= 1;
+        if let Some((_, cursor)) = self.dialog.input_buffer_mut() {
+            if *cursor > 0 {
+                *cursor -= 1;
+            }
         }
     }
 
     /// Move cursor right
     pub fn input_right(&mut self) {
-        if self.input_cursor < self.input_buffer.len() {
-            self.input_cursor += 1;
+        if let Some((buffer, cursor)) = self.dialog.input_buffer_mut() {
+            if *cursor < buffer.len() {
+                *cursor += 1;
+            }
         }
-    }
-
-    /// Clear input buffer
-    pub fn input_clear(&mut self) {
-        self.input_buffer.clear();
-        self.input_cursor = 0;
     }
 
     /// Start search mode
     pub fn start_search(&mut self) {
-        self.view_mode = ViewMode::Search;
-        self.input_buffer = self.search_string.clone();
-        self.input_cursor = self.input_buffer.len();
+        let buffer = self.search_string.clone();
+        let cursor = buffer.len();
+        self.dialog = DialogState::Search { buffer, cursor };
     }
 
     /// Start filter mode
     pub fn start_filter(&mut self) {
-        self.view_mode = ViewMode::Filter;
-        self.input_buffer = self.filter_string.clone();
-        self.input_cursor = self.input_buffer.len();
+        let buffer = self.filter_string.clone();
+        let cursor = buffer.len();
+        self.dialog = DialogState::Filter { buffer, cursor };
     }
 
     /// Exit current mode
     pub fn exit_mode(&mut self) {
-        self.view_mode = ViewMode::Normal;
-        self.input_clear();
+        self.dialog = DialogState::None;
     }
 
     /// Tag selected process and all its children
@@ -1795,7 +1791,6 @@ impl App {
 
     /// Enter user select mode
     pub fn enter_user_select_mode(&mut self) {
-        // Build unique user list
         let mut users: Vec<String> = self.processes
             .iter()
             .map(|p| p.user.clone())
@@ -1803,16 +1798,14 @@ impl App {
             .into_iter()
             .collect();
         users.sort();
-        self.user_list = users;
 
-        // Set current selection to current filter
-        self.user_select_index = if let Some(ref filter) = self.user_filter {
-            self.user_list.iter().position(|u| u == filter).map(|i| i + 1).unwrap_or(0)
+        let index = if let Some(ref filter) = self.user_filter {
+            users.iter().position(|u| u == filter).map(|i| i + 1).unwrap_or(0)
         } else {
-            0 // "All users"
+            0
         };
 
-        self.view_mode = ViewMode::UserSelect;
+        self.dialog = DialogState::UserSelect { index, users };
     }
 
     /// Toggle follow mode
@@ -1827,41 +1820,39 @@ impl App {
     /// Enter environment view mode
     pub fn enter_environment_mode(&mut self) {
         if self.selected_process().is_some() {
-            self.env_scroll = 0;
-            self.view_mode = ViewMode::Environment;
+            self.dialog = DialogState::Environment { scroll: 0 };
         }
     }
 
     /// Enter command wrap view mode
     pub fn enter_command_wrap_mode(&mut self) {
         if self.selected_process().is_some() {
-            self.command_wrap_scroll = 0;
-            self.view_mode = ViewMode::CommandWrap;
+            self.dialog = DialogState::CommandWrap { scroll: 0 };
         }
     }
 
     /// Enter CPU affinity mode
     pub fn enter_affinity_mode(&mut self) {
         if let Some(proc) = self.selected_process() {
-            // Get current affinity or default to all CPUs
             let cpu_count = self.system_metrics.cpu.core_usage.len();
-            // Safe bit shift: for 64+ CPUs, use all bits set
             let all_cpus = if cpu_count >= 64 { u64::MAX } else { (1u64 << cpu_count) - 1 };
-            self.affinity_mask = crate::system::get_process_affinity(proc.pid)
-                .unwrap_or(all_cpus);
-            self.affinity_selected = 0;
-            self.view_mode = ViewMode::Affinity;
+            let mask = crate::system::get_process_affinity(proc.pid).unwrap_or(all_cpus);
+            self.dialog = DialogState::Affinity { mask, selected: 0 };
         }
     }
 
     /// Apply CPU affinity to selected process
     pub fn apply_affinity(&mut self) {
+        let mask = match &self.dialog {
+            DialogState::Affinity { mask, .. } => *mask,
+            _ => return,
+        };
+        if mask == 0 {
+            self.last_error = Some(("Cannot set empty affinity mask".to_string(), Instant::now()));
+            return;
+        }
         if let Some(proc) = self.selected_process() {
-            if self.affinity_mask == 0 {
-                self.last_error = Some(("Cannot set empty affinity mask".to_string(), Instant::now()));
-                return;
-            }
-            if let Err(e) = crate::system::set_process_affinity(proc.pid, self.affinity_mask) {
+            if let Err(e) = crate::system::set_process_affinity(proc.pid, mask) {
                 self.last_error = Some((format!("Failed to set affinity: {}", e), Instant::now()));
             }
         }
@@ -1911,7 +1902,7 @@ impl App {
                     self.ensure_visible();
                     // Collapse the parent
                     self.collapsed_pids.insert(parent_pid);
-                    self.update_displayed_processes();
+                    self.needs_process_update = true;
                     break;
                 }
             }
@@ -1920,7 +1911,6 @@ impl App {
 
     /// Enter column configuration mode
     pub fn enter_column_config_mode(&mut self) {
-        self.column_config_index = 0;
-        self.view_mode = ViewMode::ColumnConfig;
+        self.dialog = DialogState::ColumnConfig { index: 0 };
     }
 }

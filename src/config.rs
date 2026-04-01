@@ -2,7 +2,7 @@
 
 use crate::json::{self, Value};
 use crate::ui::colors::ColorScheme;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -110,10 +110,6 @@ pub struct Config {
     /// Show confirmation dialog before killing processes
     pub confirm_kill: bool,
 
-    // Tree view settings
-    /// Default collapsed PIDs (persisted)
-    #[allow(dead_code)]
-    pub collapsed_pids: HashSet<u32>,
 }
 
 impl Default for Config {
@@ -168,7 +164,6 @@ impl Default for Config {
             mouse_enabled: true,
             readonly: false,
             confirm_kill: true,  // Show confirmation dialogs by default
-            collapsed_pids: HashSet::new(),
         }
     }
 }
@@ -332,7 +327,6 @@ impl Config {
             mouse_enabled: get_bool("mouse_enabled", defaults.mouse_enabled),
             readonly: get_bool("readonly", defaults.readonly),
             confirm_kill: get_bool("confirm_kill", defaults.confirm_kill),
-            collapsed_pids: HashSet::new(),
         }
     }
 

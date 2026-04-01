@@ -884,30 +884,6 @@ impl Theme {
         }
     }
 
-    /// Get memory color based on usage percentage
-    #[allow(dead_code)]
-    pub fn mem_color(&self, percent: f32) -> Color {
-        if percent < 50.0 {
-            self.mem_low
-        } else if percent < 80.0 {
-            self.mem_mid
-        } else {
-            self.mem_high
-        }
-    }
-
-    /// Get swap color based on usage percentage
-    #[allow(dead_code)]
-    pub fn swap_color(&self, percent: f32) -> Color {
-        if percent < 50.0 {
-            self.swap_low
-        } else if percent < 80.0 {
-            self.swap_mid
-        } else {
-            self.swap_high
-        }
-    }
-
     /// Get process status color
     pub fn status_color(&self, status: char) -> Color {
         match status {
@@ -920,26 +896,4 @@ impl Theme {
         }
     }
 
-    /// Get color for memory size display (htop uses different colors for MB vs GB)
-    #[allow(dead_code)]
-    pub fn memory_size_color(&self, bytes: u64) -> Color {
-        if bytes >= 1_073_741_824 {
-            // >= 1GB
-            self.process_gigabytes
-        } else {
-            self.process_megabytes
-        }
-    }
-
-    /// Get color for process priority (based on base priority relative to normal=8)
-    #[allow(dead_code)]
-    pub fn priority_color(&self, base_priority: i32) -> Color {
-        if base_priority > 8 {
-            self.process_high_priority
-        } else if base_priority < 8 {
-            self.process_low_priority
-        } else {
-            self.text
-        }
-    }
 }

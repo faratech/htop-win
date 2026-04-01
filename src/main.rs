@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod data;
 mod input;
 mod installer;
 mod json;
@@ -429,8 +430,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         app.config.refresh_rate_ms = 10;
     }
 
-    // Initial system refresh
-    app.refresh_system();
+    // Spawn background data collector and wait for initial snapshot
+    let (collector, data_rx) = data::DataCollector::spawn(app.config.refresh_rate_ms);
+    if let Ok(snapshot) = data_rx.recv() {
+        app.apply_snapshot(snapshot);
+    }
     let process_count = app.processes.len();
 
     // Create benchmark stats if in benchmark mode
@@ -447,7 +451,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Run the main loop
-    let result = run_app(&mut terminal, &mut app, &config, bench_stats.as_mut(), update_rx);
+    let result = run_app(
+        &mut terminal,
+        &mut app,
+        &config,
+        bench_stats.as_mut(),
+        update_rx,
+        data_rx,
+        &collector,
+    );
 
     // Restore terminal
     disable_raw_mode()?;
@@ -476,13 +488,24 @@ fn run_app(
     _config: &Config,
     mut bench_stats: Option<&mut BenchmarkStats>,
     update_rx: std::sync::mpsc::Receiver<installer::UpdateStatus>,
+    data_rx: std::sync::mpsc::Receiver<data::SystemSnapshot>,
+    collector: &data::DataCollector,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::sync::atomic::Ordering;
+
     let mut last_tick = Instant::now();
     let mut needs_redraw = true;
 
     loop {
         // Read tick rate from app.config so it updates dynamically
         let tick_rate = Duration::from_millis(app.config.refresh_rate_ms);
+
+        // Flush deferred process list update before rendering
+        if app.needs_process_update {
+            app.update_displayed_processes();
+            app.needs_process_update = false;
+            needs_redraw = true;
+        }
 
         // Draw UI only when needed (state changed)
         if needs_redraw {
@@ -502,10 +525,20 @@ fn run_app(
                     if input::handle_key_event(app, key) {
                         return Ok(());
                     }
+                    // Sync shared state with background collector
+                    collector.paused.store(app.paused, Ordering::Relaxed);
+                    collector
+                        .tick_rate_ms
+                        .store(app.config.refresh_rate_ms, Ordering::Relaxed);
                     needs_redraw = true;
                 }
                 Event::Mouse(mouse) => {
                     input::handle_mouse_event(app, mouse);
+                    // Sync shared state with background collector
+                    collector.paused.store(app.paused, Ordering::Relaxed);
+                    collector
+                        .tick_rate_ms
+                        .store(app.config.refresh_rate_ms, Ordering::Relaxed);
                     needs_redraw = true;
                 }
                 Event::Resize(_, _) => {
@@ -537,26 +570,38 @@ fn run_app(
             needs_redraw = true;
         }
 
-        // Refresh system data at tick rate (unless paused)
-        if last_tick.elapsed() >= tick_rate {
-            if !app.paused {
-                let refresh_start = Instant::now();
-                app.refresh_system();
-                if let Some(stats) = bench_stats.as_mut() {
-                    stats.record_refresh(refresh_start.elapsed());
+        // Apply latest system data from background collector (drain to newest)
+        {
+            let mut latest = None;
+            while let Ok(snapshot) = data_rx.try_recv() {
+                // Recycle superseded snapshots' process vecs
+                if let Some(prev) = latest.replace(snapshot) {
+                    let _ = collector.recycle_tx.send(prev.processes);
                 }
+            }
+            if let Some(snapshot) = latest {
+                if let Some(stats) = bench_stats.as_mut() {
+                    stats.record_refresh(snapshot.refresh_duration);
+                }
+                // Recycle old vec before replacing
+                let old = std::mem::take(&mut app.processes);
+                let _ = collector.recycle_tx.send(old);
+                app.apply_snapshot(snapshot);
                 app.iteration_count += 1;
                 needs_redraw = true;
 
                 // Check if we've reached max iterations
                 if let Some(max) = app.max_iterations
-                    && app.iteration_count >= max {
-                        return Ok(());
-                    }
+                    && app.iteration_count >= max
+                {
+                    return Ok(());
+                }
             }
+        }
 
-            // Refresh I/O counters when process info dialog is open (even when paused)
-            if app.view_mode == app::ViewMode::ProcessInfo {
+        // Refresh I/O counters when process info dialog is open (at tick rate, even when paused)
+        if last_tick.elapsed() >= tick_rate {
+            if matches!(app.dialog, app::DialogState::ProcessInfo { .. }) {
                 app.refresh_process_info_io();
                 needs_redraw = true;
             }

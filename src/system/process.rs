@@ -6,7 +6,7 @@ use super::native::{SystemProcess, filetime_to_unix};
 #[cfg(windows)]
 use windows::core::PWSTR;
 #[cfg(windows)]
-use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(windows)]
 use windows::Win32::Security::{
     AdjustTokenPrivileges, GetTokenInformation, LookupAccountSidW, LookupPrivilegeValueW,
@@ -21,7 +21,7 @@ use windows::Win32::System::ProcessStatus::{
 use windows::Win32::System::Threading::IO_COUNTERS;
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessInformation, GetProcessIoCounters, GetProcessTimes,
+    GetCurrentProcess, GetProcessInformation, GetProcessIoCounters,
     IsWow64Process2, OpenProcess, OpenProcessToken, ProcessMachineTypeInfo, ProcessPowerThrottling,
     QueryFullProcessImageNameW, SetPriorityClass, TerminateProcess,
     ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
@@ -171,36 +171,6 @@ fn open_process_query(pid: u32) -> Option<HANDLE> {
                 Ok(h) if !h.is_invalid() => Some(h),
                 _ => None,
             },
-        }
-    }
-}
-
-/// Query CPU time and start time from a process handle
-/// Note: Currently unused - cpu_time and start_time come from NtQuerySystemInformation.
-/// Kept for potential future use or fallback.
-#[cfg(windows)]
-#[inline]
-#[allow(dead_code)]
-fn query_process_times(handle: HANDLE) -> (Duration, u64) {
-    unsafe {
-        let mut creation = FILETIME::default();
-        let mut exit = FILETIME::default();
-        let mut kernel = FILETIME::default();
-        let mut user = FILETIME::default();
-
-        if GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user).is_ok() {
-            let kernel_100ns = ((kernel.dwHighDateTime as u64) << 32) | kernel.dwLowDateTime as u64;
-            let user_100ns = ((user.dwHighDateTime as u64) << 32) | user.dwLowDateTime as u64;
-            let total_100ns = kernel_100ns + user_100ns;
-            let cpu_time = Duration::new(total_100ns / 10_000_000, ((total_100ns % 10_000_000) * 100) as u32);
-
-            // Convert FILETIME to Unix timestamp (116444736000000000 = difference between 1601 and 1970)
-            let creation_100ns = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
-            let start_time = creation_100ns.saturating_sub(116444736000000000) / 10_000_000;
-
-            (cpu_time, start_time)
-        } else {
-            (Duration::ZERO, 0)
         }
     }
 }
