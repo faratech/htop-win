@@ -182,14 +182,57 @@ fn get_shadow_prefix_len(path: &str) -> usize {
     0
 }
 
-/// Get column width constraint for a given column
-fn column_width(col: &SortColumn) -> Constraint {
-    // Command column uses Min() to expand, all others use fixed Length()
-    if matches!(col, SortColumn::Command) {
-        Constraint::Min(col.width())
-    } else {
-        Constraint::Length(col.width())
+/// Build adaptive column-width constraints. When the sum of natural column
+/// widths exceeds the available area, each fixed-width (non-Command) column
+/// is scaled down proportionally so every column stays visible — columns
+/// shrink instead of getting cut off at the right edge.
+///
+/// Shared with `ui::mod::calculate_column_bounds` so the click-region x/width
+/// bookkeeping matches what the Table widget actually renders.
+pub fn adaptive_column_widths(columns: &[SortColumn], area_width: u16) -> Vec<Constraint> {
+    const COLUMN_SPACING: u16 = 1;
+    const MIN_COL_WIDTH: u16 = 2;
+
+    if columns.is_empty() {
+        return Vec::new();
     }
+
+    let spacing_total = COLUMN_SPACING * (columns.len().saturating_sub(1) as u16);
+    let available = area_width.saturating_sub(spacing_total);
+
+    // Natural sum of Length widths (excluding Command, which is Min/flexible).
+    let fixed_natural: u16 = columns
+        .iter()
+        .filter(|c| !matches!(c, SortColumn::Command))
+        .map(|c| c.width())
+        .sum();
+
+    // Reserve a small amount for Command if present.
+    let command_reserve: u16 = if columns.iter().any(|c| matches!(c, SortColumn::Command)) {
+        MIN_COL_WIDTH
+    } else {
+        0
+    };
+
+    // Only shrink when fixed columns + command reserve don't fit.
+    let needs_shrink = fixed_natural + command_reserve > available;
+
+    columns
+        .iter()
+        .map(|col| {
+            if matches!(col, SortColumn::Command) {
+                Constraint::Min(col.width())
+            } else if needs_shrink && fixed_natural > 0 {
+                // Scale this column's share of the fixed budget to what's available.
+                let budget = available.saturating_sub(command_reserve);
+                let scaled =
+                    (col.width() as u32 * budget as u32 / fixed_natural as u32) as u16;
+                Constraint::Length(scaled.max(MIN_COL_WIDTH))
+            } else {
+                Constraint::Length(col.width())
+            }
+        })
+        .collect()
 }
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
@@ -220,8 +263,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
     let header = Row::new(header_cells).style(header_style).height(1);
 
-    // Column widths for visible columns only
-    let widths: Vec<Constraint> = visible_columns.iter().map(column_width).collect();
+    // Column widths for visible columns only. Use adaptive sizing so columns
+    // shrink proportionally when the terminal is too narrow to fit them all at
+    // natural width, instead of getting cut off.
+    let widths: Vec<Constraint> = adaptive_column_widths(visible_columns, area.width);
 
     // Cache current time for start_time formatting (avoid syscall per process)
     let now_secs = std::time::SystemTime::now()

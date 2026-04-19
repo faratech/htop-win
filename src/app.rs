@@ -570,6 +570,8 @@ pub struct App {
     pub tagged_pids: HashSet<u32>,
     /// Process list visible height (set during render)
     pub visible_height: usize,
+    /// Terminal width in columns (set during render, used for responsive header layout)
+    pub terminal_width: u16,
     /// Last error message with timestamp for auto-expiry
     pub last_error: Option<(String, Instant)>,
     /// Status message (success/info) with timestamp for auto-expiry
@@ -653,6 +655,7 @@ impl App {
             pid_filter: None,
             tagged_pids: HashSet::new(),
             visible_height: 20,
+            terminal_width: 80,
             last_error: None,
             status_message: None,
             collapsed_pids: HashSet::new(),

@@ -15,6 +15,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let size = frame.area();
     let theme = &app.theme;
 
+    // Track terminal width for responsive header layout
+    app.terminal_width = size.width;
+
     // Clear UI regions from previous frame (they'll be repopulated during this render)
     app.ui_bounds.clear_regions();
 
@@ -184,17 +187,9 @@ fn calculate_column_bounds(visible_columns: &[SortColumn], area: Rect) -> Vec<Co
         return Vec::new();
     }
 
-    // Build the same constraints used in process_list.rs
-    let constraints: Vec<Constraint> = visible_columns
-        .iter()
-        .map(|col| {
-            if matches!(col, SortColumn::Command) {
-                Constraint::Min(col.width())
-            } else {
-                Constraint::Length(col.width())
-            }
-        })
-        .collect();
+    // Use the same adaptive constraints that process_list::draw uses so click
+    // regions stay aligned with the actually-rendered columns.
+    let constraints = process_list::adaptive_column_widths(visible_columns, area.width);
 
     // Use Layout to resolve constraints to actual widths
     // This matches how ratatui's Table internally calculates column positions
