@@ -11,12 +11,27 @@ use crate::system::format_bytes;
 /// Maximum bar width is 128 characters which covers most terminal widths.
 const MAX_BAR_WIDTH: usize = 128;
 
-/// Display cap for CPU/Mem/Swap bars. Bars never render wider than this,
-/// so a bar that would otherwise balloon (e.g. when the meter column
-/// suddenly gets much wider because the layout dropped from 3→2 or 2→1)
-/// stays at a predictable size. Below this cap the bar still shrinks
-/// smoothly with the column width.
-const MAX_DISPLAY_BAR_WIDTH: usize = 48;
+/// Minimum cap for CPU/Mem/Swap bar display width. Bars never render
+/// shorter than col_width suggests, but also never balloon past
+/// `max_bar_width(col_width)`. See `max_bar_width` for the scaling curve.
+const BAR_CAP_FLOOR: usize = 40;
+/// Hard absolute cap so even on ultrawide monitors bars stay readable
+/// (a 200-char bar is just a blur).
+const BAR_CAP_CEIL: usize = 72;
+
+/// Adaptive bar-width cap.
+///
+/// - At typical widths the cap is flat at [`BAR_CAP_FLOOR`], which smooths the
+///   bar-size pop when the layout drops a meter column (e.g. 3 cols @ width 150
+///   → 2 cols @ width 149).
+/// - On wide columns the cap grows to about two-thirds of the column so bars
+///   don't leave a huge blank gap between `]` and the column's right edge.
+/// - Beyond [`BAR_CAP_CEIL`] the cap plateaus again — past a certain point a
+///   longer bar stops conveying more information.
+#[inline]
+fn max_bar_width(col_width: usize) -> usize {
+    (col_width * 2 / 3).clamp(BAR_CAP_FLOOR, BAR_CAP_CEIL)
+}
 
 /// Pre-computed string of '|' characters for bar fills
 static BAR_FILL: &str = "||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||";
@@ -96,16 +111,22 @@ fn extras_for_column(col_idx: usize, col_count: usize) -> usize {
     }
 }
 
-/// Column that holds Net/Dsk/Bat fillers in an N-column layout, if any.
+/// Whether a given column hosts Net/Dsk/Bat fillers in its empty CPU slots.
 ///
-/// - 2 cols: right column (col 1) — fillers go in empty CPU slots before Tasks/Uptime.
-/// - 3 cols: middle column (col 1) — fillers go in empty CPU slots, no extras after.
-/// - 1 col:  no filler column.
-fn filler_column(col_count: usize) -> Option<usize> {
-    match col_count {
-        2 | 3 => Some(1),
-        _ => None,
+/// - 1 col:  no fillers (narrow collapsed view matches bare htop).
+/// - 2 cols: rightmost column hosts fillers before Tasks/Uptime (historical).
+/// - 3+ cols: every middle column (non-leftmost, non-rightmost) hosts fillers.
+///
+/// A shared cursor in `draw` walks left-to-right so the three fillers spread
+/// across columns instead of stacking in one.
+fn col_hosts_fillers(col_idx: usize, col_count: usize) -> bool {
+    if col_count < 2 {
+        return false;
     }
+    if col_count == 2 {
+        return col_idx == 1;
+    }
+    col_idx > 0 && col_idx < col_count - 1
 }
 
 /// Compute the meter-row count (CPU block height in each column).
@@ -148,8 +169,19 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         .constraints(constraints)
         .split(inner);
 
+    // Shared cursor so Net/Dsk/Bat fillers spread across any middle columns
+    // left-to-right instead of all landing in the first filler-hosting column.
+    let mut filler_cursor = 0usize;
     for (col_idx, col_area) in column_rects.iter().enumerate() {
-        draw_meter_column(frame, app, *col_area, col_idx, cols, meter_rows);
+        draw_meter_column(
+            frame,
+            app,
+            *col_area,
+            col_idx,
+            cols,
+            meter_rows,
+            &mut filler_cursor,
+        );
     }
 }
 
@@ -166,6 +198,7 @@ fn draw_meter_column(
     col_idx: usize,
     col_count: usize,
     meter_rows: usize,
+    filler_cursor: &mut usize,
 ) {
     let cpu_count = app.system_metrics.cpu.core_usage.len();
     let extras = extras_for_column(col_idx, col_count);
@@ -181,13 +214,11 @@ fn draw_meter_column(
         .constraints(constraints)
         .split(area);
 
-    let hosts_fillers = filler_column(col_count) == Some(col_idx);
+    let hosts_fillers = col_hosts_fillers(col_idx, col_count);
 
-    // Filler counter (Net=0, Dsk=1, Bat=2)
-    let mut filler_idx = 0usize;
-
-    // CPU block (up to meter_rows). Empty CPU slots in the filler column become
-    // Net/Dsk/Bat meters; empty slots in other columns stay blank.
+    // CPU block (up to meter_rows). Empty CPU slots in filler-hosting columns
+    // advance the shared filler cursor (Net → Dsk → Bat); empty slots in other
+    // columns stay blank.
     for (row_idx, &row) in rows.iter().enumerate().take(meter_rows) {
         let cpu_idx = row_idx * col_count + col_idx;
         if cpu_idx < cpu_count {
@@ -205,14 +236,14 @@ fn draw_meter_column(
                 app.system_metrics.cpu.core_usage[cpu_idx],
                 row,
             );
-        } else if hosts_fillers {
-            match filler_idx {
+        } else if hosts_fillers && *filler_cursor < 3 {
+            match *filler_cursor {
                 0 => draw_network_info(frame, app, row),
                 1 => draw_disk_info(frame, app, row),
                 2 => draw_battery_info(frame, app, row),
                 _ => {}
             }
-            filler_idx += 1;
+            *filler_cursor += 1;
         }
     }
 
@@ -301,7 +332,7 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
         MeterMode::Graph => {
             // Graph mode: sparkline using history
             let history = app.cpu_history.get(cpu_idx);
-            let graph_width = (area.width.saturating_sub(10) as usize).min(MAX_DISPLAY_BAR_WIDTH); // label + percent
+            let graph_width = (area.width.saturating_sub(10) as usize).min(max_bar_width(area.width as usize)); // label + percent
 
             let graph_str = if let Some(hist) = history {
                 render_sparkline(hist, graph_width)
@@ -318,7 +349,7 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
         MeterMode::Bar | MeterMode::Hidden => {
             // Bar mode (default): multi-segment bar with user/system breakdown (htop style)
             // htop uses: nice(blue) + user(green) + system(red) + iowait(gray)
-            let bar_width = (area.width.saturating_sub(11) as usize).min(MAX_DISPLAY_BAR_WIDTH);
+            let bar_width = (area.width.saturating_sub(11) as usize).min(max_bar_width(area.width as usize));
             let percent = format!("{:5.1}%]", usage_clamped);
 
             let breakdown = app
@@ -451,7 +482,7 @@ fn draw_memory_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
         MeterMode::Graph => {
             // Graph mode: sparkline using history
-            let graph_width = (area.width.saturating_sub(mem_info.len() as u16 + 6) as usize).min(MAX_DISPLAY_BAR_WIDTH);
+            let graph_width = (area.width.saturating_sub(mem_info.len() as u16 + 6) as usize).min(max_bar_width(area.width as usize));
             let graph_str = render_sparkline(&app.mem_history, graph_width);
 
             Line::from(vec![
@@ -465,7 +496,7 @@ fn draw_memory_bar(frame: &mut Frame, app: &App, area: Rect) {
             // htop order: used (green) + shared (magenta) + buffers (blue) + cache (yellow)
             // See htop MemoryMeter.c: MemoryMeter_attributes[]
             let info_len = mem_info.len() + 1;
-            let bar_width = (area.width.saturating_sub(4 + info_len as u16) as usize).min(MAX_DISPLAY_BAR_WIDTH);
+            let bar_width = (area.width.saturating_sub(4 + info_len as u16) as usize).min(max_bar_width(area.width as usize));
 
             // Calculate segment percentages (htop style)
             let total_f = mem.total as f32;
@@ -530,7 +561,7 @@ fn draw_swap_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
         MeterMode::Graph => {
             // Graph mode: sparkline using history
-            let graph_width = (area.width.saturating_sub(swap_info.len() as u16 + 6) as usize).min(MAX_DISPLAY_BAR_WIDTH);
+            let graph_width = (area.width.saturating_sub(swap_info.len() as u16 + 6) as usize).min(max_bar_width(area.width as usize));
             let graph_str = render_sparkline(&app.swap_history, graph_width);
 
             Line::from(vec![
@@ -542,7 +573,7 @@ fn draw_swap_bar(frame: &mut Frame, app: &App, area: Rect) {
         MeterMode::Bar | MeterMode::Hidden => {
             // Bar mode (default)
             let info_len = swap_info.len() + 1; // +1 for the closing bracket
-            let bar_width = (area.width.saturating_sub(4 + info_len as u16) as usize).min(MAX_DISPLAY_BAR_WIDTH); // 4 for "Swp["
+            let bar_width = (area.width.saturating_sub(4 + info_len as u16) as usize).min(max_bar_width(area.width as usize)); // 4 for "Swp["
             let filled = ((usage as usize) * bar_width / 100).min(bar_width);
             let empty = bar_width - filled;
 

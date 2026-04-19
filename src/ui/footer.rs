@@ -12,6 +12,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let footer_focused = app.focus_region == FocusRegion::Footer;
     let focused_key_index = app.focus_index;
 
+    // Compute the label width that will fit in this terminal. Labels max out at
+    // 6 chars (htop's default) but shrink down to 0 on very narrow widths so at
+    // least the key numbers stay visible.
+    let label_width = compute_label_width(&function_keys, area.width);
+    let empty_slot_width = label_width + 1; // 1 char stand-in for missing key + label
+
     // Track x position for registering function key bounds
     let mut x_pos = area.x;
     let mut key_index = 0usize;
@@ -21,14 +27,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         .iter()
         .flat_map(|(key_num, key_str, label)| {
             if key_str.is_empty() {
-                // Empty key/label pair - just add spacing
-                let spacing_width = 7u16;
-                x_pos += spacing_width;
-                vec![Span::styled("       ", Style::default().bg(theme.background))]
+                // Empty key/label pair — fill with blanks sized to match other slots
+                x_pos += empty_slot_width;
+                let blanks = " ".repeat(empty_slot_width as usize);
+                vec![Span::styled(blanks, Style::default().bg(theme.background))]
             } else {
-                // Calculate total width: key text + label (6 chars fixed width)
                 let key_width = key_str.len() as u16;
-                let label_width = 6u16;
                 let total_width = key_width + label_width;
 
                 // Register function key region if it's a valid F-key
@@ -51,13 +55,25 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                     (theme.header_key_fg, theme.header_key_bg, theme.text, theme.background)
                 };
 
+                // Truncate label to the dynamic label width (avoids overflow
+                // on narrow terminals) and left-pad to fill the cell.
+                let label_padded = if label_width == 0 {
+                    String::new()
+                } else {
+                    let mut s: String = label.chars().take(label_width as usize).collect();
+                    while (s.chars().count() as u16) < label_width {
+                        s.push(' ');
+                    }
+                    s
+                };
+
                 vec![
                     Span::styled(
                         key_str.to_string(),
                         Style::default().fg(key_fg).bg(key_bg),
                     ),
                     Span::styled(
-                        format!("{:<6}", label), // htop uses fixed-width labels with trailing space
+                        label_padded,
                         Style::default().fg(label_fg).bg(label_bg),
                     ),
                 ]
@@ -77,6 +93,30 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         let status_para = Paragraph::new(status_line).style(Style::default().bg(theme.background));
         frame.render_widget(status_para, status_area);
     }
+}
+
+/// Pick the largest label width (0..=6) that lets the whole footer fit in
+/// `available_width`. Returns 6 on roomy terminals (htop default); shrinks on
+/// narrow ones so at least the `F1`/`F2`/… key numbers remain visible.
+fn compute_label_width(
+    function_keys: &[(Option<u8>, &'static str, &'static str)],
+    available_width: u16,
+) -> u16 {
+    // Sum of key character widths (keys with empty strings stand in for a 1-char blank).
+    let key_chars_total: u16 = function_keys
+        .iter()
+        .map(|(_, k, _)| if k.is_empty() { 1u16 } else { k.len() as u16 })
+        .sum();
+    let slots = function_keys.len() as u16;
+
+    for candidate in (0..=6u16).rev() {
+        // Each slot consumes `key_chars + candidate` (or `1 + candidate` for empty slots).
+        let needed = key_chars_total + slots * candidate;
+        if needed <= available_width {
+            return candidate;
+        }
+    }
+    0
 }
 
 /// Returns function keys with: (Option<function_key_number>, key_text, label)

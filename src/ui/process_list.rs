@@ -191,7 +191,12 @@ fn get_shadow_prefix_len(path: &str) -> usize {
 /// bookkeeping matches what the Table widget actually renders.
 pub fn adaptive_column_widths(columns: &[SortColumn], area_width: u16) -> Vec<Constraint> {
     const COLUMN_SPACING: u16 = 1;
-    const MIN_COL_WIDTH: u16 = 2;
+    /// Minimum rendered width for any non-Command column — picked so values like
+    /// small PIDs (`123`) and short user names (`root`) stay legible.
+    const MIN_COL_WIDTH: u16 = 3;
+    /// How much width to leave for the Command column when the rest has to
+    /// shrink. Command is the most important field, so keep it readable.
+    const COMMAND_RESERVE: u16 = 12;
 
     if columns.is_empty() {
         return Vec::new();
@@ -207,29 +212,69 @@ pub fn adaptive_column_widths(columns: &[SortColumn], area_width: u16) -> Vec<Co
         .map(|c| c.width())
         .sum();
 
-    // Reserve a small amount for Command if present.
-    let command_reserve: u16 = if columns.iter().any(|c| matches!(c, SortColumn::Command)) {
-        MIN_COL_WIDTH
-    } else {
-        0
-    };
+    let has_command = columns.iter().any(|c| matches!(c, SortColumn::Command));
+    let command_reserve: u16 = if has_command { COMMAND_RESERVE } else { 0 };
 
     // Only shrink when fixed columns + command reserve don't fit.
     let needs_shrink = fixed_natural + command_reserve > available;
 
-    columns
+    if !needs_shrink {
+        return columns
+            .iter()
+            .map(|col| {
+                if matches!(col, SortColumn::Command) {
+                    Constraint::Min(col.width())
+                } else {
+                    Constraint::Length(col.width())
+                }
+            })
+            .collect();
+    }
+
+    // Compute scaled widths and track the rounding remainder so we can
+    // redistribute it and avoid leaving a one-or-two-char sliver unused.
+    let budget = available.saturating_sub(command_reserve);
+    let mut scaled: Vec<u16> = columns
         .iter()
         .map(|col| {
             if matches!(col, SortColumn::Command) {
-                Constraint::Min(col.width())
-            } else if needs_shrink && fixed_natural > 0 {
-                // Scale this column's share of the fixed budget to what's available.
-                let budget = available.saturating_sub(command_reserve);
-                let scaled =
-                    (col.width() as u32 * budget as u32 / fixed_natural as u32) as u16;
-                Constraint::Length(scaled.max(MIN_COL_WIDTH))
+                0 // placeholder; Command uses Min
+            } else if fixed_natural > 0 {
+                ((col.width() as u32 * budget as u32 / fixed_natural as u32) as u16)
+                    .max(MIN_COL_WIDTH)
             } else {
-                Constraint::Length(col.width())
+                MIN_COL_WIDTH
+            }
+        })
+        .collect();
+
+    // Redistribute integer-division remainder: every non-Command column gets
+    // +1 until the remainder is exhausted. Prefers widening the leftmost cols.
+    let assigned_fixed: u16 = scaled
+        .iter()
+        .zip(columns.iter())
+        .filter(|(_, col)| !matches!(col, SortColumn::Command))
+        .map(|(w, _)| *w)
+        .sum();
+    let mut leftover = budget.saturating_sub(assigned_fixed);
+    for (w, col) in scaled.iter_mut().zip(columns.iter()) {
+        if leftover == 0 {
+            break;
+        }
+        if !matches!(col, SortColumn::Command) {
+            *w += 1;
+            leftover -= 1;
+        }
+    }
+
+    columns
+        .iter()
+        .zip(scaled.iter())
+        .map(|(col, &w)| {
+            if matches!(col, SortColumn::Command) {
+                Constraint::Min(COMMAND_RESERVE)
+            } else {
+                Constraint::Length(w)
             }
         })
         .collect()
