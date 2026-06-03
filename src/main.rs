@@ -363,7 +363,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Apply command-line overrides
     if let Some(delay) = args.delay {
-        config.refresh_rate_ms = delay;
+        // Clamp to the same 100ms floor the config-file path enforces (config.rs),
+        // otherwise `--delay 0` drives both the collector thread and the main loop
+        // into a 100% CPU busy-loop.
+        config.refresh_rate_ms = delay.max(100);
     }
     if args.tree {
         config.tree_view_default = true;

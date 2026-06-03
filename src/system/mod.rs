@@ -216,7 +216,9 @@ impl SystemMetrics {
             self::process::cleanup_stale_caches(&current_pids);
         }
 
-        with_process_list(|proc_list| {
+        // On query failure (None), keep the previous process list and baselines
+        // untouched rather than blanking the table for a frame.
+        let _ = with_process_list(|proc_list| {
             // Update time tracking for CPU delta calculation
             let now = std::time::Instant::now();
             self.last_native_refresh = now;

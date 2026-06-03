@@ -32,8 +32,12 @@ impl Rect {
         Self { x, y, width, height }
     }
 
-    pub fn area(&self) -> u16 {
-        self.width.saturating_mul(self.height)
+    /// Total cell count. Returns `usize` (not `u16`) so terminals with more than
+    /// 65535 cells (large/ultrawide/high-DPI, e.g. 300x300) don't saturate the
+    /// area, which previously under-allocated `Buffer` and caused an out-of-bounds
+    /// index panic in `flush_diff` (process-aborting under `panic = "abort"`).
+    pub fn area(&self) -> usize {
+        (self.width as usize) * (self.height as usize)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -598,7 +602,7 @@ pub struct Buffer {
 
 impl Buffer {
     pub fn empty(area: Rect) -> Self {
-        let size = area.area() as usize;
+        let size = area.area();
         Self {
             area,
             content: vec![BufferCell::default(); size],
@@ -606,7 +610,7 @@ impl Buffer {
     }
 
     pub fn filled(area: Rect, cell: BufferCell) -> Self {
-        let size = area.area() as usize;
+        let size = area.area();
         Self {
             area,
             content: vec![cell; size],
@@ -838,7 +842,12 @@ impl Terminal {
             let mut skip = 0;
             for x in current.area.x..current.area.right() {
                 let idx = current.index_of(x, y);
-                let cell = &current.content[idx];
+                // Defense-in-depth: index via .get() rather than direct indexing so a
+                // stray out-of-range idx can never abort the process (panic = "abort").
+                let Some(cell) = current.content.get(idx) else {
+                    skip += 1;
+                    continue;
+                };
                 let prev = previous.content.get(idx);
 
                 // Skip continuation cells - they're placeholders for wide characters

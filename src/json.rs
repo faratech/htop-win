@@ -70,15 +70,22 @@ impl Value {
     }
 }
 
+/// Maximum nesting depth. Beyond this, input is rejected as a parse error rather
+/// than recursing further — unbounded recursion on deeply-nested input would
+/// otherwise overflow the stack and abort the whole process (panic = "abort").
+/// 128 matches serde_json's default recursion limit.
+const MAX_DEPTH: usize = 128;
+
 /// Simple JSON parser
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { input, pos: 0 }
+        Self { input, pos: 0, depth: 0 }
     }
 
     fn peek(&self) -> Option<char> {
@@ -105,8 +112,21 @@ impl<'a> Parser<'a> {
         self.skip_whitespace();
         match self.peek()? {
             '"' => self.parse_string().map(Value::String),
-            '{' => self.parse_object(),
-            '[' => self.parse_array(),
+            c @ ('{' | '[') => {
+                // Bound recursion depth so pathologically-nested input is rejected
+                // instead of exhausting the stack.
+                if self.depth >= MAX_DEPTH {
+                    return None;
+                }
+                self.depth += 1;
+                let result = if c == '{' {
+                    self.parse_object()
+                } else {
+                    self.parse_array()
+                };
+                self.depth -= 1;
+                result
+            }
             't' | 'f' => self.parse_bool(),
             'n' => self.parse_null(),
             c if c == '-' || c.is_ascii_digit() => self.parse_number(),
@@ -381,6 +401,16 @@ mod tests {
         let v = parse(r#"{"key": "value", "num": 42}"#).unwrap();
         assert_eq!(v.get("key").unwrap().as_str(), Some("value"));
         assert_eq!(v.get("num").unwrap().as_i64(), Some(42));
+    }
+
+    #[test]
+    fn test_deeply_nested_rejected_without_overflow() {
+        // Pathologically deep input must be rejected (None), not overflow the stack.
+        let deep = "[".repeat(100_000);
+        assert_eq!(parse(&deep), None);
+        // Nesting within the limit still parses.
+        let ok = format!("{}{}", "[".repeat(64), "]".repeat(64));
+        assert!(parse(&ok).is_some());
     }
 
     #[test]

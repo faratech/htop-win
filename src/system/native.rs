@@ -138,7 +138,11 @@ impl<'a> SystemProcessList<'a> {
 
 /// Execute a closure with access to the system process list
 /// This handles buffer management and syscalls
-pub fn with_process_list<F, R>(f: F) -> R
+/// Returns `None` if the system query failed (other than a recoverable buffer-size
+/// mismatch). Callers must treat `None` as "could not read processes this tick" and
+/// keep their previous state — NOT as "zero processes exist", which would wipe the
+/// list and corrupt CPU/disk baselines.
+pub fn with_process_list<F, R>(f: F) -> Option<R>
 where
     F: FnOnce(SystemProcessList) -> R,
 {
@@ -178,12 +182,13 @@ where
                 continue;
             }
 
-            // Other error - return empty result
-            // We pass an empty slice in this case
-            return f(SystemProcessList { buffer: &[] });
+            // Other (transient) error, e.g. STATUS_ACCESS_DENIED / low memory.
+            // Signal failure so the caller preserves its previous good list and
+            // baselines instead of seeing an empty list.
+            return None;
         }
 
-        f(SystemProcessList { buffer: &buffer })
+        Some(f(SystemProcessList { buffer: &buffer }))
     })
 }
 

@@ -389,26 +389,23 @@ fn handle_sort_select_keys(app: &mut App, key: KeyEvent) -> bool {
             app.dialog = DialogState::None;
         }
         KeyCode::Enter => {
-            if let DialogState::SortSelect { index } = app.dialog {
-                if index < columns.len() {
+            if let DialogState::SortSelect { index } = app.dialog
+                && index < columns.len() {
                     app.set_sort_column(columns[index]);
                 }
-            }
             app.dialog = DialogState::None;
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if let DialogState::SortSelect { ref mut index } = app.dialog {
-                if *index > 0 {
+            if let DialogState::SortSelect { ref mut index } = app.dialog
+                && *index > 0 {
                     *index -= 1;
                 }
-            }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let DialogState::SortSelect { ref mut index } = app.dialog {
-                if *index < columns.len() - 1 {
+            if let DialogState::SortSelect { ref mut index } = app.dialog
+                && *index < columns.len() - 1 {
                     *index += 1;
                 }
-            }
         }
         KeyCode::Home => {
             if let DialogState::SortSelect { ref mut index } = app.dialog {
@@ -491,35 +488,31 @@ fn handle_priority_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         // Up = move up in list (lower index)
         KeyCode::Up => {
-            if let DialogState::Priority { ref mut class_index, .. } = app.dialog {
-                if *class_index > 0 {
+            if let DialogState::Priority { ref mut class_index, .. } = app.dialog
+                && *class_index > 0 {
                     *class_index -= 1;
                 }
-            }
         }
         // Down = move down in list (higher index)
         KeyCode::Down => {
-            if let DialogState::Priority { ref mut class_index, .. } = app.dialog {
-                if *class_index < max_index {
+            if let DialogState::Priority { ref mut class_index, .. } = app.dialog
+                && *class_index < max_index {
                     *class_index += 1;
                 }
-            }
         }
         // Right = increase priority (higher index)
         KeyCode::Right => {
-            if let DialogState::Priority { ref mut class_index, .. } = app.dialog {
-                if *class_index < max_index {
+            if let DialogState::Priority { ref mut class_index, .. } = app.dialog
+                && *class_index < max_index {
                     *class_index += 1;
                 }
-            }
         }
         // Left = decrease priority (lower index)
         KeyCode::Left => {
-            if let DialogState::Priority { ref mut class_index, .. } = app.dialog {
-                if *class_index > 0 {
+            if let DialogState::Priority { ref mut class_index, .. } = app.dialog
+                && *class_index > 0 {
                     *class_index -= 1;
                 }
-            }
         }
         // E = toggle efficiency mode
         KeyCode::Char('e') | KeyCode::Char('E') => {
@@ -565,19 +558,17 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
             app.dialog = DialogState::None;
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if let DialogState::Setup { ref mut selected } = app.dialog {
-                if *selected > 0 {
+            if let DialogState::Setup { ref mut selected } = app.dialog
+                && *selected > 0 {
                     *selected -= 1;
                 }
-            }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let DialogState::Setup { ref mut selected } = app.dialog {
-                if *selected < 12 {
+            if let DialogState::Setup { ref mut selected } = app.dialog
+                && *selected < 12 {
                     // Number of setup items - 1
                     *selected += 1;
                 }
-            }
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             // Toggle selected setting or open submenu
@@ -737,18 +728,16 @@ fn handle_signal_select_keys(app: &mut App, key: KeyEvent) -> bool {
             app.dialog = DialogState::None;
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if let DialogState::SignalSelect { ref mut index, .. } = app.dialog {
-                if *index > 0 {
+            if let DialogState::SignalSelect { ref mut index, .. } = app.dialog
+                && *index > 0 {
                     *index -= 1;
                 }
-            }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let DialogState::SignalSelect { ref mut index, .. } = app.dialog {
-                if *index < signal_count() - 1 {
+            if let DialogState::SignalSelect { ref mut index, .. } = app.dialog
+                && *index < signal_count() - 1 {
                     *index += 1;
                 }
-            }
         }
         _ => {}
     }
@@ -773,18 +762,16 @@ fn handle_user_select_keys(app: &mut App, key: KeyEvent) -> bool {
             app.dialog = DialogState::None;
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if let DialogState::UserSelect { ref mut index, .. } = app.dialog {
-                if *index > 0 {
+            if let DialogState::UserSelect { ref mut index, .. } = app.dialog
+                && *index > 0 {
                     *index -= 1;
                 }
-            }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let DialogState::UserSelect { ref mut index, ref users } = app.dialog {
-                if *index < users.len() {
+            if let DialogState::UserSelect { ref mut index, ref users } = app.dialog
+                && *index < users.len() {
                     *index += 1;
                 }
-            }
         }
         _ => {}
     }
@@ -797,7 +784,7 @@ fn handle_environment_keys(app: &mut App, key: KeyEvent) -> bool {
             app.dialog = DialogState::None;
         }
         _ => {
-            if let DialogState::Environment { ref mut scroll } = app.dialog {
+            if let DialogState::Environment { ref mut scroll, .. } = app.dialog {
                 handle_scroll_keys(scroll, key.code);
             }
         }
@@ -814,28 +801,25 @@ fn handle_color_scheme_keys(app: &mut App, key: KeyEvent) -> bool {
             app.dialog = DialogState::Setup { selected: 10 };
         }
         KeyCode::Enter => {
-            if let DialogState::ColorScheme { index } = app.dialog {
-                if let Some(scheme) = schemes.get(index) {
+            if let DialogState::ColorScheme { index } = app.dialog
+                && let Some(scheme) = schemes.get(index) {
                     app.config.color_scheme = *scheme;
                     app.update_theme();
                     app.save_config();
                 }
-            }
             app.dialog = DialogState::Setup { selected: 10 };
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if let DialogState::ColorScheme { ref mut index } = app.dialog {
-                if *index > 0 {
+            if let DialogState::ColorScheme { ref mut index } = app.dialog
+                && *index > 0 {
                     *index -= 1;
                 }
-            }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let DialogState::ColorScheme { ref mut index } = app.dialog {
-                if *index < schemes.len() - 1 {
+            if let DialogState::ColorScheme { ref mut index } = app.dialog
+                && *index < schemes.len() - 1 {
                     *index += 1;
                 }
-            }
         }
         _ => {}
     }
@@ -848,7 +832,7 @@ fn handle_command_wrap_keys(app: &mut App, key: KeyEvent) -> bool {
             app.dialog = DialogState::None;
         }
         _ => {
-            if let DialogState::CommandWrap { ref mut scroll } = app.dialog {
+            if let DialogState::CommandWrap { ref mut scroll, .. } = app.dialog {
                 handle_scroll_keys(scroll, key.code);
             }
         }
@@ -867,52 +851,47 @@ fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Up | KeyCode::Char('k') => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 // Shift+Up: Move column up in order
-                if let DialogState::ColumnConfig { index } = app.dialog {
-                    if let Some(col) = all_columns.get(index) {
+                if let DialogState::ColumnConfig { index } = app.dialog
+                    && let Some(col) = all_columns.get(index) {
                         let col_name = col.name().to_string();
                         if app.move_column_up_in_active_tab(&col_name) {
                             app.save_config();
                         }
                     }
-                }
             } else {
                 // Regular Up: Navigate
-                if let DialogState::ColumnConfig { ref mut index } = app.dialog {
-                    if *index > 0 {
+                if let DialogState::ColumnConfig { ref mut index } = app.dialog
+                    && *index > 0 {
                         *index -= 1;
                     }
-                }
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 // Shift+Down: Move column down in order
-                if let DialogState::ColumnConfig { index } = app.dialog {
-                    if let Some(col) = all_columns.get(index) {
+                if let DialogState::ColumnConfig { index } = app.dialog
+                    && let Some(col) = all_columns.get(index) {
                         let col_name = col.name().to_string();
                         if app.move_column_down_in_active_tab(&col_name) {
                             app.save_config();
                         }
                     }
-                }
             } else {
                 // Regular Down: Navigate
-                if let DialogState::ColumnConfig { ref mut index } = app.dialog {
-                    if *index < all_columns.len() - 1 {
+                if let DialogState::ColumnConfig { ref mut index } = app.dialog
+                    && *index < all_columns.len() - 1 {
                         *index += 1;
                     }
-                }
             }
         }
         KeyCode::Char(' ') | KeyCode::Enter => {
             // Toggle column visibility in active tab
-            if let DialogState::ColumnConfig { index } = app.dialog {
-                if let Some(col) = all_columns.get(index) {
+            if let DialogState::ColumnConfig { index } = app.dialog
+                && let Some(col) = all_columns.get(index) {
                     let col_name = col.name().to_string();
                     app.toggle_column_in_active_tab(&col_name);
                     app.save_config();
                 }
-            }
         }
         _ => {}
     }
@@ -928,18 +907,16 @@ fn handle_affinity_keys(app: &mut App, key: KeyEvent) -> bool {
             app.dialog = DialogState::None;
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if let DialogState::Affinity { ref mut selected, .. } = app.dialog {
-                if *selected > 0 {
+            if let DialogState::Affinity { ref mut selected, .. } = app.dialog
+                && *selected > 0 {
                     *selected -= 1;
                 }
-            }
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if let DialogState::Affinity { ref mut selected, .. } = app.dialog {
-                if *selected < cpu_count.saturating_sub(1) {
+            if let DialogState::Affinity { ref mut selected, .. } = app.dialog
+                && *selected < cpu_count.saturating_sub(1) {
                     *selected += 1;
                 }
-            }
         }
         KeyCode::Char(' ') => {
             // Toggle CPU in affinity mask
@@ -1019,11 +996,10 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
                             // Calculate which item was clicked (y - dialog_y - 1 for border)
                             let item_index = (y.saturating_sub(dialog_y).saturating_sub(1)) as usize;
                             let num_items = 13; // Setup has 13 items
-                            if item_index < num_items {
-                                if let DialogState::Setup { ref mut selected } = app.dialog {
+                            if item_index < num_items
+                                && let DialogState::Setup { ref mut selected } = app.dialog {
                                     *selected = item_index;
                                 }
-                            }
                             return;
                         }
                     }
@@ -1079,8 +1055,8 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
             if is_in_dialog {
                 match &mut app.dialog {
                     DialogState::Help { scroll }
-                    | DialogState::Environment { scroll }
-                    | DialogState::CommandWrap { scroll } => {
+                    | DialogState::Environment { scroll, .. }
+                    | DialogState::CommandWrap { scroll, .. } => {
                         *scroll = scroll.saturating_sub(3);
                     }
                     DialogState::SortSelect { index }
@@ -1100,8 +1076,8 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
             if is_in_dialog {
                 match &mut app.dialog {
                     DialogState::Help { scroll }
-                    | DialogState::Environment { scroll }
-                    | DialogState::CommandWrap { scroll } => {
+                    | DialogState::Environment { scroll, .. }
+                    | DialogState::CommandWrap { scroll, .. } => {
                         *scroll += 3;
                     }
                     DialogState::SortSelect { index } => {

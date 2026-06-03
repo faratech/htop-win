@@ -480,8 +480,10 @@ impl ScreenTab {
 /// Dialog/view state - encapsulates per-dialog state into enum variants
 /// Replaces the previous flat ViewMode enum + scattered dialog fields
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum DialogState {
     /// Normal process list view (no dialog open)
+    #[default]
     None,
     Help { scroll: usize },
     Search { buffer: String, cursor: usize },
@@ -493,18 +495,13 @@ pub enum DialogState {
     Setup { selected: usize },
     ProcessInfo { target: Box<ProcessInfo> },
     UserSelect { index: usize, users: Vec<String> },
-    Environment { scroll: usize },
+    Environment { scroll: usize, pid: u32 },
     ColorScheme { index: usize },
-    CommandWrap { scroll: usize },
+    CommandWrap { scroll: usize, pid: u32 },
     ColumnConfig { index: usize },
-    Affinity { mask: u64, selected: usize },
+    Affinity { mask: u64, selected: usize, pid: u32 },
 }
 
-impl Default for DialogState {
-    fn default() -> Self {
-        DialogState::None
-    }
-}
 
 impl DialogState {
     /// Get mutable reference to input buffer and cursor (Search/Filter dialogs)
@@ -740,29 +737,27 @@ impl App {
 
     /// Move a column up in the active tab's order
     pub fn move_column_up_in_active_tab(&mut self, column: &str) -> bool {
-        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
-            if let Some(pos) = tab.columns.iter().position(|c| c == column)
+        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab)
+            && let Some(pos) = tab.columns.iter().position(|c| c == column)
                 && pos > 0 {
                     tab.columns.swap(pos, pos - 1);
                     self.sync_config_from_active_tab();
                     self.update_visible_columns_cache();
                     return true;
                 }
-        }
         false
     }
 
     /// Move a column down in the active tab's order
     pub fn move_column_down_in_active_tab(&mut self, column: &str) -> bool {
-        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
-            if let Some(pos) = tab.columns.iter().position(|c| c == column)
+        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab)
+            && let Some(pos) = tab.columns.iter().position(|c| c == column)
                 && pos < tab.columns.len() - 1 {
                     tab.columns.swap(pos, pos + 1);
                     self.sync_config_from_active_tab();
                     self.update_visible_columns_cache();
                     return true;
                 }
-        }
         false
     }
 
@@ -1495,6 +1490,14 @@ impl App {
         self.displayed_processes.get(self.selected_index)
     }
 
+    /// Look up a process by PID in the currently displayed list. Used by dialogs
+    /// that captured their target's PID at open time, so a background re-sort can't
+    /// make them act on / display a different process (the race-prevention pattern
+    /// documented in CLAUDE.md). Returns None if the process has since exited.
+    pub fn process_by_pid(&self, pid: u32) -> Option<&ProcessInfo> {
+        self.displayed_processes.iter().find(|p| p.pid == pid)
+    }
+
     /// Toggle tree view
     pub fn toggle_tree_view(&mut self) {
         self.tree_view = !self.tree_view;
@@ -1636,8 +1639,11 @@ impl App {
             DialogState::Priority { pid, name, .. } => (*pid, name.clone()),
             _ => return,
         };
-        // Get current efficiency mode status
-        let current = self.selected_process()
+        // Read the current state from the captured pid, not selected_process():
+        // a background re-sort can move a different process under selected_index
+        // while the Priority dialog is open, which would otherwise flip the wrong
+        // direction or silently no-op.
+        let current = self.process_by_pid(pid)
             .map(|p| p.efficiency_mode)
             .unwrap_or(false);
         let new_state = !current;
@@ -1682,39 +1688,35 @@ impl App {
 
     /// Delete character before cursor
     pub fn input_backspace(&mut self) {
-        if let Some((buffer, cursor)) = self.dialog.input_buffer_mut() {
-            if *cursor > 0 {
+        if let Some((buffer, cursor)) = self.dialog.input_buffer_mut()
+            && *cursor > 0 {
                 *cursor -= 1;
                 buffer.remove(*cursor);
             }
-        }
     }
 
     /// Delete character at cursor
     pub fn input_delete(&mut self) {
-        if let Some((buffer, cursor)) = self.dialog.input_buffer_mut() {
-            if *cursor < buffer.len() {
+        if let Some((buffer, cursor)) = self.dialog.input_buffer_mut()
+            && *cursor < buffer.len() {
                 buffer.remove(*cursor);
             }
-        }
     }
 
     /// Move cursor left
     pub fn input_left(&mut self) {
-        if let Some((_, cursor)) = self.dialog.input_buffer_mut() {
-            if *cursor > 0 {
+        if let Some((_, cursor)) = self.dialog.input_buffer_mut()
+            && *cursor > 0 {
                 *cursor -= 1;
             }
-        }
     }
 
     /// Move cursor right
     pub fn input_right(&mut self) {
-        if let Some((buffer, cursor)) = self.dialog.input_buffer_mut() {
-            if *cursor < buffer.len() {
+        if let Some((buffer, cursor)) = self.dialog.input_buffer_mut()
+            && *cursor < buffer.len() {
                 *cursor += 1;
             }
-        }
     }
 
     /// Start search mode
@@ -1822,15 +1824,15 @@ impl App {
 
     /// Enter environment view mode
     pub fn enter_environment_mode(&mut self) {
-        if self.selected_process().is_some() {
-            self.dialog = DialogState::Environment { scroll: 0 };
+        if let Some(proc) = self.selected_process() {
+            self.dialog = DialogState::Environment { scroll: 0, pid: proc.pid };
         }
     }
 
     /// Enter command wrap view mode
     pub fn enter_command_wrap_mode(&mut self) {
-        if self.selected_process().is_some() {
-            self.dialog = DialogState::CommandWrap { scroll: 0 };
+        if let Some(proc) = self.selected_process() {
+            self.dialog = DialogState::CommandWrap { scroll: 0, pid: proc.pid };
         }
     }
 
@@ -1839,25 +1841,26 @@ impl App {
         if let Some(proc) = self.selected_process() {
             let cpu_count = self.system_metrics.cpu.core_usage.len();
             let all_cpus = if cpu_count >= 64 { u64::MAX } else { (1u64 << cpu_count) - 1 };
-            let mask = crate::system::get_process_affinity(proc.pid).unwrap_or(all_cpus);
-            self.dialog = DialogState::Affinity { mask, selected: 0 };
+            let pid = proc.pid;
+            let mask = crate::system::get_process_affinity(pid).unwrap_or(all_cpus);
+            self.dialog = DialogState::Affinity { mask, selected: 0, pid };
         }
     }
 
-    /// Apply CPU affinity to selected process
+    /// Apply CPU affinity to the process captured when the dialog was opened.
     pub fn apply_affinity(&mut self) {
-        let mask = match &self.dialog {
-            DialogState::Affinity { mask, .. } => *mask,
+        let (mask, pid) = match &self.dialog {
+            DialogState::Affinity { mask, pid, .. } => (*mask, *pid),
             _ => return,
         };
         if mask == 0 {
             self.last_error = Some(("Cannot set empty affinity mask".to_string(), Instant::now()));
             return;
         }
-        if let Some(proc) = self.selected_process() {
-            if let Err(e) = crate::system::set_process_affinity(proc.pid, mask) {
-                self.last_error = Some((format!("Failed to set affinity: {}", e), Instant::now()));
-            }
+        // Use the captured pid, not selected_process(): a background refresh can
+        // re-sort the list and shift selected_index while the dialog is open.
+        if let Err(e) = crate::system::set_process_affinity(pid, mask) {
+            self.last_error = Some((format!("Failed to set affinity: {}", e), Instant::now()));
         }
     }
 

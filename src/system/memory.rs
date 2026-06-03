@@ -139,17 +139,21 @@ impl MemoryInfo {
                 };
 
                 // Get actual page file usage using NtQuerySystemInformation
-                // SystemPageFileInformation = 18
-                #[repr(C)]
-                struct SystemPageFileInfo {
-                    next_entry_offset: u32,
-                    total_size: u32,      // Total size in pages
-                    total_in_use: u32,    // Currently in use in pages
-                    peak_usage: u32,
-                    page_file_name: [u16; 260], // UNICODE_STRING follows but we don't need it
-                }
-
-                let pf_struct_size = std::mem::size_of::<SystemPageFileInfo>();
+                // SystemPageFileInformation = 18.
+                //
+                // Fixed record layout of SYSTEM_PAGEFILE_INFORMATION: four ULONGs
+                // (NextEntryOffset, TotalSize, TotalInUse, PeakUsage) followed by a
+                // UNICODE_STRING. The pagefile name's wchars live AFTER the fixed record
+                // (referenced by the UNICODE_STRING's Buffer pointer), so they are not
+                // part of the fixed size. A UNICODE_STRING occupies two pointer-sized
+                // words (Length+MaximumLength, then Buffer): 16 bytes on x64, 8 on x86.
+                //
+                // The previous code modeled the tail as an inline `[u16; 260]`, inflating
+                // the size to 536 bytes; the `return_length >= size` guard below then
+                // essentially never passed, so this accurate per-pagefile branch was dead
+                // code and swap always fell back to the cruder commit-based estimate.
+                let pf_struct_size =
+                    4 * std::mem::size_of::<u32>() + 2 * std::mem::size_of::<*mut u16>();
                 let mut pagefile_info: [u8; 4096] = [0; 4096];
                 let mut return_length: u32 = 0;
                 let pf_status = NtQuerySystemInformation(
@@ -170,14 +174,21 @@ impl MemoryInfo {
                         if offset + pf_struct_size > buf_len {
                             break;
                         }
-                        let info = &*(pagefile_info.as_ptr().add(offset) as *const SystemPageFileInfo);
-                        total_size += info.total_size as u64 * page_size;
-                        total_in_use += info.total_in_use as u64 * page_size;
+                        // Read fields with read_unaligned: `pagefile_info` is a byte
+                        // array (align 1) but the record contains an 8-aligned pointer,
+                        // so forming a `&SystemPageFileInfo` reference would be UB. The
+                        // first three ULONGs sit at byte offsets 0/4/8.
+                        let base = pagefile_info.as_ptr().add(offset);
+                        let next_entry_offset = (base.add(0) as *const u32).read_unaligned();
+                        let entry_total_size = (base.add(4) as *const u32).read_unaligned();
+                        let entry_total_in_use = (base.add(8) as *const u32).read_unaligned();
+                        total_size += entry_total_size as u64 * page_size;
+                        total_in_use += entry_total_in_use as u64 * page_size;
 
-                        if info.next_entry_offset == 0 {
+                        if next_entry_offset == 0 {
                             break;
                         }
-                        let next = offset + info.next_entry_offset as usize;
+                        let next = offset + next_entry_offset as usize;
                         if next <= offset || next + pf_struct_size > buf_len {
                             break; // Prevent infinite loop or out-of-bounds
                         }

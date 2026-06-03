@@ -386,8 +386,10 @@ pub fn draw_priority(frame: &mut Frame, app: &App) {
 
     let process_info = format!("PID: {} - {}", pid, name);
 
-    // Get efficiency mode status from selected process
-    let efficiency_mode = app.selected_process()
+    // Read efficiency state from the captured pid (not the live selection): a
+    // background re-sort can move a different process under the cursor while the
+    // dialog is open, which would otherwise display a mismatched flag.
+    let efficiency_mode = app.process_by_pid(*pid)
         .map(|p| p.efficiency_mode)
         .unwrap_or(false);
 
@@ -738,10 +740,10 @@ pub fn draw_user_select(frame: &mut Frame, app: &App) {
 
 /// Draw environment variables dialog
 pub fn draw_environment(frame: &mut Frame, app: &App) {
-    let DialogState::Environment { scroll: _ } = &app.dialog else { return; };
+    let DialogState::Environment { scroll: _, pid } = &app.dialog else { return; };
     let area = centered_rect(80, 80, frame.area());
 
-    let content = app.selected_process()
+    let content = app.process_by_pid(*pid)
         .map(|proc| format!(
             "Environment Variables for {} (PID: {})\n\n\
              Note: Environment variables cannot be read from \n\
@@ -810,10 +812,10 @@ pub fn signal_count() -> usize {
 
 /// Draw wrapped command display dialog
 pub fn draw_command_wrap(frame: &mut Frame, app: &App) {
-    let DialogState::CommandWrap { scroll } = &app.dialog else { return; };
+    let DialogState::CommandWrap { scroll, pid } = &app.dialog else { return; };
     let area = centered_rect(80, 70, frame.area());
 
-    let content = if let Some(proc) = app.selected_process() {
+    let content = if let Some(proc) = app.process_by_pid(*pid) {
         // Wrap command line nicely
         let mut lines = vec![
             format!("Process: {} (PID: {})", proc.name, proc.pid),
@@ -942,14 +944,15 @@ pub fn draw_column_config(frame: &mut Frame, app: &App) {
 
 /// Draw CPU affinity dialog
 pub fn draw_affinity(frame: &mut Frame, app: &App) {
-    let DialogState::Affinity { mask, selected } = &app.dialog else { return; };
+    let DialogState::Affinity { mask, selected, pid } = &app.dialog else { return; };
     let theme = &app.theme;
     let cpu_count = app.system_metrics.cpu.core_usage.len();
     let height = (cpu_count + 4).min(20) as u16;
     let area = centered_rect_fixed(35, height, frame.area());
 
+    // Display the captured target, matching the process apply_affinity() acts on.
     let proc_name = app
-        .selected_process()
+        .process_by_pid(*pid)
         .map(|p| format!("{} (PID: {})", p.name, p.pid))
         .unwrap_or_else(|| "Unknown".to_string());
 

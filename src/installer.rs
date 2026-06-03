@@ -8,12 +8,15 @@ use windows::core::{w, PCWSTR, PWSTR};
 #[cfg(windows)]
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
-    WinHttpQueryDataAvailable, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
+    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
+    WinHttpSendRequest,
     WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
     WINHTTP_FLAG_SECURE,
     URL_COMPONENTS,
     WINHTTP_INTERNET_SCHEME_HTTPS,
     WINHTTP_OPEN_REQUEST_FLAGS,
+    WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_QUERY_STATUS_CODE,
 };
 #[cfg(windows)]
 use windows::Win32::Foundation::GetLastError;
@@ -142,12 +145,14 @@ fn native_http_get(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let mut url_path = vec![0u16; 2048];
         
         let url_wide: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
-        let mut components = URL_COMPONENTS::default();
-        components.dwStructSize = std::mem::size_of::<URL_COMPONENTS>() as u32;
-        components.dwHostNameLength = host_name.len() as u32;
-        components.lpszHostName = PWSTR(host_name.as_mut_ptr());
-        components.dwUrlPathLength = url_path.len() as u32;
-        components.lpszUrlPath = PWSTR(url_path.as_mut_ptr());
+        let mut components = URL_COMPONENTS {
+            dwStructSize: std::mem::size_of::<URL_COMPONENTS>() as u32,
+            dwHostNameLength: host_name.len() as u32,
+            lpszHostName: PWSTR(host_name.as_mut_ptr()),
+            dwUrlPathLength: url_path.len() as u32,
+            lpszUrlPath: PWSTR(url_path.as_mut_ptr()),
+            ..Default::default()
+        };
 
         if WinHttpCrackUrl(&url_wide, 0, &mut components).is_err() {
              return Err(format!("WinHttpCrackUrl failed: {:?}", GetLastError()).into());
@@ -157,7 +162,7 @@ fn native_http_get(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let connect = WinHttpConnect(
             session,
             PCWSTR(components.lpszHostName.0),
-            components.nPort as u16,
+            components.nPort,
             0,
         );
         if connect.is_null() {
@@ -198,35 +203,60 @@ fn native_http_get(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
             return Err(format!("WinHttpReceiveResponse failed: {:?}", GetLastError()).into());
         }
 
+        // 6b. Check the HTTP status code. WinHTTP follows redirects by default, so this
+        // is the FINAL status (e.g. after a GitHub asset URL redirects to its CDN).
+        // Without this, a 404/403/5xx HTML error body would be read as "success" and,
+        // for the asset download, written to disk and installed as the executable.
+        let mut status_code: u32 = 0;
+        let mut status_len = std::mem::size_of::<u32>() as u32;
+        if WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            PCWSTR::null(), // WINHTTP_HEADER_NAME_BY_INDEX
+            Some(&mut status_code as *mut u32 as *mut c_void),
+            &mut status_len,
+            std::ptr::null_mut(), // WINHTTP_NO_HEADER_INDEX
+        )
+        .is_err()
+        {
+            return Err(format!("WinHttpQueryHeaders failed: {:?}", GetLastError()).into());
+        }
+        if !(200..300).contains(&status_code) {
+            return Err(format!("HTTP request failed with status {}", status_code).into());
+        }
+
         // 7. Read Data
         let mut body = Vec::new();
         let mut buffer = vec![0u8; 8192];
         let mut bytes_read = 0;
 
         loop {
+            // Propagate read errors instead of returning a truncated body as Ok:
+            // a mid-stream failure must NOT be reported as a complete download, or a
+            // corrupt partial .exe could be installed over the working one.
             if WinHttpQueryDataAvailable(request, &mut bytes_read).is_err() {
-                break;
+                return Err(format!("WinHttpQueryDataAvailable failed: {:?}", GetLastError()).into());
             }
             if bytes_read == 0 {
                 break;
             }
-            
+
             let to_read = bytes_read.min(buffer.len() as u32);
             let mut read_now = 0;
-            
+
             if WinHttpReadData(
                 request,
                 buffer.as_mut_ptr() as *mut c_void,
                 to_read,
                 &mut read_now,
             ).is_err() {
-                break;
+                return Err(format!("WinHttpReadData failed: {:?}", GetLastError()).into());
             }
-            
+
             if read_now == 0 {
                 break;
             }
-            
+
             body.extend_from_slice(&buffer[..read_now as usize]);
         }
 
@@ -277,14 +307,12 @@ pub fn get_latest_release() -> Result<(String, String), Box<dyn std::error::Erro
         if let Some(after_colon) = part.split_once(':') {
             // after_colon.1 is everything after the first ':', e.g. ' "https://...foo.exe",...'
             let rest = after_colon.1.trim();
-            if rest.starts_with('"') {
-                if let Some(url) = rest[1..].split('"').next() {
-                    if url.ends_with(&target_suffix) {
+            if rest.starts_with('"')
+                && let Some(url) = rest[1..].split('"').next()
+                    && url.ends_with(&target_suffix) {
                         download_url = url.to_string();
                         break;
                     }
-                }
-            }
         }
     }
 
@@ -293,14 +321,12 @@ pub fn get_latest_release() -> Result<(String, String), Box<dyn std::error::Erro
         for part in json_text.split("\"browser_download_url\"") {
             if let Some(after_colon) = part.split_once(':') {
                 let rest = after_colon.1.trim();
-                if rest.starts_with('"') {
-                    if let Some(url) = rest[1..].split('"').next() {
-                        if url.ends_with(".exe") {
+                if rest.starts_with('"')
+                    && let Some(url) = rest[1..].split('"').next()
+                        && url.ends_with(".exe") {
                             download_url = url.to_string();
                             break;
                         }
-                    }
-                }
             }
         }
     }
@@ -420,26 +446,34 @@ pub fn check_and_download_update() -> UpdateStatus {
     let temp_file = temp_dir.join("htop-win-update.exe");
 
     // If update already downloaded and pending, report it without re-downloading
-    if temp_file.exists() {
-        if let Ok(metadata) = fs::metadata(&temp_file) {
+    if temp_file.exists()
+        && let Ok(metadata) = fs::metadata(&temp_file) {
             if metadata.len() > 0 {
-                // Check what version is on GitHub to report correctly
-                if let Ok((latest_version, _)) = get_latest_release() {
-                    let current_version = env!("CARGO_PKG_VERSION");
-                    if is_newer_version(&latest_version, current_version) {
-                        return UpdateStatus::Downloaded {
-                            version: latest_version,
-                            path: temp_file,
-                        };
+                // A non-empty pending update exists. Act only on a definitive answer
+                // from GitHub: report it if newer, delete it only if CONFIRMED stale.
+                // On a transient API failure, keep it — don't discard a valid,
+                // already-downloaded update just because the check momentarily failed.
+                match get_latest_release() {
+                    Ok((latest_version, _)) => {
+                        let current_version = env!("CARGO_PKG_VERSION");
+                        if is_newer_version(&latest_version, current_version) {
+                            return UpdateStatus::Downloaded {
+                                version: latest_version,
+                                path: temp_file,
+                            };
+                        }
+                        // Confirmed not newer than current -- the pending file is stale.
+                        let _ = fs::remove_file(&temp_file);
+                    }
+                    Err(_) => {
+                        // Couldn't reach GitHub; preserve the pending update for retry.
+                        return UpdateStatus::None;
                     }
                 }
-                // Same version or can't check -- clean up stale temp file
-                let _ = fs::remove_file(&temp_file);
             } else {
                 let _ = fs::remove_file(&temp_file);
             }
         }
-    }
 
     let current_version = env!("CARGO_PKG_VERSION");
 
