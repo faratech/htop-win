@@ -1262,7 +1262,7 @@ impl App {
         }
 
         // Sort roots by PID
-        root_processes.sort_by(|a, b| a.pid.cmp(&b.pid));
+        root_processes.sort_by_key(|p| p.pid);
 
         // Build tree recursively
         let mut result = Vec::new();
@@ -1325,7 +1325,7 @@ impl App {
         // Only add children if not collapsed - take ownership to avoid cloning
         if !is_collapsed
             && let Some(mut sorted_children) = children_map.remove(&pid) {
-                sorted_children.sort_by(|a, b| a.pid.cmp(&b.pid));
+                sorted_children.sort_by_key(|p| p.pid);
                 let child_count = sorted_children.len();
 
                 // Calculate the prefix for children

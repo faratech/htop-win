@@ -1756,11 +1756,9 @@ impl StatefulWidget for Scrollbar<'_> {
         let viewport = state.viewport_content_length.max(1);
         let thumb_size = (track_len * viewport / state.content_length.max(1)).max(1).min(track_len);
         let scrollable = state.content_length.saturating_sub(viewport);
-        let thumb_pos = if scrollable > 0 {
-            (track_len - thumb_size) * state.position / scrollable
-        } else {
-            0
-        };
+        let thumb_pos = ((track_len - thumb_size) * state.position)
+            .checked_div(scrollable)
+            .unwrap_or(0);
 
         // Draw track and thumb
         for i in 0..track_len {
