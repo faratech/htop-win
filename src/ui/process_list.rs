@@ -354,8 +354,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 } else { std::borrow::Cow::Borrowed(&proc.tree_prefix) }
             } else { std::borrow::Cow::Borrowed("") };
 
-            // Choose between full command path or just the program name
-            let display_command = if app.config.show_program_path {
+            // Choose between full command path or just the program name.
+            // Typed as &str so its slices can be borrowed directly into Spans
+            // (zero-allocation) instead of cloned — valid because `proc` is
+            // borrowed from app.displayed_processes for the whole draw.
+            let display_command: &str = if app.config.show_program_path {
                 &proc.command
             } else {
                 &proc.name
@@ -431,22 +434,22 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
                             // Part 1: Shadow prefix (if any) in grey
                             if shadow_prefix_len > 0 && shadow_prefix_len <= path_end {
-                                // Use String::from to get owned value from slice
+                                // Borrow the path slices directly (no allocation)
                                 spans.push(Span::styled(
-                                    String::from(&display_command[..shadow_prefix_len]),
+                                    &display_command[..shadow_prefix_len],
                                     Style::default().fg(if is_selected { theme.selection_fg } else { theme.process_shadow })
                                 ));
                                 // Part 2: Rest of path (after shadow, before basename) in normal color
                                 if shadow_prefix_len < path_end {
                                     spans.push(Span::styled(
-                                        String::from(&display_command[shadow_prefix_len..path_end]),
+                                        &display_command[shadow_prefix_len..path_end],
                                         Style::default().fg(if is_selected { theme.selection_fg } else { theme.process })
                                     ));
                                 }
                             } else {
                                 // No shadow prefix, just path in normal color
                                 spans.push(Span::styled(
-                                    String::from(&display_command[..path_end]),
+                                    &display_command[..path_end],
                                     Style::default().fg(if is_selected { theme.selection_fg } else { theme.process })
                                 ));
                             }
@@ -467,7 +470,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 Style::default().fg(basename_color)
                             };
-                            spans.push(Span::styled(String::from(&display_command[basename_start..]), basename_style));
+                            spans.push(Span::styled(&display_command[basename_start..], basename_style));
                         } else {
                             // Not showing path, or no path separator - show as single span
                             let (color, bold) = if is_selected {
@@ -485,8 +488,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 Style::default().fg(color)
                             };
-                            // Clone the display_command to avoid lifetime issues
-                            spans.push(Span::styled(display_command.clone(), style));
+                            spans.push(Span::styled(display_command, style));
                         }
 
                         return Cell::from(Line::from(spans));

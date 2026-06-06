@@ -326,8 +326,17 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
     use super::cache::{CACHE, config};
     use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
 
-    // Get unified cache snapshot (single lock acquisition for all cached data)
-    let cache_snapshot = CACHE.snapshot();
+    // Clone only the visible PIDs' cache entries under a short read lock, instead
+    // of cloning the entire cache map (`snapshot()`) every refresh. The lock is
+    // released before the per-process syscalls below — those must NOT run while
+    // holding it, or they would stall the collector thread's cache write lock.
+    let cache_snapshot: HashMap<u32, super::cache::ProcessCacheEntry> =
+        CACHE.with_read(|cache| {
+            processes
+                .iter()
+                .filter_map(|p| cache.get(&p.pid).map(|e| (p.pid, e.clone())))
+                .collect()
+        });
     let now = std::time::Instant::now();
 
     // Query data sequentially - parallel overhead exceeds benefit for this workload
@@ -569,11 +578,19 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
         })
         .collect();
 
+    // Build lookup map once (used for both the cache update and the struct update
+    // below). Previously the cache-update closure did a linear `find` per PID,
+    // which was O(n^2) over the visible slice.
+    let data_map: HashMap<u32, &EnrichedProcessData> = enriched_data
+        .iter()
+        .map(|d| (d.pid, d))
+        .collect();
+
     // Update unified cache with newly queried data (single lock acquisition)
     {
         let pids: Vec<u32> = enriched_data.iter().map(|d| d.pid).collect();
         CACHE.update_batch(&pids, |pid, entry| {
-            if let Some(data) = enriched_data.iter().find(|d| d.pid == pid) {
+            if let Some(data) = data_map.get(&pid) {
                 entry.is_elevated = Some(data.is_elevated);
                 entry.arch = Some(data.arch);
                 entry.exe_path = Some(data.exe_path.clone());
@@ -582,12 +599,6 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             }
         });
     }
-
-    // Build lookup map
-    let data_map: HashMap<u32, &EnrichedProcessData> = enriched_data
-        .iter()
-        .map(|d| (d.pid, d))
-        .collect();
 
     // Update process structs
     // IMPORTANT: cpu_time and start_time are already populated from NtQuerySystemInformation in from_native.
@@ -765,37 +776,46 @@ impl ProcessInfo {
         
         let pid = proc.pid();
         let now = std::time::Instant::now();
-        let cache_snapshot = CACHE.snapshot();
-        let cached_entry = cache_snapshot.get(&pid);
 
-        // Get cached static info
-        let (is_elevated, arch, cached_exe_path) = cached_entry
-            .and_then(|e| {
-                match (&e.is_elevated, &e.arch, &e.exe_path) {
-                    (Some(elev), Some(arch), Some(path)) => Some((*elev, *arch, path.clone())),
-                    _ => None,
-                }
-            })
-            .unwrap_or((false, ProcessArch::Native, String::new()));
+        // Read only this PID's cached fields under a short read lock, instead of
+        // cloning the entire cache map (`snapshot()`) just to look up one entry.
+        // from_raw runs once per *new* process, so the old full-map clone was
+        // O(processes^2) string-cloning on boot / mass-spawn.
+        let (is_elevated, arch, cached_exe_path, efficiency_mode, user) =
+            CACHE.with_read(|cache| {
+                let cached_entry = cache.get(&pid);
 
-        let efficiency_mode = cached_entry
-            .and_then(|e| {
-                if let (Some(mode), Some(updated)) = (e.efficiency_mode, e.efficiency_updated)
-                    && now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS {
-                        return Some(mode);
-                    }
-                None
-            })
-            .unwrap_or(false);
+                // Get cached static info
+                let (is_elevated, arch, cached_exe_path) = cached_entry
+                    .and_then(|e| {
+                        match (&e.is_elevated, &e.arch, &e.exe_path) {
+                            (Some(elev), Some(arch), Some(path)) => Some((*elev, *arch, path.clone())),
+                            _ => None,
+                        }
+                    })
+                    .unwrap_or((false, ProcessArch::Native, String::new()));
 
-        let user = cached_entry
-            .and_then(|e| e.user.clone())
-            .unwrap_or_else(|| {
-                if pid == 0 || pid == 4 {
-                    SYSTEM_STR.to_string()
-                } else {
-                    "-".to_string()
-                }
+                let efficiency_mode = cached_entry
+                    .and_then(|e| {
+                        if let (Some(mode), Some(updated)) = (e.efficiency_mode, e.efficiency_updated)
+                            && now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS {
+                                return Some(mode);
+                            }
+                        None
+                    })
+                    .unwrap_or(false);
+
+                let user = cached_entry
+                    .and_then(|e| e.user.clone())
+                    .unwrap_or_else(|| {
+                        if pid == 0 || pid == 4 {
+                            SYSTEM_STR.to_string()
+                        } else {
+                            "-".to_string()
+                        }
+                    });
+
+                (is_elevated, arch, cached_exe_path, efficiency_mode, user)
             });
 
         let mem_percent = if total_mem > 0 {

@@ -1063,6 +1063,14 @@ impl App {
         let show_user = self.config.show_user_threads;
         let process_count = self.processes.len();
 
+        // Prune stale collapsed PIDs only when the set has grown disproportionate to
+        // the live process count. Otherwise `collapsed_pids` grows unbounded over long
+        // uptime (each collapse_all adds every PID; dead/reused PIDs are never removed).
+        if self.collapsed_pids.len() > process_count * 2 {
+            let live: HashSet<u32> = self.processes.iter().map(|p| p.pid).collect();
+            self.collapsed_pids.retain(|pid| live.contains(pid));
+        }
+
         let mut processes: Vec<ProcessInfo> = Vec::with_capacity(process_count);
         processes.extend(self.processes
             .iter()
@@ -1265,11 +1273,11 @@ impl App {
         root_processes.sort_by_key(|p| p.pid);
 
         // Build tree recursively
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(process_count);
         let root_count = root_processes.len();
         for (idx, root) in root_processes.into_iter().enumerate() {
             let is_last = idx == root_count - 1;
-            self.add_tree_node(&mut result, root, &mut children_map, 0, is_last, String::new());
+            self.add_tree_node(&mut result, root, &mut children_map, 0, is_last, "");
         }
 
         // Collect orphaned processes (e.g. from PID reuse cycles) that weren't
@@ -1293,7 +1301,7 @@ impl App {
         children_map: &mut std::collections::HashMap<u32, Vec<ProcessInfo>>,
         depth: usize,
         is_last: bool,
-        parent_prefix: String,
+        parent_prefix: &str,
     ) {
         // Guard against cycles from PID reuse and excessively deep trees
         const MAX_TREE_DEPTH: usize = 64;
@@ -1313,7 +1321,7 @@ impl App {
         if depth > 0 {
             let branch = if is_last { "└─ " } else { "├─ " };
             let mut prefix = String::with_capacity(parent_prefix.len() + 6);
-            prefix.push_str(&parent_prefix);
+            prefix.push_str(parent_prefix);
             prefix.push_str(branch);
             process.tree_prefix = prefix;
         } else {
@@ -1333,7 +1341,7 @@ impl App {
                 let child_parent_prefix = if depth > 0 {
                     let connector = if is_last { "   " } else { "│  " };
                     let mut prefix = String::with_capacity(parent_prefix.len() + 3);
-                    prefix.push_str(&parent_prefix);
+                    prefix.push_str(parent_prefix);
                     prefix.push_str(connector);
                     prefix
                 } else {
@@ -1342,7 +1350,7 @@ impl App {
 
                 for (idx, child) in sorted_children.into_iter().enumerate() {
                     let child_is_last = idx == child_count - 1;
-                    self.add_tree_node(result, child, children_map, depth + 1, child_is_last, child_parent_prefix.clone());
+                    self.add_tree_node(result, child, children_map, depth + 1, child_is_last, &child_parent_prefix);
                 }
             }
     }

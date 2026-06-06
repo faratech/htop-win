@@ -658,7 +658,7 @@ impl Buffer {
         let max_col = x.saturating_add(max_width).min(self.area.x + self.area.width);
 
         for ch in string.chars() {
-            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+            let width = if ch.is_ascii_graphic() { 1 } else { unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) } as u16;
             if col + width > max_col {
                 break;
             }
@@ -685,7 +685,7 @@ impl Buffer {
         for span in &line.spans {
             let style = line.style.patch(span.style);
             for ch in span.content.chars() {
-                let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+                let width = if ch.is_ascii_graphic() { 1 } else { unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) } as u16;
                 if col + width > max_col {
                     return;
                 }

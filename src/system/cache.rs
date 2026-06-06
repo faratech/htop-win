@@ -215,16 +215,7 @@ impl ProcessCache {
         result
     }
 
-    // ========== Snapshot Methods ==========
-
-    /// Get a snapshot of all cached data (single lock acquisition)
-    /// Returns cloned data to minimize lock hold time
-    pub fn snapshot(&self) -> HashMap<u32, ProcessCacheEntry> {
-        self.entries
-            .read()
-            .map(|cache| cache.clone())
-            .unwrap_or_default()
-    }
+    // ========== Read Access ==========
 
     /// Execute a closure with read access to the cache, avoiding a full clone.
     /// The lock is held for the duration of the callback.
@@ -306,8 +297,8 @@ mod tests {
     fn test_user_cache() {
         let cache = ProcessCache::new();
         cache.set_user(123, "testuser".to_string());
-        let snap = cache.snapshot();
-        assert_eq!(snap[&123].user, Some("testuser".to_string()));
+        let user = cache.with_read(|c| c[&123].user.clone());
+        assert_eq!(user, Some("testuser".to_string()));
     }
 
     #[test]
@@ -322,14 +313,15 @@ mod tests {
         let current_pids: HashSet<u32> = [1, 3].into_iter().collect();
         cache.cleanup(&current_pids);
 
-        let snap = cache.snapshot();
-        assert!(snap.contains_key(&1));
-        assert!(!snap.contains_key(&2)); // Cleaned up
-        assert!(snap.contains_key(&3));
+        cache.with_read(|c| {
+            assert!(c.contains_key(&1));
+            assert!(!c.contains_key(&2)); // Cleaned up
+            assert!(c.contains_key(&3));
+        });
     }
 
     #[test]
-    fn test_snapshot() {
+    fn test_with_read() {
         let cache = ProcessCache::new();
         cache.update_times_batch(&[
             (1, 100, 200, 1, 0, 0),
@@ -337,9 +329,10 @@ mod tests {
         ]);
         cache.set_user(1, "user1".to_string());
 
-        let snapshot = cache.snapshot();
-        assert_eq!(snapshot.len(), 2);
-        assert!(snapshot.contains_key(&1));
-        assert!(snapshot.contains_key(&2));
+        cache.with_read(|c| {
+            assert_eq!(c.len(), 2);
+            assert!(c.contains_key(&1));
+            assert!(c.contains_key(&2));
+        });
     }
 }
