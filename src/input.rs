@@ -565,7 +565,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if let DialogState::Setup { ref mut selected } = app.dialog
-                && *selected < 12 {
+                && *selected < 13 {
                     // Number of setup items - 1
                     *selected += 1;
                 }
@@ -594,36 +594,40 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     app.config.memory_meter_mode = cycle_meter_mode(app.config.memory_meter_mode);
                 }
                 3 => {
+                    // Cycle NPU meter mode (meter only appears on NPU machines)
+                    app.config.npu_meter_mode = cycle_meter_mode(app.config.npu_meter_mode);
+                }
+                4 => {
                     // Toggle show kernel threads
                     app.config.show_kernel_threads = !app.config.show_kernel_threads;
                 }
-                4 => {
+                5 => {
                     // Toggle show user threads
                     app.config.show_user_threads = !app.config.show_user_threads;
                 }
-                5 => {
+                6 => {
                     // Toggle show program path
                     app.config.show_program_path = !app.config.show_program_path;
                     app.needs_process_update = true;
                 }
-                6 => {
+                7 => {
                     // Toggle highlight new processes
                     app.config.highlight_new_processes = !app.config.highlight_new_processes;
                 }
-                7 => {
+                8 => {
                     // Toggle highlight large numbers
                     app.config.highlight_large_numbers = !app.config.highlight_large_numbers;
                 }
-                8 => {
+                9 => {
                     // Toggle tree view
                     app.toggle_tree_view();
                     app.config.tree_view_default = app.tree_view;
                 }
-                9 => {
+                10 => {
                     // Toggle confirm before kill
                     app.config.confirm_kill = !app.config.confirm_kill;
                 }
-                10 => {
+                11 => {
                     // Open color scheme selection
                     let schemes = ColorScheme::all();
                     let index = schemes.iter()
@@ -631,11 +635,11 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                         .unwrap_or(0);
                     app.dialog = DialogState::ColorScheme { index };
                 }
-                11 => {
+                12 => {
                     // Open column configuration
                     app.enter_column_config_mode();
                 }
-                12 => {
+                13 => {
                     // Reset all settings to defaults
                     app.config.reset_to_defaults();
                     app.reset_screen_tabs();
@@ -691,6 +695,14 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                         app.config.memory_meter_mode = cycle_meter_mode(app.config.memory_meter_mode);
                     } else {
                         app.config.memory_meter_mode = cycle_meter_mode_rev(app.config.memory_meter_mode);
+                    }
+                }
+                3 => {
+                    // Adjust NPU meter mode
+                    if key.code == KeyCode::Right {
+                        app.config.npu_meter_mode = cycle_meter_mode(app.config.npu_meter_mode);
+                    } else {
+                        app.config.npu_meter_mode = cycle_meter_mode_rev(app.config.npu_meter_mode);
                     }
                 }
                 _ => {}
@@ -798,7 +810,7 @@ fn handle_color_scheme_keys(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Esc => {
-            app.dialog = DialogState::Setup { selected: 10 };
+            app.dialog = DialogState::Setup { selected: 11 };
         }
         KeyCode::Enter => {
             if let DialogState::ColorScheme { index } = app.dialog
@@ -807,7 +819,7 @@ fn handle_color_scheme_keys(app: &mut App, key: KeyEvent) -> bool {
                     app.update_theme();
                     app.save_config();
                 }
-            app.dialog = DialogState::Setup { selected: 10 };
+            app.dialog = DialogState::Setup { selected: 11 };
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let DialogState::ColorScheme { ref mut index } = app.dialog
@@ -846,7 +858,7 @@ fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Esc => {
-            app.dialog = DialogState::Setup { selected: 11 };
+            app.dialog = DialogState::Setup { selected: 12 };
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -995,7 +1007,7 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
                            y > dialog_y && y < dialog_y + dialog_height - 1 {
                             // Calculate which item was clicked (y - dialog_y - 1 for border)
                             let item_index = (y.saturating_sub(dialog_y).saturating_sub(1)) as usize;
-                            let num_items = 13; // Setup has 13 items
+                            let num_items = 14; // Setup has 14 items
                             if item_index < num_items
                                 && let DialogState::Setup { ref mut selected } = app.dialog {
                                     *selected = item_index;
@@ -1144,6 +1156,12 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
             // Swap meter click - cycle meter mode (shares with memory)
             (UIElement::SwapMeter, UIAction::Click) => {
                 app.config.memory_meter_mode = app.config.memory_meter_mode.next();
+                app.save_config();
+            }
+
+            // NPU meter click - cycle meter mode
+            (UIElement::NpuMeter, UIAction::Click) => {
+                app.config.npu_meter_mode = app.config.npu_meter_mode.next();
                 app.save_config();
             }
 

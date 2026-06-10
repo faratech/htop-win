@@ -30,6 +30,7 @@ windows = { version = "0.62", features = [
     "Win32_System_Com",
     "Win32_Networking_WinHttp",
     "Wdk_System_SystemInformation",
+    "Wdk_Graphics_Direct3D",
 ] }
 
 [build-dependencies]

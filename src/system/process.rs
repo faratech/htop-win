@@ -163,7 +163,7 @@ impl ProcessArch {
 /// Open a process handle with fallback from full to limited query access
 #[cfg(windows)]
 #[inline]
-fn open_process_query(pid: u32) -> Option<HANDLE> {
+pub(crate) fn open_process_query(pid: u32) -> Option<HANDLE> {
     unsafe {
         match OpenProcess(PROCESS_QUERY_INFORMATION, false, pid) {
             Ok(h) if !h.is_invalid() => Some(h),
@@ -696,6 +696,8 @@ pub struct ProcessInfo {
     pub io_write_bytes: u64, // I/O bytes written (cumulative)
     pub io_read_rate: u64,   // I/O read bytes since last refresh
     pub io_write_rate: u64,  // I/O write bytes since last refresh
+    pub npu_percent: f32,    // NPU utilization (max across NPU engine nodes)
+    pub npu_memory: u64,     // NPU dedicated + shared committed bytes
     // Pre-computed lowercase strings for efficient filtering (avoid per-filter allocations)
     pub name_lower: String,
     pub command_lower: String,
@@ -873,6 +875,8 @@ impl ProcessInfo {
             io_write_bytes: proc.write_bytes(),
             io_read_rate: 0,
             io_write_rate: 0,
+            npu_percent: 0.0,
+            npu_memory: 0,
             name_lower,
             command_lower,
             user_lower,

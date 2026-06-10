@@ -89,10 +89,13 @@ pub struct Config {
     pub show_clock: bool,
     pub show_hostname: bool,
     pub show_battery: bool,
+    /// NPU meter (auto-hides on machines without an NPU)
+    pub show_npu_meter: bool,
 
     // Meter modes
     pub cpu_meter_mode: MeterMode,
     pub memory_meter_mode: MeterMode,
+    pub npu_meter_mode: MeterMode,
 
     // Column visibility (which columns to show in process list)
     pub visible_columns: Vec<String>,
@@ -139,9 +142,12 @@ impl Default for Config {
             show_clock: false,
             show_hostname: true,
             show_battery: false,
+            // Harmless default: the meter only appears when an NPU exists
+            show_npu_meter: true,
 
             cpu_meter_mode: MeterMode::Bar,
             memory_meter_mode: MeterMode::Bar,
+            npu_meter_mode: MeterMode::Bar,
 
             visible_columns: vec![
                 "PID".to_string(),
@@ -287,6 +293,7 @@ impl Config {
             show_clock: get_bool("show_clock", defaults.show_clock),
             show_hostname: get_bool("show_hostname", defaults.show_hostname),
             show_battery: get_bool("show_battery", defaults.show_battery),
+            show_npu_meter: get_bool("show_npu_meter", defaults.show_npu_meter),
 
             cpu_meter_mode: MeterMode::from_str(&get_str(
                 "cpu_meter_mode",
@@ -295,6 +302,10 @@ impl Config {
             memory_meter_mode: MeterMode::from_str(&get_str(
                 "memory_meter_mode",
                 defaults.memory_meter_mode.as_str(),
+            )),
+            npu_meter_mode: MeterMode::from_str(&get_str(
+                "npu_meter_mode",
+                defaults.npu_meter_mode.as_str(),
             )),
 
             visible_columns,
@@ -415,6 +426,10 @@ impl Config {
             Value::Bool(self.show_hostname),
         );
         map.insert("show_battery".to_string(), Value::Bool(self.show_battery));
+        map.insert(
+            "show_npu_meter".to_string(),
+            Value::Bool(self.show_npu_meter),
+        );
 
         map.insert(
             "cpu_meter_mode".to_string(),
@@ -423,6 +438,10 @@ impl Config {
         map.insert(
             "memory_meter_mode".to_string(),
             Value::String(self.memory_meter_mode.as_str().to_string()),
+        );
+        map.insert(
+            "npu_meter_mode".to_string(),
+            Value::String(self.npu_meter_mode.as_str().to_string()),
         );
 
         map.insert(
@@ -493,5 +512,7 @@ mod tests {
         assert_eq!(loaded.refresh_rate_ms, config.refresh_rate_ms);
         assert_eq!(loaded.tree_view_default, config.tree_view_default);
         assert_eq!(loaded.visible_columns, config.visible_columns);
+        assert_eq!(loaded.show_npu_meter, config.show_npu_meter);
+        assert_eq!(loaded.npu_meter_mode, config.npu_meter_mode);
     }
 }

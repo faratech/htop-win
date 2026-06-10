@@ -1,11 +1,13 @@
 mod cpu;
 mod memory;
 mod native;
+mod npu;
 pub mod cache;
 mod process;
 
 pub use cpu::CpuInfo;
 pub use memory::{format_bytes, MemoryInfo};
+pub use npu::{set_process_stats_enabled as set_npu_process_stats_enabled, NpuInfo};
 pub use process::{
     enable_debug_privilege, enrich_processes, get_process_affinity, get_process_exe_path,
     get_process_io_counters, kill_process, set_efficiency_mode, set_priority_class,
@@ -36,6 +38,8 @@ pub struct SystemMetrics {
     // Battery
     pub battery_percent: Option<f32>,
     pub battery_charging: bool,
+    // NPU (None when no MCDM compute-only adapter exists)
+    pub npu: Option<NpuInfo>,
     // Previous values for rate calculation
     prev_net_rx: u64,
     prev_net_tx: u64,
@@ -67,6 +71,7 @@ impl Default for SystemMetrics {
             disk_write_rate: 0,
             battery_percent: None,
             battery_charging: false,
+            npu: None,
             prev_net_rx: 0,
             prev_net_tx: 0,
             prev_disk_read: 0,
@@ -182,6 +187,9 @@ impl SystemMetrics {
 
         // Update battery status
         self.update_battery();
+
+        // Update NPU metrics (no-op on machines without an NPU)
+        self.npu = npu::refresh();
     }
 
     fn update_battery(&mut self) {
@@ -273,12 +281,18 @@ impl SystemMetrics {
 
             let mut new_processes = Vec::new();
 
+            // Per-process NPU stats (empty unless an NPU exists and an NPU
+            // column is currently visible or sorted)
+            let pids: Vec<u32> = proc_list.iter().map(|p| p.pid()).collect();
+            let npu_stats = npu::process_stats(&pids);
+
             // Iterate raw processes
             for raw_proc in proc_list.iter() {
                 let pid = raw_proc.pid();
                 seen_pids.insert(pid);
                 let cpu_pct = rates.cpu_percentages.get(&pid).copied().unwrap_or(0.0);
                 let (io_read_rate, io_write_rate) = rates.io_rates.get(&pid).copied().unwrap_or((0, 0));
+                let proc_npu = npu_stats.get(&pid).copied().unwrap_or_default();
 
                 if let Some(&idx) = existing_map.get(&pid) {
                     let native_start = filetime_to_unix(raw_proc.create_time());
@@ -293,10 +307,14 @@ impl SystemMetrics {
                     }
                     existing_proc.io_read_rate = io_read_rate;
                     existing_proc.io_write_rate = io_write_rate;
+                    existing_proc.npu_percent = proc_npu.percent;
+                    existing_proc.npu_memory = proc_npu.memory;
                 } else {
                     let mut proc_info = ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem);
                     proc_info.io_read_rate = io_read_rate;
                     proc_info.io_write_rate = io_write_rate;
+                    proc_info.npu_percent = proc_npu.percent;
+                    proc_info.npu_memory = proc_npu.memory;
                     new_processes.push(proc_info);
                 }
             }

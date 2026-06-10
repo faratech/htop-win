@@ -94,17 +94,26 @@ fn calculate_meter_columns(width: u16, cpu_count: usize) -> usize {
     many_core.min(cpu_count.max(1))
 }
 
+/// Whether the NPU meter row is shown: requires an NPU (MCDM compute-only
+/// adapter) to exist and the meter to be enabled in config. On machines
+/// without an NPU the header layout is unchanged.
+fn npu_meter_visible(app: &App) -> bool {
+    app.config.show_npu_meter && app.system_metrics.npu.is_some()
+}
+
 /// How many "extra" (non-CPU) meter rows a given column holds.
 ///
-/// - Leftmost column gets Mem + Swp (2 rows).
+/// - Leftmost column gets Mem + Swp (2 rows), plus NPU when present.
 /// - Rightmost column gets Tasks + Uptime (2 rows).
-/// - On single-column mode the one column holds all 4 (Mem, Swp, Tasks, Uptime).
+/// - On single-column mode the one column holds all (Mem, Swp, [NPU], Tasks, Uptime).
 /// - Middle columns (only when col_count == 3) have no mandatory extras —
 ///   Net/Dsk/Bat fill empty CPU slots opportunistically inside `draw_meter_column`.
-fn extras_for_column(col_idx: usize, col_count: usize) -> usize {
+fn extras_for_column(col_idx: usize, col_count: usize, has_npu: bool) -> usize {
     if col_count == 1 {
-        4
-    } else if col_idx == 0 || col_idx == col_count - 1 {
+        4 + has_npu as usize
+    } else if col_idx == 0 {
+        2 + has_npu as usize
+    } else if col_idx == col_count - 1 {
         2
     } else {
         0
@@ -143,7 +152,8 @@ pub fn calculate_header_height(app: &App) -> u16 {
     let cols = calculate_meter_columns(app.terminal_width, cpu_count);
     let meter_rows = meter_rows_for(cpu_count, cols);
     // 1-col stacks all 4 extras; multi-col columns hold at most 2 each.
-    let extras = if cols == 1 { 4 } else { 2 };
+    // The NPU meter adds one row to the (leftmost) column when present.
+    let extras = (if cols == 1 { 4 } else { 2 }) + npu_meter_visible(app) as usize;
     (meter_rows + extras).max(4) as u16
 }
 
@@ -201,7 +211,8 @@ fn draw_meter_column(
     filler_cursor: &mut usize,
 ) {
     let cpu_count = app.system_metrics.cpu.core_usage.len();
-    let extras = extras_for_column(col_idx, col_count);
+    let has_npu = npu_meter_visible(app);
+    let extras = extras_for_column(col_idx, col_count, has_npu);
     let total_rows = meter_rows + extras;
     if total_rows == 0 {
         return;
@@ -251,14 +262,28 @@ fn draw_meter_column(
     let is_leftmost = col_idx == 0;
     let is_rightmost = col_idx == col_count - 1;
     let order: &[ExtraMeter] = if col_count == 1 {
-        &[
-            ExtraMeter::Memory,
-            ExtraMeter::Swap,
-            ExtraMeter::Tasks,
-            ExtraMeter::Uptime,
-        ]
+        if has_npu {
+            &[
+                ExtraMeter::Memory,
+                ExtraMeter::Swap,
+                ExtraMeter::Npu,
+                ExtraMeter::Tasks,
+                ExtraMeter::Uptime,
+            ]
+        } else {
+            &[
+                ExtraMeter::Memory,
+                ExtraMeter::Swap,
+                ExtraMeter::Tasks,
+                ExtraMeter::Uptime,
+            ]
+        }
     } else if is_leftmost {
-        &[ExtraMeter::Memory, ExtraMeter::Swap]
+        if has_npu {
+            &[ExtraMeter::Memory, ExtraMeter::Swap, ExtraMeter::Npu]
+        } else {
+            &[ExtraMeter::Memory, ExtraMeter::Swap]
+        }
     } else if is_rightmost {
         &[ExtraMeter::Tasks, ExtraMeter::Uptime]
     } else {
@@ -291,6 +316,16 @@ fn draw_meter_column(
                 });
                 draw_swap_bar(frame, app, row);
             }
+            ExtraMeter::Npu => {
+                app.ui_bounds.add_region(UIRegion {
+                    element: UIElement::NpuMeter,
+                    x: row.x,
+                    y: row.y,
+                    width: row.width,
+                    height: row.height,
+                });
+                draw_npu_bar(frame, app, row);
+            }
             ExtraMeter::Tasks => draw_tasks_info(frame, app, row),
             ExtraMeter::Uptime => draw_uptime_info(frame, app, row),
         }
@@ -301,6 +336,7 @@ fn draw_meter_column(
 enum ExtraMeter {
     Memory,
     Swap,
+    Npu,
     Tasks,
     Uptime,
 }
@@ -585,6 +621,69 @@ fn draw_swap_bar(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(bar_fill(filled), Style::default().fg(bar_color)),
                 Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
                 Span::styled(format!("{}]", swap_info), Style::default().fg(theme.text)),
+            ])
+        }
+    };
+
+    let paragraph = Paragraph::new(line);
+    frame.render_widget(paragraph, area);
+}
+
+/// NPU utilization meter (Task Manager parity). The bar fill is utilization;
+/// the info text shows NPU memory in use (and total when the driver reports
+/// a commit limit). Only drawn when an NPU exists (see `npu_meter_visible`).
+fn draw_npu_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let mode = app.config.npu_meter_mode;
+
+    if mode == MeterMode::Hidden {
+        return;
+    }
+
+    let Some(npu) = &app.system_metrics.npu else {
+        return;
+    };
+    let usage = npu.utilization.clamp(0.0, 100.0);
+    let theme = &app.theme;
+
+    // htop-style format: "NPU[|||||      X.XX% Y.YG/Z.ZG]"
+    let npu_info = if npu.mem_total > 0 {
+        format!("{:.1}% {}/{}", usage, format_bytes(npu.mem_used), format_bytes(npu.mem_total))
+    } else {
+        format!("{:.1}% {}", usage, format_bytes(npu.mem_used))
+    };
+
+    let line = match mode {
+        MeterMode::Text => {
+            Line::from(vec![
+                Span::styled("NPU: ", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{:5.1}%", usage),
+                    Style::default().fg(theme.cpu_color(usage)).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" ({})", format_bytes(npu.mem_used)), Style::default().fg(theme.text)),
+            ])
+        }
+        MeterMode::Graph => {
+            let graph_width = (area.width.saturating_sub(npu_info.len() as u16 + 6) as usize).min(max_bar_width(area.width as usize));
+            let graph_str = render_sparkline(&app.npu_history, graph_width);
+
+            Line::from(vec![
+                Span::styled("NPU[", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+                Span::styled(graph_str, Style::default().fg(theme.cpu_color(usage)).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{}]", npu_info), Style::default().fg(theme.text)),
+            ])
+        }
+        MeterMode::Bar | MeterMode::Hidden => {
+            let info_len = npu_info.len() + 1; // +1 for the closing bracket
+            let bar_width = (area.width.saturating_sub(4 + info_len as u16) as usize).min(max_bar_width(area.width as usize)); // 4 for "NPU["
+            let filled = ((usage as usize) * bar_width / 100).min(bar_width);
+            let empty = bar_width - filled;
+
+            Line::from(vec![
+                Span::styled("NPU[", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+                Span::styled(bar_fill(filled), Style::default().fg(theme.cpu_color(usage))),
+                Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
+                Span::styled(format!("{}]", npu_info), Style::default().fg(theme.text)),
             ])
         }
     };
