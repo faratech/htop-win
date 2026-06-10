@@ -816,14 +816,34 @@ impl App {
         }
     }
 
-    /// Reset screen tabs to defaults and apply
+    /// Reset screen tabs to defaults and apply. The Main tab defaults are
+    /// hardware-aware: GPU/NPU columns are included when the adapter exists,
+    /// so a reset doesn't strip columns the machine actually supports.
     pub fn reset_screen_tabs(&mut self) {
-        self.screen_tabs = vec![
-            ScreenTab::default_main(&Config::default()),
-            ScreenTab::default_io(),
-        ];
+        let mut main = ScreenTab::default_main(&Config::default());
+        main.columns = hardware_default_columns(
+            self.system_metrics.gpu.is_some(),
+            self.system_metrics.npu.is_some(),
+        );
+        self.screen_tabs = vec![main, ScreenTab::default_io()];
         self.active_tab = 0;
         self.apply_active_tab();
+    }
+
+    /// First-run setup: include GPU/NPU columns in the Main tab now that
+    /// hardware detection has run (adapter info isn't known at App::new).
+    /// Only called when no config file existed, so no user layout is touched.
+    pub fn apply_hardware_default_columns(&mut self) {
+        if let Some(tab) = self.screen_tabs.first_mut() {
+            tab.columns = hardware_default_columns(
+                self.system_metrics.gpu.is_some(),
+                self.system_metrics.npu.is_some(),
+            );
+        }
+        if self.active_tab == 0 {
+            self.sync_config_from_active_tab();
+            self.update_visible_columns_cache();
+        }
     }
 
     /// Update the color theme from config
@@ -2028,6 +2048,26 @@ fn canonical_insert_index(columns: &[String], column: &str) -> usize {
         .unwrap_or(columns.len())
 }
 
+/// Default Main-tab columns for the detected hardware: the static defaults
+/// plus GPU%/GPU-MEM and NPU%/NPU-MEM when the corresponding adapter exists,
+/// inserted at their canonical positions (right after MEM%).
+fn hardware_default_columns(has_gpu: bool, has_npu: bool) -> Vec<String> {
+    let mut columns = Config::default().visible_columns;
+    let mut add = |name: &str| {
+        let at = canonical_insert_index(&columns, name);
+        columns.insert(at, name.to_string());
+    };
+    if has_gpu {
+        add("GPU%");
+        add("GPU-MEM");
+    }
+    if has_npu {
+        add("NPU%");
+        add("NPU-MEM");
+    }
+    columns
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2054,6 +2094,28 @@ mod tests {
         for (i, name) in usage.iter().enumerate() {
             assert_eq!(SortColumn::display_rank(name), base + i);
         }
+    }
+
+    #[test]
+    fn hardware_defaults_add_adapter_columns_after_mem() {
+        // No adapters: identical to the static defaults
+        assert_eq!(
+            hardware_default_columns(false, false),
+            crate::config::Config::default().visible_columns
+        );
+
+        // Both adapters: usage block sits between MEM% and TIME+, Command last
+        let full = hardware_default_columns(true, true);
+        let mem = full.iter().position(|c| c == "MEM%").unwrap();
+        let window: Vec<&str> = full[mem..mem + 5].iter().map(String::as_str).collect();
+        assert_eq!(window, ["MEM%", "GPU%", "GPU-MEM", "NPU%", "NPU-MEM"]);
+        assert_eq!(full.last().map(String::as_str), Some("Command"));
+        assert_canonical_order(&full);
+
+        // GPU without NPU (the common case)
+        let gpu_only = hardware_default_columns(true, false);
+        assert!(gpu_only.iter().any(|c| c == "GPU-MEM"));
+        assert!(!gpu_only.iter().any(|c| c == "NPU%"));
     }
 
     #[test]

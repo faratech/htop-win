@@ -434,7 +434,10 @@ fn run_tui_inner(
         let _ = event::read();
     }
 
-    // Load configuration from file (or use defaults)
+    // Load configuration from file (or use defaults). Remember whether a
+    // config existed: on first run the default columns are augmented with
+    // GPU/NPU columns once hardware detection has run (first snapshot).
+    let first_run = !Config::config_path().is_some_and(|p| p.exists());
     let mut config = Config::load();
 
     // Apply command-line overrides
@@ -513,6 +516,9 @@ fn run_tui_inner(
     let (collector, data_rx) = data::DataCollector::spawn(app.config.refresh_rate_ms);
     if let Ok(snapshot) = data_rx.recv() {
         app.apply_snapshot(snapshot);
+    }
+    if first_run {
+        app.apply_hardware_default_columns();
     }
     *process_count = app.processes.len();
 
