@@ -696,6 +696,8 @@ pub struct ProcessInfo {
     pub io_write_bytes: u64, // I/O bytes written (cumulative)
     pub io_read_rate: u64,   // I/O read bytes since last refresh
     pub io_write_rate: u64,  // I/O write bytes since last refresh
+    pub gpu_percent: f32,    // GPU utilization (max across all GPU engine nodes)
+    pub gpu_memory: u64,     // GPU committed bytes across all GPU adapters
     pub npu_percent: f32,    // NPU utilization (max across NPU engine nodes)
     pub npu_memory: u64,     // NPU dedicated + shared committed bytes
     // Pre-computed lowercase strings for efficient filtering (avoid per-filter allocations)
@@ -875,6 +877,8 @@ impl ProcessInfo {
             io_write_bytes: proc.write_bytes(),
             io_read_rate: 0,
             io_write_rate: 0,
+            gpu_percent: 0.0,
+            gpu_memory: 0,
             npu_percent: 0.0,
             npu_memory: 0,
             name_lower,

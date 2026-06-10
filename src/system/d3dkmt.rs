@@ -51,13 +51,17 @@ pub struct AdapterSnapshot {
     pub npu: Option<NpuInfo>,
 }
 
-/// Per-process NPU usage row.
+/// Per-process GPU/NPU usage row.
 #[derive(Clone, Copy, Default)]
-pub struct ProcNpu {
+pub struct ProcAdapterStats {
+    /// 0-100, max across all GPU engine nodes of all GPU adapters
+    pub gpu_percent: f32,
+    /// Committed bytes across all GPU adapters
+    pub gpu_memory: u64,
     /// 0-100, max across NPU engine nodes
-    pub percent: f32,
+    pub npu_percent: f32,
     /// Dedicated + shared committed bytes
-    pub memory: u64,
+    pub npu_memory: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -91,17 +95,26 @@ struct AdapterState {
     last_proc_sample: Option<Instant>,
     /// pid -> previous RunningTime per node, flattened across adapters
     prev_proc_running: HashMap<u32, Vec<i64>>,
+    /// (gpu, npu) gates last seen by process_stats; a change invalidates the
+    /// flattened baselines (a disabled class keeps stale RunningTime values)
+    prev_proc_gates: (bool, bool),
 }
 
 static ADAPTER_STATE: Mutex<Option<AdapterState>> = Mutex::new(None);
 
-/// Per-process collection gate, set from the UI thread (NPU column visible or
-/// sorted), read by the data-collector thread. Per-process stats cost a handle
-/// open plus a few syscalls per process per tick, so they're off unless shown.
-static PROCESS_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Per-process collection gates, set from the UI thread (a GPU/NPU column is
+/// visible or sorted), read by the data-collector thread. Per-process stats
+/// cost a handle open plus a few syscalls per process per tick, so each class
+/// is off unless shown.
+static GPU_PROCESS_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
+static NPU_PROCESS_STATS_ENABLED: AtomicBool = AtomicBool::new(false);
 
-pub fn set_process_stats_enabled(enabled: bool) {
-    PROCESS_STATS_ENABLED.store(enabled, Ordering::Relaxed);
+pub fn set_gpu_process_stats_enabled(enabled: bool) {
+    GPU_PROCESS_STATS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_npu_process_stats_enabled(enabled: bool) {
+    NPU_PROCESS_STATS_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 /// Adapter classification from D3DKMT_ADAPTERTYPE flags. Software renderers
@@ -409,22 +422,28 @@ pub fn refresh() -> AdapterSnapshot {
     }
 }
 
-/// Per-process NPU stats for the given PIDs. Returns an empty map unless an
-/// NPU exists and `set_process_stats_enabled(true)` was called.
-pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcNpu> {
+/// Per-process GPU/NPU stats for the given PIDs. A class is only queried when
+/// its adapters exist and its `set_*_process_stats_enabled(true)` gate is on;
+/// with both gates off this returns an empty map without opening any handles.
+pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcAdapterStats> {
     let mut guard = ADAPTER_STATE.lock().unwrap();
     let Some(state) = guard.as_mut() else {
         return HashMap::new();
     };
-    if !state.adapters.iter().any(|a| a.class == AdapterClass::Npu) {
-        return HashMap::new();
-    }
-    if !PROCESS_STATS_ENABLED.load(Ordering::Relaxed) {
-        // Drop stale baselines so re-enabling starts from a clean first sample.
-        if !state.prev_proc_running.is_empty() {
-            state.prev_proc_running.clear();
-        }
+
+    let gpu_enabled = GPU_PROCESS_STATS_ENABLED.load(Ordering::Relaxed)
+        && state.adapters.iter().any(|a| a.class == AdapterClass::Gpu);
+    let npu_enabled = NPU_PROCESS_STATS_ENABLED.load(Ordering::Relaxed)
+        && state.adapters.iter().any(|a| a.class == AdapterClass::Npu);
+
+    // Nodes of a disabled class keep stale RunningTime baselines, so any gate
+    // change restarts delta tracking from a clean first sample.
+    if (gpu_enabled, npu_enabled) != state.prev_proc_gates {
+        state.prev_proc_gates = (gpu_enabled, npu_enabled);
+        state.prev_proc_running.clear();
         state.last_proc_sample = None;
+    }
+    if !gpu_enabled && !npu_enabled {
         return HashMap::new();
     }
 
@@ -434,8 +453,8 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcNpu> {
 
     // Split borrows so adapters and the baseline map can be used together.
     let AdapterState { adapters, prev_proc_running, .. } = state;
-    // Baseline slots cover every node of every adapter (GPUs included) so the
-    // flattened indices stay stable regardless of which classes are queried.
+    // Baseline slots cover every node of every adapter so the flattened
+    // indices stay stable regardless of which classes are queried.
     let total_nodes: usize = adapters.iter().map(|a| a.node_count as usize).sum();
 
     let mut result = HashMap::with_capacity(pids.len());
@@ -454,10 +473,14 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcNpu> {
             .entry(pid)
             .or_insert_with(|| vec![0; total_nodes]);
 
-        let mut entry = ProcNpu::default();
+        let mut entry = ProcAdapterStats::default();
         let mut node_index = 0;
         for adapter in adapters.iter() {
-            if adapter.class != AdapterClass::Npu {
+            let class_enabled = match adapter.class {
+                AdapterClass::Gpu => gpu_enabled,
+                AdapterClass::Npu => npu_enabled,
+            };
+            if !class_enabled {
                 node_index += adapter.node_count as usize;
                 continue;
             }
@@ -477,7 +500,14 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcNpu> {
                         unsafe { stats.QueryResult.ProcessNodeInformation.RunningTime };
                     if !fresh && let Some(secs) = elapsed {
                         let pct = running_time_to_percent(prev[node_index], running, secs);
-                        entry.percent = entry.percent.max(pct);
+                        match adapter.class {
+                            AdapterClass::Gpu => {
+                                entry.gpu_percent = entry.gpu_percent.max(pct)
+                            }
+                            AdapterClass::Npu => {
+                                entry.npu_percent = entry.npu_percent.max(pct)
+                            }
+                        }
                     }
                     prev[node_index] = running;
                 }
@@ -494,9 +524,13 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcNpu> {
                     SegmentId: segment_id,
                 };
                 if unsafe { query_statistics(&mut stats) } {
-                    entry.memory += unsafe {
+                    let committed = unsafe {
                         stats.QueryResult.ProcessSegmentInformation.BytesCommitted
                     };
+                    match adapter.class {
+                        AdapterClass::Gpu => entry.gpu_memory += committed,
+                        AdapterClass::Npu => entry.npu_memory += committed,
+                    }
                 }
             }
         }

@@ -326,6 +326,9 @@ pub enum SortColumn {
     IoWriteRate, // I/O write bytes per refresh
     IoRead,      // Cumulative I/O read bytes
     IoWrite,     // Cumulative I/O write bytes
+    // GPU columns (Task Manager parity; only meaningful on GPU machines)
+    Gpu,         // GPU utilization percent (max across all GPU engine nodes)
+    GpuMem,      // GPU committed memory across all GPU adapters
     // NPU columns (Task Manager parity; only meaningful on NPU machines)
     Npu,         // NPU utilization percent
     NpuMem,      // NPU dedicated + shared memory
@@ -358,6 +361,8 @@ impl SortColumn {
             SortColumn::IoWriteRate,
             SortColumn::IoRead,
             SortColumn::IoWrite,
+            SortColumn::Gpu,
+            SortColumn::GpuMem,
             SortColumn::Npu,
             SortColumn::NpuMem,
         ]
@@ -389,6 +394,8 @@ impl SortColumn {
             SortColumn::IoWriteRate => "IO_W/s",
             SortColumn::IoRead => "IO_RD",
             SortColumn::IoWrite => "IO_WR",
+            SortColumn::Gpu => "GPU%",
+            SortColumn::GpuMem => "GPU-MEM",
             SortColumn::Npu => "NPU%",
             SortColumn::NpuMem => "NPU-MEM",
         }
@@ -422,6 +429,8 @@ impl SortColumn {
             "IO_W/s" => Some(SortColumn::IoWriteRate),
             "IO_RD" => Some(SortColumn::IoRead),
             "IO_WR" => Some(SortColumn::IoWrite),
+            "GPU%" => Some(SortColumn::Gpu),
+            "GPU-MEM" => Some(SortColumn::GpuMem),
             "NPU%" => Some(SortColumn::Npu),
             "NPU-MEM" => Some(SortColumn::NpuMem),
             _ => None,
@@ -455,6 +464,8 @@ impl SortColumn {
             SortColumn::IoWriteRate => 7,
             SortColumn::IoRead => 7,
             SortColumn::IoWrite => 7,
+            SortColumn::Gpu => 6,
+            SortColumn::GpuMem => 8,
             SortColumn::Npu => 6,
             SortColumn::NpuMem => 8,
         }
@@ -1077,21 +1088,29 @@ impl App {
             .push_back(self.system_metrics.npu.as_ref().map_or(0.0, |n| n.utilization));
     }
 
-    /// Keep the per-process NPU collection gate in sync with what's displayed.
-    /// Collection costs a handle open plus a few syscalls per process per tick,
-    /// so it only runs while an NPU column is visible or sorted.
-    fn refresh_npu_collection_flag(&self) {
-        let wanted = matches!(self.sort_column, SortColumn::Npu | SortColumn::NpuMem)
+    /// Keep the per-process GPU/NPU collection gates in sync with what's
+    /// displayed. Collection costs a handle open plus a few syscalls per
+    /// process per tick, so each class only runs while one of its columns
+    /// is visible or sorted.
+    fn refresh_adapter_collection_flags(&self) {
+        let gpu_wanted = matches!(self.sort_column, SortColumn::Gpu | SortColumn::GpuMem)
+            || self
+                .cached_visible_columns
+                .iter()
+                .any(|c| matches!(c, SortColumn::Gpu | SortColumn::GpuMem));
+        crate::system::set_gpu_process_stats_enabled(gpu_wanted);
+
+        let npu_wanted = matches!(self.sort_column, SortColumn::Npu | SortColumn::NpuMem)
             || self
                 .cached_visible_columns
                 .iter()
                 .any(|c| matches!(c, SortColumn::Npu | SortColumn::NpuMem));
-        crate::system::set_npu_process_stats_enabled(wanted);
+        crate::system::set_npu_process_stats_enabled(npu_wanted);
     }
 
     /// Update displayed processes based on filter and sort
     pub fn update_displayed_processes(&mut self) {
-        self.refresh_npu_collection_flag();
+        self.refresh_adapter_collection_flags();
 
         // Use cached lowercase filter string
         let has_filter = !self.filter_string_lower.is_empty();
@@ -1279,6 +1298,8 @@ impl App {
                         SortColumn::IoWriteRate => a.io_write_rate.cmp(&b.io_write_rate),
                         SortColumn::IoRead => a.io_read_bytes.cmp(&b.io_read_bytes),
                         SortColumn::IoWrite => a.io_write_bytes.cmp(&b.io_write_bytes),
+                        SortColumn::Gpu => a.gpu_percent.partial_cmp(&b.gpu_percent).unwrap_or(Ordering::Equal),
+                        SortColumn::GpuMem => a.gpu_memory.cmp(&b.gpu_memory),
                         SortColumn::Npu => a.npu_percent.partial_cmp(&b.npu_percent).unwrap_or(Ordering::Equal),
                         SortColumn::NpuMem => a.npu_memory.cmp(&b.npu_memory),
                         // Already handled above

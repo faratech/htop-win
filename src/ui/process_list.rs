@@ -661,6 +661,27 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             let spans = format_bytes_colored(bytes, theme, is_selected, app.config.highlight_large_numbers);
                             return Cell::from(Line::from(spans));
                         }
+                        SortColumn::Gpu => {
+                            // htop Row_printPercentage style; idle (0.0) is dimmed like I/O
+                            let color = if is_selected {
+                                theme.selection_fg
+                            } else if proc.gpu_percent < 0.05 {
+                                theme.process_shadow
+                            } else if app.config.highlight_large_numbers && proc.gpu_percent >= 99.9 {
+                                theme.process_megabytes
+                            } else {
+                                theme.process
+                            };
+                            (fmt!("{:>5.1}", proc.gpu_percent), color)
+                        }
+                        SortColumn::GpuMem => {
+                            if proc.gpu_memory == 0 {
+                                let color = if is_selected { theme.selection_fg } else { theme.process_shadow };
+                                return Cell::from(Span::styled(fmt!("{:>7}", 0), Style::default().fg(color)));
+                            }
+                            let spans = format_bytes_colored(proc.gpu_memory, theme, is_selected, app.config.highlight_large_numbers);
+                            return Cell::from(Line::from(spans));
+                        }
                         SortColumn::Npu => {
                             // htop Row_printPercentage style; idle (0.0) is dimmed like I/O
                             let color = if is_selected {

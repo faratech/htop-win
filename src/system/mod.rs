@@ -6,7 +6,9 @@ pub mod cache;
 mod process;
 
 pub use cpu::CpuInfo;
-pub use d3dkmt::{set_process_stats_enabled as set_npu_process_stats_enabled, GpuInfo, NpuInfo};
+pub use d3dkmt::{
+    set_gpu_process_stats_enabled, set_npu_process_stats_enabled, GpuInfo, NpuInfo,
+};
 pub use memory::{format_bytes, MemoryInfo};
 pub use process::{
     enable_debug_privilege, enrich_processes, get_process_affinity, get_process_exe_path,
@@ -286,10 +288,10 @@ impl SystemMetrics {
 
             let mut new_processes = Vec::new();
 
-            // Per-process NPU stats (empty unless an NPU exists and an NPU
-            // column is currently visible or sorted)
+            // Per-process GPU/NPU stats (empty unless the hardware exists and
+            // one of its columns is currently visible or sorted)
             let pids: Vec<u32> = proc_list.iter().map(|p| p.pid()).collect();
-            let npu_stats = d3dkmt::process_stats(&pids);
+            let adapter_stats = d3dkmt::process_stats(&pids);
 
             // Iterate raw processes
             for raw_proc in proc_list.iter() {
@@ -297,7 +299,7 @@ impl SystemMetrics {
                 seen_pids.insert(pid);
                 let cpu_pct = rates.cpu_percentages.get(&pid).copied().unwrap_or(0.0);
                 let (io_read_rate, io_write_rate) = rates.io_rates.get(&pid).copied().unwrap_or((0, 0));
-                let proc_npu = npu_stats.get(&pid).copied().unwrap_or_default();
+                let proc_adapter = adapter_stats.get(&pid).copied().unwrap_or_default();
 
                 if let Some(&idx) = existing_map.get(&pid) {
                     let native_start = filetime_to_unix(raw_proc.create_time());
@@ -312,14 +314,18 @@ impl SystemMetrics {
                     }
                     existing_proc.io_read_rate = io_read_rate;
                     existing_proc.io_write_rate = io_write_rate;
-                    existing_proc.npu_percent = proc_npu.percent;
-                    existing_proc.npu_memory = proc_npu.memory;
+                    existing_proc.gpu_percent = proc_adapter.gpu_percent;
+                    existing_proc.gpu_memory = proc_adapter.gpu_memory;
+                    existing_proc.npu_percent = proc_adapter.npu_percent;
+                    existing_proc.npu_memory = proc_adapter.npu_memory;
                 } else {
                     let mut proc_info = ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem);
                     proc_info.io_read_rate = io_read_rate;
                     proc_info.io_write_rate = io_write_rate;
-                    proc_info.npu_percent = proc_npu.percent;
-                    proc_info.npu_memory = proc_npu.memory;
+                    proc_info.gpu_percent = proc_adapter.gpu_percent;
+                    proc_info.gpu_memory = proc_adapter.gpu_memory;
+                    proc_info.npu_percent = proc_adapter.npu_percent;
+                    proc_info.npu_memory = proc_adapter.npu_memory;
                     new_processes.push(proc_info);
                 }
             }
