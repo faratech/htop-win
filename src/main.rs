@@ -9,9 +9,11 @@ mod terminal;
 mod ui;
 
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crossterm::{
+    cursor,
     event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -295,6 +297,22 @@ impl BenchmarkStats {
     }
 }
 
+/// True once mouse capture has been enabled, so restore only disables what was set.
+static MOUSE_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Restore the terminal to its normal state. Idempotent and infallible so it is
+/// safe to call from the panic hook, the error path, and the normal exit path
+/// alike (errors are ignored — there is nothing useful to do with them).
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let mut stdout = io::stdout();
+    let _ = execute!(stdout, LeaveAlternateScreen);
+    if MOUSE_CAPTURE_ENABLED.load(Ordering::Relaxed) {
+        let _ = execute!(stdout, DisableMouseCapture);
+    }
+    let _ = execute!(stdout, cursor::Show);
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = match parse_args() {
         Ok(args) => args,
@@ -342,13 +360,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only succeeds when running as Administrator
     system::enable_debug_privilege();
 
-    // Setup terminal
+    // Restore the terminal before the default panic handler prints, so the
+    // message lands on the normal screen instead of the soon-to-vanish
+    // alternate one. Panic hooks still run before abort() under the release
+    // profile's panic = "abort". (In debug builds a background-thread panic
+    // restores while the UI thread keeps drawing; in release the process
+    // aborts immediately, so the hook's view is exact.)
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        restore_terminal();
+        default_hook(info);
+    }));
+
+    // Setup terminal. If this very first step fails there is nothing to
+    // restore; every failure after it returns through run_tui to the single
+    // restore_terminal() call below.
     enable_raw_mode()?;
+
+    let (result, bench_stats, process_count) = run_tui(&args, update_just_applied);
+
+    // Restore terminal — the one restore point for both Ok and error returns
+    restore_terminal();
+
+    if let Err(err) = &result {
+        eprintln!("Error: {err:?}");
+    }
+
+    // Print benchmark report if in benchmark mode
+    if let Some(stats) = bench_stats {
+        stats.print_report(process_count);
+    }
+
+    Ok(())
+}
+
+/// Run the TUI session, returning the run result together with the benchmark
+/// state and process count needed for the post-restore report (which must be
+/// delivered even when the session ends in an error).
+fn run_tui(
+    args: &Args,
+    update_just_applied: bool,
+) -> (
+    Result<(), Box<dyn std::error::Error>>,
+    Option<BenchmarkStats>,
+    usize,
+) {
+    let mut bench_stats = None;
+    let mut process_count = 0;
+    let result = run_tui_inner(args, update_just_applied, &mut bench_stats, &mut process_count);
+    (result, bench_stats, process_count)
+}
+
+/// Everything between raw-mode setup and terminal restore. Any `?` failure in
+/// here propagates back to main(), which restores the terminal exactly once.
+fn run_tui_inner(
+    args: &Args,
+    update_just_applied: bool,
+    bench_stats: &mut Option<BenchmarkStats>,
+    process_count: &mut usize,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
     if args.no_mouse {
         execute!(stdout, EnterAlternateScreen)?;
     } else {
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        MOUSE_CAPTURE_ENABLED.store(true, Ordering::Relaxed);
     }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -438,10 +514,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(snapshot) = data_rx.recv() {
         app.apply_snapshot(snapshot);
     }
-    let process_count = app.processes.len();
+    *process_count = app.processes.len();
 
     // Create benchmark stats if in benchmark mode
-    let mut bench_stats = benchmark_mode.map(|_| BenchmarkStats::new());
+    *bench_stats = benchmark_mode.map(|_| BenchmarkStats::new());
 
     // Spawn background update check (skip if we just applied an update, since
     // the running binary is still the old version and would re-download)
@@ -454,7 +530,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Run the main loop
-    let result = run_app(
+    run_app(
         &mut terminal,
         &mut app,
         &config,
@@ -462,27 +538,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         update_rx,
         data_rx,
         &collector,
-    );
-
-    // Restore terminal
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-
-    if let Err(err) = &result {
-        eprintln!("Error: {err:?}");
-    }
-
-    // Print benchmark report if in benchmark mode
-    if let Some(stats) = bench_stats {
-        stats.print_report(process_count);
-    }
-
-    Ok(())
+    )
 }
 
 fn run_app(
@@ -494,8 +550,6 @@ fn run_app(
     data_rx: std::sync::mpsc::Receiver<data::SystemSnapshot>,
     collector: &data::DataCollector,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::sync::atomic::Ordering;
-
     let mut last_tick = Instant::now();
     let mut needs_redraw = true;
 

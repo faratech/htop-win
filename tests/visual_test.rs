@@ -3,7 +3,6 @@
 //! This module provides tools to capture terminal output and compare
 //! against htop reference screenshots.
 
-use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -120,6 +119,12 @@ pub struct ScreenDiff {
     pub size_mismatch: Option<((usize, usize), (usize, usize))>,
     pub char_diffs: Vec<CharDiff>,
     pub color_diffs: Vec<ColorDiff>,
+}
+
+impl Default for ScreenDiff {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ScreenDiff {

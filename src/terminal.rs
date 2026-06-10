@@ -1752,13 +1752,17 @@ impl StatefulWidget for Scrollbar<'_> {
             return;
         }
 
-        // Calculate thumb size and position
+        // Calculate thumb size and position. Clamp the position so a caller
+        // passing position > scrollable pins the thumb to the track end
+        // instead of pushing it off the track entirely.
         let viewport = state.viewport_content_length.max(1);
         let thumb_size = (track_len * viewport / state.content_length.max(1)).max(1).min(track_len);
         let scrollable = state.content_length.saturating_sub(viewport);
-        let thumb_pos = ((track_len - thumb_size) * state.position)
+        let max_pos = track_len - thumb_size; // safe: thumb_size is .min(track_len)
+        let thumb_pos = (max_pos * state.position)
             .checked_div(scrollable)
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .min(max_pos);
 
         // Draw track and thumb
         for i in 0..track_len {
@@ -1779,5 +1783,29 @@ impl StatefulWidget for Scrollbar<'_> {
                 cell.set_style(self.style);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_scrollbar_thumb_clamped_to_track() {
+        // A position far beyond the scrollable range must pin the thumb to
+        // the track end, not push it off the track entirely (regression:
+        // dialogs pass unclamped scroll offsets).
+        let area = Rect::new(0, 0, 1, 10);
+        let mut buf = Buffer::empty(area);
+        let mut state = ScrollbarState::new(90)
+            .position(500)
+            .viewport_content_length(10);
+        Scrollbar::new(ScrollbarOrientation::VerticalRight).render(area, &mut buf, &mut state);
+
+        let thumb = "█";
+        // The thumb is pinned to the bottom of the track...
+        assert_eq!(buf.get(0, 9).unwrap().symbol, thumb);
+        // ...and did not vanish into (or flood) the rest of the track.
+        assert_ne!(buf.get(0, 0).unwrap().symbol, thumb);
     }
 }

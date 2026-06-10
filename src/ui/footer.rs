@@ -61,9 +61,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                     String::new()
                 } else {
                     let mut s: String = label.chars().take(label_width as usize).collect();
-                    while (s.chars().count() as u16) < label_width {
-                        s.push(' ');
-                    }
+                    let missing = (label_width as usize).saturating_sub(s.chars().count());
+                    s.extend(std::iter::repeat_n(' ', missing));
                     s
                 };
 

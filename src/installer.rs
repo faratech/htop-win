@@ -108,6 +108,32 @@ pub fn is_newer_version(a: &str, b: &str) -> bool {
     }
 }
 
+/// Minimum plausible size for a release binary (real ones are ~600-800 KB).
+const MIN_UPDATE_SIZE: usize = 100 * 1024;
+
+/// Reject anything that is not plausibly a Windows PE executable, so a CDN
+/// error page or truncated download is never installed over the working exe.
+/// (Transport integrity comes from WinHTTP's TLS; if stronger guarantees are
+/// ever wanted, Authenticode via WinVerifyTrust — zero new deps — is the next
+/// step, not a hand-rolled checksum.)
+fn validate_pe_executable(body: &[u8]) -> Result<(), String> {
+    if body.len() < MIN_UPDATE_SIZE {
+        return Err(format!(
+            "file too small ({} bytes) to be htop-win",
+            body.len()
+        ));
+    }
+    if &body[0..2] != b"MZ" {
+        return Err("missing MZ header (not a Windows executable)".into());
+    }
+    // The PE signature lives at the offset stored in e_lfanew (u32 LE at 0x3C)
+    let e_lfanew = u32::from_le_bytes([body[0x3c], body[0x3d], body[0x3e], body[0x3f]]) as usize;
+    match body.get(e_lfanew..e_lfanew + 4) {
+        Some(sig) if sig == b"PE\0\0" => Ok(()),
+        _ => Err("missing PE signature".into()),
+    }
+}
+
 /// Helper struct to automatically close WinHTTP handles
 #[cfg(windows)]
 struct HandleGuard(*mut std::ffi::c_void);
@@ -376,9 +402,8 @@ pub fn update_from_github(force: bool) -> Result<(), Box<dyn std::error::Error>>
     let temp_file = temp_dir.join("htop-win-update.exe");
 
     let body = native_http_get(&download_url)?;
-    if body.is_empty() {
-        return Err("Downloaded update file is empty".into());
-    }
+    validate_pe_executable(&body)
+        .map_err(|e| format!("Downloaded update rejected: {}", e))?;
     fs::write(&temp_file, body)?;
 
     println!("Download complete. Installing...");
@@ -447,8 +472,8 @@ pub fn check_and_download_update() -> UpdateStatus {
 
     // If update already downloaded and pending, report it without re-downloading
     if temp_file.exists()
-        && let Ok(metadata) = fs::metadata(&temp_file) {
-            if metadata.len() > 0 {
+        && let Ok(pending) = fs::read(&temp_file) {
+            if validate_pe_executable(&pending).is_ok() {
                 // A non-empty pending update exists. Act only on a definitive answer
                 // from GitHub: report it if newer, delete it only if CONFIRMED stale.
                 // On a transient API failure, keep it — don't discard a valid,
@@ -487,7 +512,7 @@ pub fn check_and_download_update() -> UpdateStatus {
     }
 
     match native_http_get(&download_url) {
-        Ok(body) if !body.is_empty() => {
+        Ok(body) if validate_pe_executable(&body).is_ok() => {
             if fs::write(&temp_file, body).is_ok() {
                 UpdateStatus::Downloaded {
                     version: latest_version,
@@ -536,14 +561,17 @@ pub fn apply_pending_update() -> bool {
         return false;
     }
 
-    // Verify update file integrity
-    if let Ok(metadata) = fs::metadata(&update_file) {
-        if metadata.len() == 0 {
+    // Verify update file integrity before installing it over the working exe.
+    // The pending file may have been written by an older htop-win without
+    // download-time validation, so this gate must not rely on the downloader.
+    match fs::read(&update_file) {
+        Ok(body) if validate_pe_executable(&body).is_ok() => {}
+        Ok(_) => {
+            // Not a plausible executable — discard rather than install
             let _ = fs::remove_file(&update_file);
             return false;
         }
-    } else {
-        return false;
+        Err(_) => return false,
     }
 
     let install_path = current_exe;
@@ -587,4 +615,74 @@ pub fn apply_pending_update() -> bool {
 
     eprintln!("Update applied successfully!");
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Smallest buffer validate_pe_executable accepts: MZ header, e_lfanew
+    /// pointing at a PE\0\0 signature, padded past MIN_UPDATE_SIZE.
+    fn synthetic_pe() -> Vec<u8> {
+        let mut body = vec![0u8; MIN_UPDATE_SIZE + 1024];
+        body[0] = b'M';
+        body[1] = b'Z';
+        body[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
+        body[0x80..0x84].copy_from_slice(b"PE\0\0");
+        body
+    }
+
+    #[test]
+    fn test_validate_pe_accepts_synthetic_pe() {
+        assert!(validate_pe_executable(&synthetic_pe()).is_ok());
+    }
+
+    #[test]
+    fn test_validate_pe_rejects_empty() {
+        assert!(validate_pe_executable(&[]).is_err());
+    }
+
+    #[test]
+    fn test_validate_pe_rejects_missing_mz() {
+        let body = vec![b'A'; MIN_UPDATE_SIZE + 1024];
+        assert!(validate_pe_executable(&body).is_err());
+    }
+
+    #[test]
+    fn test_validate_pe_rejects_too_small() {
+        let mut body = synthetic_pe();
+        body.truncate(MIN_UPDATE_SIZE / 2);
+        assert!(validate_pe_executable(&body).is_err());
+    }
+
+    #[test]
+    fn test_validate_pe_rejects_missing_pe_signature() {
+        let mut body = synthetic_pe();
+        body[0x80..0x84].copy_from_slice(b"XX\0\0");
+        assert!(validate_pe_executable(&body).is_err());
+    }
+
+    #[test]
+    fn test_validate_pe_rejects_out_of_bounds_e_lfanew() {
+        let mut body = synthetic_pe();
+        let oob = (body.len() as u32).to_le_bytes();
+        body[0x3c..0x40].copy_from_slice(&oob);
+        assert!(validate_pe_executable(&body).is_err());
+    }
+
+    #[test]
+    fn test_validate_pe_rejects_html_error_page() {
+        let mut body = b"<html><body>404 Not Found</body></html>".to_vec();
+        body.resize(MIN_UPDATE_SIZE + 1024, b' ');
+        assert!(validate_pe_executable(&body).is_err());
+    }
+
+    #[test]
+    fn test_is_newer_version() {
+        assert!(is_newer_version("0.2.0", "0.1.10"));
+        assert!(is_newer_version("0.10.0", "0.9.9"));
+        assert!(!is_newer_version("0.1.10", "0.2.0"));
+        assert!(!is_newer_version("1.0.0", "1.0.0"));
+        assert!(!is_newer_version("garbage", "1.0.0"));
+    }
 }

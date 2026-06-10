@@ -148,23 +148,64 @@ impl<'a> Parser<'a> {
                     return Some(result);
                 }
                 '\\' => {
-                    self.advance();
-                    match self.peek()? {
+                    self.advance(); // consume '\'
+                    let esc = self.peek()?;
+                    self.advance(); // consume the escape character
+                    match esc {
                         '"' => result.push('"'),
                         '\\' => result.push('\\'),
                         '/' => result.push('/'),
+                        'b' => result.push('\u{0008}'),
+                        'f' => result.push('\u{000C}'),
                         'n' => result.push('\n'),
                         'r' => result.push('\r'),
                         't' => result.push('\t'),
+                        'u' => result.push(self.parse_unicode_escape()?),
                         _ => return None,
                     }
-                    self.advance();
                 }
                 c => {
                     result.push(c);
                     self.advance();
                 }
             }
+        }
+    }
+
+    /// Parse exactly four hex digits (the XXXX of a \uXXXX escape).
+    fn parse_hex4(&mut self) -> Option<u32> {
+        let mut value = 0u32;
+        for _ in 0..4 {
+            let digit = self.peek()?.to_digit(16)?;
+            value = value * 16 + digit;
+            self.advance();
+        }
+        Some(value)
+    }
+
+    /// Parse the remainder of a \uXXXX escape ("\u" already consumed),
+    /// including UTF-16 surrogate pairs. Lone surrogates are rejected.
+    fn parse_unicode_escape(&mut self) -> Option<char> {
+        let high = self.parse_hex4()?;
+        match high {
+            0xD800..=0xDBFF => {
+                // High surrogate: a "\uXXXX" low surrogate must follow.
+                if self.peek()? != '\\' {
+                    return None;
+                }
+                self.advance();
+                if self.peek()? != 'u' {
+                    return None;
+                }
+                self.advance();
+                let low = self.parse_hex4()?;
+                if !(0xDC00..=0xDFFF).contains(&low) {
+                    return None;
+                }
+                char::from_u32(0x10000 + ((high - 0xD800) << 10) + (low - 0xDC00))
+            }
+            0xDC00..=0xDFFF => None,
+            code => char::from_u32(code),
         }
     }
 
@@ -300,6 +341,7 @@ fn write_value(out: &mut String, value: &Value, indent: usize) {
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => out.push_str(&n.to_string()),
         Value::String(s) => {
+            use std::fmt::Write as _;
             out.push('"');
             for c in s.chars() {
                 match c {
@@ -310,6 +352,11 @@ fn write_value(out: &mut String, value: &Value, indent: usize) {
                     '\n' => out.push_str("\\n"),
                     '\r' => out.push_str("\\r"),
                     '\t' => out.push_str("\\t"),
+                    // Remaining control chars must be escaped too — raw ones
+                    // are invalid JSON (write! to a String cannot fail).
+                    c if (c as u32) < 0x20 => {
+                        let _ = write!(out, "\\u{:04x}", c as u32);
+                    }
                     c => out.push(c),
                 }
             }
@@ -420,5 +467,51 @@ mod tests {
         let output = to_string_pretty(&v);
         let v2 = parse(&output).unwrap();
         assert_eq!(v, v2);
+    }
+
+    #[test]
+    fn test_string_escape_roundtrip() {
+        // Control chars, named escapes, and non-ASCII must survive
+        // serialize -> parse unchanged (regression: \b and \f used to be
+        // emitted but rejected on re-parse, nuking the whole config).
+        let original = Value::String("\u{8}\u{c}\n\r\t\x01\x1f\"\\path/to🦀".to_string());
+        let serialized = to_string_pretty(&original);
+        assert_eq!(parse(&serialized), Some(original));
+    }
+
+    #[test]
+    fn test_parse_unicode_escapes() {
+        assert_eq!(parse("\"\\u0041\"").unwrap().as_str(), Some("A"));
+        // Surrogate pair decoding to U+1F980 (crab emoji)
+        assert_eq!(
+            parse("\"\\ud83e\\udd80\"").unwrap().as_str(),
+            Some("\u{1F980}")
+        );
+        // Lone high surrogate, lone low surrogate, bad hex, truncated
+        assert_eq!(parse("\"\\ud800\""), None);
+        assert_eq!(parse("\"\\udc00\""), None);
+        assert_eq!(parse("\"\\u00g1\""), None);
+        assert_eq!(parse("\"\\u00"), None);
+    }
+
+    #[test]
+    fn test_parse_named_escapes() {
+        assert_eq!(
+            parse(r#""\b\f\n\r\t\"\\\/""#).unwrap().as_str(),
+            Some("\u{8}\u{c}\n\r\t\"\\/")
+        );
+    }
+
+    #[test]
+    fn test_serializer_escapes_control_chars() {
+        let serialized = to_string_pretty(&Value::String("\x01".to_string()));
+        assert_eq!(serialized, "\"\\u0001\"");
+    }
+
+    #[test]
+    fn test_parser_accepts_raw_control_chars() {
+        // Deliberate leniency: configs written by older versions contain raw
+        // control characters; they must still load.
+        assert_eq!(parse("\"a\x01b\"").unwrap().as_str(), Some("a\x01b"));
     }
 }
