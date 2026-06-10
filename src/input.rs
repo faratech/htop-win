@@ -3,13 +3,16 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButto
 use crate::app::{App, DialogState, SortColumn};
 
 /// Handle scroll keys for dialogs. Returns true if the key was handled.
+/// Content length isn't known here; offsets are clamped at render time
+/// (ui::dialogs::render_scrollable_dialog), so End just saturates to MAX.
 fn handle_scroll_keys(scroll: &mut usize, key: KeyCode) -> bool {
     match key {
         KeyCode::Up | KeyCode::Char('k') => { *scroll = scroll.saturating_sub(1); true }
-        KeyCode::Down | KeyCode::Char('j') => { *scroll += 1; true }
+        KeyCode::Down | KeyCode::Char('j') => { *scroll = scroll.saturating_add(1); true }
         KeyCode::PageUp => { *scroll = scroll.saturating_sub(10); true }
-        KeyCode::PageDown => { *scroll += 10; true }
+        KeyCode::PageDown => { *scroll = scroll.saturating_add(10); true }
         KeyCode::Home => { *scroll = 0; true }
+        KeyCode::End => { *scroll = usize::MAX; true }
         _ => false,
     }
 }
@@ -713,8 +716,17 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
     false
 }
 
-fn handle_process_info_keys(app: &mut App, _key: KeyEvent) -> bool {
-    app.dialog = DialogState::None;
+fn handle_process_info_keys(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(10) => {
+            app.dialog = DialogState::None;
+        }
+        _ => {
+            if let DialogState::ProcessInfo { ref mut scroll, .. } = app.dialog {
+                handle_scroll_keys(scroll, key.code);
+            }
+        }
+    }
     false
 }
 
@@ -1068,7 +1080,8 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
                 match &mut app.dialog {
                     DialogState::Help { scroll }
                     | DialogState::Environment { scroll, .. }
-                    | DialogState::CommandWrap { scroll, .. } => {
+                    | DialogState::CommandWrap { scroll, .. }
+                    | DialogState::ProcessInfo { scroll, .. } => {
                         *scroll = scroll.saturating_sub(3);
                     }
                     DialogState::SortSelect { index }
@@ -1089,8 +1102,10 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
                 match &mut app.dialog {
                     DialogState::Help { scroll }
                     | DialogState::Environment { scroll, .. }
-                    | DialogState::CommandWrap { scroll, .. } => {
-                        *scroll += 3;
+                    | DialogState::CommandWrap { scroll, .. }
+                    | DialogState::ProcessInfo { scroll, .. } => {
+                        // Clamped to content length at render time
+                        *scroll = scroll.saturating_add(3);
                     }
                     DialogState::SortSelect { index } => {
                         let max = SortColumn::all().len().saturating_sub(1);

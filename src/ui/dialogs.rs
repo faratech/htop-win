@@ -28,6 +28,103 @@ fn item_style(is_selected: bool, theme: &Theme) -> Style {
     if is_selected { selected_style(theme) } else { normal_style(theme) }
 }
 
+/// Word-wrap one logical line to `width` columns, preserving its leading
+/// indentation and hard-splitting words longer than the available width
+/// (e.g. long unbroken paths).
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    if width == 0 || text.width() <= width {
+        return vec![text.to_string()];
+    }
+
+    let indent: String = text.chars().take_while(|c| *c == ' ').collect();
+    let avail = width.saturating_sub(indent.len()).max(1);
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for word in text.split_whitespace() {
+        let word_width = word.width();
+        if current_width > 0 {
+            if current_width + 1 + word_width <= avail {
+                current.push(' ');
+                current.push_str(word);
+                current_width += 1 + word_width;
+                continue;
+            }
+            lines.push(format!("{indent}{current}"));
+            current.clear();
+            current_width = 0;
+        }
+        if word_width <= avail {
+            current.push_str(word);
+            current_width = word_width;
+        } else {
+            for c in word.chars() {
+                let char_width = UnicodeWidthChar::width(c).unwrap_or(1);
+                if current_width > 0 && current_width + char_width > avail {
+                    lines.push(format!("{indent}{current}"));
+                    current.clear();
+                    current_width = 0;
+                }
+                current.push(c);
+                current_width += char_width;
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(format!("{indent}{current}"));
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// Render a scrollable line-based dialog. Clamps `*scroll` so content can't
+/// be scrolled past its end — total/visible line counts are only known here
+/// at render time, and a draw runs between every two input events, so input
+/// handlers leave offsets unbounded (e.g. End sets usize::MAX).
+fn render_scrollable_dialog(
+    frame: &mut Frame,
+    area: Rect,
+    block: Block,
+    style: Style,
+    lines: Vec<Line>,
+    scroll: &mut usize,
+) {
+    let total_lines = lines.len();
+    let visible_lines = area.height.saturating_sub(2) as usize; // Account for border
+    *scroll = (*scroll).min(total_lines.saturating_sub(visible_lines));
+
+    let items: Vec<ListItem> = lines
+        .into_iter()
+        .skip(*scroll)
+        .map(ListItem::new)
+        .collect();
+
+    let list = List::new(items).block(block).style(style);
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(list, area);
+
+    if total_lines > visible_lines {
+        let scrollbar_area = Rect::new(
+            area.x + area.width - 1,
+            area.y + 1,
+            1,
+            area.height.saturating_sub(2),
+        );
+        let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_lines))
+            .position(*scroll);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
+}
+
 /// Windows signal names and values
 const SIGNALS: &[(u32, &str, &str)] = &[
     (15, "SIGTERM", "Terminate gracefully"),
@@ -42,8 +139,8 @@ const SIGNALS: &[(u32, &str, &str)] = &[
 ];
 
 /// Draw help dialog
-pub fn draw_help(frame: &mut Frame, app: &App) {
-    let DialogState::Help { scroll } = &app.dialog else { return; };
+pub fn draw_help(frame: &mut Frame, app: &mut App) {
+    let DialogState::Help { scroll } = &mut app.dialog else { return; };
     let area = centered_rect(80, 80, frame.area());
 
     let help_text = vec![
@@ -168,41 +265,20 @@ pub fn draw_help(frame: &mut Frame, app: &App) {
         "",
     ];
 
-    let total_lines = help_text.len();
-    let visible_lines = area.height.saturating_sub(2) as usize; // Account for border
+    let lines: Vec<Line> = help_text.into_iter().map(Line::from).collect();
+    let block = Block::default()
+        .title(" Help ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
 
-    let items: Vec<ListItem> = help_text
-        .iter()
-        .skip(*scroll)
-        .map(|line| ListItem::new(Line::from(*line)))
-        .collect();
-
-    let help_list = List::new(items)
-        .block(
-            Block::default()
-                .title(" Help ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
-        .style(Style::default().fg(Color::White));
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(help_list, area);
-
-    // Draw scrollbar if content is scrollable
-    if total_lines > visible_lines {
-        let scrollbar_area = Rect::new(
-            area.x + area.width - 1,
-            area.y + 1,
-            1,
-            area.height.saturating_sub(2),
-        );
-        let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_lines))
-            .position(*scroll);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .style(Style::default().fg(Color::DarkGray));
-        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
-    }
+    render_scrollable_dialog(
+        frame,
+        area,
+        block,
+        Style::default().fg(Color::White),
+        lines,
+        scroll,
+    );
 }
 
 /// Draw search dialog
@@ -506,14 +582,14 @@ fn meter_mode_str(mode: crate::config::MeterMode) -> String {
 }
 
 /// Draw process info dialog
-pub fn draw_process_info(frame: &mut Frame, app: &App) {
-    let DialogState::ProcessInfo { target } = &app.dialog else { return; };
+pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
     let theme = &app.theme;
+    let DialogState::ProcessInfo { target, scroll } = &mut app.dialog else { return; };
     let area = centered_rect(70, 80, frame.area());
 
     // Use captured target to prevent race condition with list refresh
     let content = {
-        let proc = target;
+        let proc = &**target;
         let status_desc = match proc.status {
             'R' => "Running",
             'S' => "Sleeping",
@@ -586,7 +662,7 @@ pub fn draw_process_info(frame: &mut Frame, app: &App) {
              \n\
              Command Line\n   {}\n\
              \n\
-             Press Esc to close",
+             Esc/q close   ↑/↓ PgUp/PgDn scroll",
             proc.pid,
             proc.parent_pid,
             proc.name,
@@ -614,19 +690,27 @@ pub fn draw_process_info(frame: &mut Frame, app: &App) {
         )
     };
 
-    let dialog = Paragraph::new(content)
-        .block(
-            Block::default()
-                .title(format!(" {} ", target.name))
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .style(Style::default().bg(theme.background)),
-        )
-        .style(Style::default().fg(theme.text).bg(theme.background))
-        .wrap(Wrap { trim: false });
+    let wrap_width = area.width.saturating_sub(2) as usize;
+    let lines: Vec<Line> = content
+        .lines()
+        .flat_map(|line| wrap_text(line, wrap_width))
+        .map(Line::from)
+        .collect();
 
-    frame.render_widget(Clear, area);
-    frame.render_widget(dialog, area);
+    let block = Block::default()
+        .title(format!(" {} ", target.name))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(theme.background));
+
+    render_scrollable_dialog(
+        frame,
+        area,
+        block,
+        Style::default().fg(theme.text).bg(theme.background),
+        lines,
+        scroll,
+    );
 }
 
 /// Draw error message
@@ -743,11 +827,12 @@ pub fn draw_user_select(frame: &mut Frame, app: &App) {
 }
 
 /// Draw environment variables dialog
-pub fn draw_environment(frame: &mut Frame, app: &App) {
-    let DialogState::Environment { scroll: _, pid } = &app.dialog else { return; };
+pub fn draw_environment(frame: &mut Frame, app: &mut App) {
+    let DialogState::Environment { pid, .. } = &app.dialog else { return; };
+    let pid = *pid;
     let area = centered_rect(80, 80, frame.area());
 
-    let content = app.process_by_pid(*pid)
+    let content = app.process_by_pid(pid)
         .map(|proc| format!(
             "Environment Variables for {} (PID: {})\n\n\
              Note: Environment variables cannot be read from \n\
@@ -758,18 +843,27 @@ pub fn draw_environment(frame: &mut Frame, app: &App) {
         ))
         .unwrap_or_else(|| "No process selected".to_string());
 
-    let dialog = Paragraph::new(content)
-        .block(
-            Block::default()
-                .title(" Environment ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Magenta)),
-        )
-        .style(Style::default().fg(Color::White))
-        .wrap(Wrap { trim: false });
+    let wrap_width = area.width.saturating_sub(2) as usize;
+    let lines: Vec<Line> = content
+        .lines()
+        .flat_map(|line| wrap_text(line, wrap_width))
+        .map(Line::from)
+        .collect();
 
-    frame.render_widget(Clear, area);
-    frame.render_widget(dialog, area);
+    let DialogState::Environment { scroll, .. } = &mut app.dialog else { return; };
+    let block = Block::default()
+        .title(" Environment ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+
+    render_scrollable_dialog(
+        frame,
+        area,
+        block,
+        Style::default().fg(Color::White),
+        lines,
+        scroll,
+    );
 }
 
 /// Draw color scheme selection dialog
@@ -815,12 +909,12 @@ pub fn signal_count() -> usize {
 }
 
 /// Draw wrapped command display dialog
-pub fn draw_command_wrap(frame: &mut Frame, app: &App) {
-    let DialogState::CommandWrap { scroll, pid } = &app.dialog else { return; };
+pub fn draw_command_wrap(frame: &mut Frame, app: &mut App) {
+    let DialogState::CommandWrap { pid, .. } = &app.dialog else { return; };
+    let pid = *pid;
     let area = centered_rect(80, 70, frame.area());
 
-    let content = if let Some(proc) = app.process_by_pid(*pid) {
-        // Wrap command line nicely
+    let text_lines = if let Some(proc) = app.process_by_pid(pid) {
         let mut lines = vec![
             format!("Process: {} (PID: {})", proc.name, proc.pid),
             String::new(),
@@ -828,68 +922,32 @@ pub fn draw_command_wrap(frame: &mut Frame, app: &App) {
             String::new(),
         ];
 
-        // Split command into wrapped lines
+        // Wrap command and path with a 2-space indent
         let max_width = area.width.saturating_sub(4) as usize;
-        let command = &proc.command;
-        let mut current_line = String::new();
-
-        for word in command.split_whitespace() {
-            if current_line.is_empty() {
-                current_line = word.to_string();
-            } else if current_line.len() + 1 + word.len() <= max_width {
-                current_line.push(' ');
-                current_line.push_str(word);
-            } else {
-                lines.push(format!("  {}", current_line));
-                current_line = word.to_string();
-            }
-        }
-        if !current_line.is_empty() {
-            lines.push(format!("  {}", current_line));
+        for segment in wrap_text(&proc.command, max_width) {
+            lines.push(format!("  {}", segment));
         }
 
         lines.push(String::new());
         lines.push("Executable Path:".to_string());
-        lines.push(format!("  {}", proc.exe_path));
+        for segment in wrap_text(&proc.exe_path, max_width) {
+            lines.push(format!("  {}", segment));
+        }
 
-        lines.join("\n")
+        lines
     } else {
-        "No process selected".to_string()
+        vec!["No process selected".to_string()]
     };
 
-    let total_lines = content.lines().count();
-    let visible_lines = area.height.saturating_sub(2) as usize;
+    let lines: Vec<Line> = text_lines.into_iter().map(Line::from).collect();
 
-    let items: Vec<ListItem> = content
-        .lines()
-        .skip(*scroll)
-        .map(|line| ListItem::new(Line::from(line.to_string())))
-        .collect();
+    let DialogState::CommandWrap { scroll, .. } = &mut app.dialog else { return; };
+    let block = Block::default()
+        .title(" Command Line (w to close) ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
 
-    let list = List::new(items).block(
-        Block::default()
-            .title(" Command Line (w to close) ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan)),
-    );
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(list, area);
-
-    // Draw scrollbar if content is scrollable
-    if total_lines > visible_lines {
-        let scrollbar_area = Rect::new(
-            area.x + area.width - 1,
-            area.y + 1,
-            1,
-            area.height.saturating_sub(2),
-        );
-        let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_lines))
-            .position(*scroll);
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .style(Style::default().fg(Color::DarkGray));
-        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
-    }
+    render_scrollable_dialog(frame, area, block, Style::default(), lines, scroll);
 }
 
 /// Draw column configuration dialog
@@ -994,4 +1052,54 @@ pub fn draw_affinity(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, area);
     frame.render_widget(list, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wrap_text;
+
+    #[test]
+    fn wrap_text_short_line_unchanged() {
+        assert_eq!(wrap_text("hello world", 20), vec!["hello world"]);
+        assert_eq!(wrap_text("", 10), vec![""]);
+        // Internal alignment spacing survives when no wrapping is needed
+        assert_eq!(wrap_text("PID             123", 40), vec!["PID             123"]);
+    }
+
+    #[test]
+    fn wrap_text_exact_width() {
+        assert_eq!(wrap_text("abcde", 5), vec!["abcde"]);
+    }
+
+    #[test]
+    fn wrap_text_wraps_at_word_boundaries() {
+        assert_eq!(wrap_text("foo bar baz", 7), vec!["foo bar", "baz"]);
+    }
+
+    #[test]
+    fn wrap_text_hard_splits_long_words() {
+        assert_eq!(
+            wrap_text("C:\\averyveryverylongpath", 10),
+            vec!["C:\\averyve", "ryverylong", "path"]
+        );
+    }
+
+    #[test]
+    fn wrap_text_preserves_indent() {
+        assert_eq!(
+            wrap_text("   foo bar baz", 7),
+            vec!["   foo", "   bar", "   baz"]
+        );
+    }
+
+    #[test]
+    fn wrap_text_zero_width_is_passthrough() {
+        assert_eq!(wrap_text("abc", 0), vec!["abc"]);
+    }
+
+    #[test]
+    fn wrap_text_wide_chars() {
+        // Each ideograph is two columns wide, so only two fit in four columns
+        assert_eq!(wrap_text("日日日", 4), vec!["日日", "日"]);
+    }
 }

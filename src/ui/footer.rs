@@ -278,7 +278,19 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::None | DialogState::Setup { .. } | DialogState::ProcessInfo { .. } => vec![
+        DialogState::ProcessInfo { .. } => vec![
+            (None, "Esc", "Close"),
+            (None, "↑↓", "Scroll"),
+            (None, "", ""),
+            (None, "", ""),
+            (None, "", ""),
+            (None, "", ""),
+            (None, "", ""),
+            (None, "", ""),
+            (None, "", ""),
+            (None, "", ""),
+        ],
+        DialogState::None | DialogState::Setup { .. } => vec![
             (Some(1), "F1", "Help"),
             (Some(2), "F2", "Setup"),
             (Some(3), "F3", "Search"),

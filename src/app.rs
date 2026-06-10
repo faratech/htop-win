@@ -506,7 +506,7 @@ pub enum DialogState {
     SignalSelect { index: usize, pid: u32, name: String, command: String },
     Priority { class_index: usize, pid: u32, name: String },
     Setup { selected: usize },
-    ProcessInfo { target: Box<ProcessInfo> },
+    ProcessInfo { target: Box<ProcessInfo>, scroll: usize },
     UserSelect { index: usize, users: Vec<String> },
     Environment { scroll: usize, pid: u32 },
     ColorScheme { index: usize },
@@ -990,13 +990,13 @@ impl App {
                     proc_copy.command = exe_path;
                 }
             }
-            self.dialog = DialogState::ProcessInfo { target: Box::new(proc_copy) };
+            self.dialog = DialogState::ProcessInfo { target: Box::new(proc_copy), scroll: 0 };
         }
     }
 
     /// Refresh I/O counters for process info dialog (called during tick when dialog is open)
     pub fn refresh_process_info_io(&mut self) {
-        if let DialogState::ProcessInfo { ref mut target } = self.dialog {
+        if let DialogState::ProcessInfo { ref mut target, .. } = self.dialog {
             let (io_read, io_write) = crate::system::get_process_io_counters(target.pid);
             target.io_read_bytes = io_read;
             target.io_write_bytes = io_write;
