@@ -335,6 +335,12 @@ pub enum SortColumn {
 }
 
 impl SortColumn {
+    /// Canonical display order. This drives the F6 sort menu, the column
+    /// picker listing, and where a newly enabled column is inserted
+    /// (`App::toggle_column_in_active_tab`): identity, scheduling, memory,
+    /// status, usage (CPU/MEM/GPU/NPU together, Task Manager style), I/O,
+    /// attributes, times, and Command last since it expands to fill the row.
+    /// The default Main and I/O tab layouts follow this relative order.
     pub fn all() -> &'static [SortColumn] {
         &[
             SortColumn::Pid,
@@ -349,23 +355,30 @@ impl SortColumn {
             SortColumn::Status,
             SortColumn::Cpu,
             SortColumn::Mem,
-            SortColumn::Time,
-            SortColumn::StartTime,
-            SortColumn::Command,
-            SortColumn::Elevated,
-            SortColumn::Arch,
-            SortColumn::Efficiency,
-            SortColumn::HandleCount,
+            SortColumn::Gpu,
+            SortColumn::GpuMem,
+            SortColumn::Npu,
+            SortColumn::NpuMem,
             SortColumn::IoRate,
             SortColumn::IoReadRate,
             SortColumn::IoWriteRate,
             SortColumn::IoRead,
             SortColumn::IoWrite,
-            SortColumn::Gpu,
-            SortColumn::GpuMem,
-            SortColumn::Npu,
-            SortColumn::NpuMem,
+            SortColumn::HandleCount,
+            SortColumn::Elevated,
+            SortColumn::Arch,
+            SortColumn::Efficiency,
+            SortColumn::StartTime,
+            SortColumn::Time,
+            SortColumn::Command,
         ]
+    }
+
+    /// Position in the canonical display order (`usize::MAX` for unknown names).
+    fn display_rank(name: &str) -> usize {
+        SortColumn::from_name(name)
+            .and_then(|col| SortColumn::all().iter().position(|c| *c == col))
+            .unwrap_or(usize::MAX)
     }
 
     pub fn name(&self) -> &'static str {
@@ -752,13 +765,18 @@ impl App {
         self.active_tab_columns().iter().position(|c| c == column)
     }
 
-    /// Toggle a column's visibility in the active tab
+    /// Toggle a column's visibility in the active tab. Newly enabled columns
+    /// are inserted at their canonical display position relative to the
+    /// columns already shown (so e.g. GPU% lands next to CPU%/MEM% and
+    /// Command stays last) instead of being appended after Command. Users
+    /// can still rearrange with Shift+Up/Down afterwards.
     pub fn toggle_column_in_active_tab(&mut self, column: &str) {
         if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
             if let Some(pos) = tab.columns.iter().position(|c| c == column) {
                 tab.columns.remove(pos);
             } else {
-                tab.columns.push(column.to_string());
+                let insert_at = canonical_insert_index(&tab.columns, column);
+                tab.columns.insert(insert_at, column.to_string());
             }
         }
         self.sync_config_from_active_tab();
@@ -1996,5 +2014,59 @@ impl App {
     /// Enter column configuration mode
     pub fn enter_column_config_mode(&mut self) {
         self.dialog = DialogState::ColumnConfig { index: 0 };
+    }
+}
+
+/// Index at which `column` should be inserted into `columns` to keep the
+/// canonical display order (`SortColumn::all()`); appends when every visible
+/// column canonically precedes it.
+fn canonical_insert_index(columns: &[String], column: &str) -> usize {
+    let rank = SortColumn::display_rank(column);
+    columns
+        .iter()
+        .position(|c| SortColumn::display_rank(c) > rank)
+        .unwrap_or(columns.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_canonical_order(columns: &[String]) {
+        let ranks: Vec<usize> = columns.iter().map(|c| SortColumn::display_rank(c)).collect();
+        let mut sorted = ranks.clone();
+        sorted.sort_unstable();
+        assert_eq!(ranks, sorted, "columns not in canonical display order: {:?}", columns);
+    }
+
+    #[test]
+    fn default_layouts_follow_display_order() {
+        assert_canonical_order(&crate::config::Config::default().visible_columns);
+        assert_canonical_order(&ScreenTab::default_io().columns);
+    }
+
+    #[test]
+    fn display_order_groups_usage_and_keeps_command_last() {
+        assert_eq!(SortColumn::display_rank("Command"), SortColumn::all().len() - 1);
+        // Usage block: CPU% MEM% GPU% GPU-MEM NPU% NPU-MEM, in that order
+        let usage = ["CPU%", "MEM%", "GPU%", "GPU-MEM", "NPU%", "NPU-MEM"];
+        let base = SortColumn::display_rank("CPU%");
+        for (i, name) in usage.iter().enumerate() {
+            assert_eq!(SortColumn::display_rank(name), base + i);
+        }
+    }
+
+    #[test]
+    fn enabling_columns_inserts_at_canonical_position() {
+        let defaults = crate::config::Config::default().visible_columns;
+        // GPU% goes right after MEM%, not after Command
+        let mem_pos = defaults.iter().position(|c| c == "MEM%").unwrap();
+        assert_eq!(canonical_insert_index(&defaults, "GPU%"), mem_pos + 1);
+        // Command (canonically last) still appends at the very end
+        let no_command: Vec<String> =
+            defaults.iter().filter(|c| *c != "Command").cloned().collect();
+        assert_eq!(canonical_insert_index(&no_command, "Command"), no_command.len());
+        // PPID slots in directly after PID
+        assert_eq!(canonical_insert_index(&defaults, "PPID"), 1);
     }
 }
