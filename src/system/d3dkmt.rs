@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::Wdk::Graphics::Direct3D::{
     D3DKMTCloseAdapter, D3DKMTEnumAdapters2, D3DKMTQueryAdapterInfo, D3DKMTQueryStatistics,
@@ -98,7 +98,20 @@ struct AdapterState {
     /// (gpu, npu) gates last seen by process_stats; a change invalidates the
     /// flattened baselines (a disabled class keeps stale RunningTime values)
     prev_proc_gates: (bool, bool),
+    /// Sorted LUIDs of every adapter seen at the last (re-)detection; compared
+    /// against fresh enumerations to spot topology changes (driver installs,
+    /// removals) that never fail an existing statistics query
+    enumerated_luids: Vec<(u32, i32)>,
+    last_topology_check: Option<Instant>,
+    /// Last successful snapshot, served during the one-tick window after a
+    /// statistics failure so adapter presence (meters, hardware-aware default
+    /// columns) doesn't flicker off while re-enumeration happens
+    last_snapshot: AdapterSnapshot,
 }
+
+/// Re-check adapter topology this often: catches drivers installed or removed
+/// while running. One enumeration syscall when nothing changed.
+const TOPOLOGY_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 static ADAPTER_STATE: Mutex<Option<AdapterState>> = Mutex::new(None);
 
@@ -162,34 +175,57 @@ unsafe fn query_statistics(query: &mut D3DKMT_QUERYSTATISTICS) -> bool {
     unsafe { D3DKMTQueryStatistics(&raw const *query).is_ok() }
 }
 
-/// Enumerate dxgkrnl adapters and keep the GPUs and NPUs.
-fn detect_adapters() -> Vec<TrackedAdapter> {
+/// Run D3DKMTEnumAdapters2 and hand each enumerated adapter to `f`, closing
+/// the adapter handles afterwards (statistics queries take the LUID, so no
+/// handle is retained).
+fn for_each_enumerated_adapter(mut f: impl FnMut(&D3DKMT_ADAPTERINFO)) {
     unsafe {
         // First call with a null buffer returns the adapter count.
         let mut enum2 = D3DKMT_ENUMADAPTERS2::default();
         if D3DKMTEnumAdapters2(&mut enum2).is_err() || enum2.NumAdapters == 0 {
-            return Vec::new();
+            return;
         }
         let mut infos: Vec<D3DKMT_ADAPTERINFO> =
             vec![D3DKMT_ADAPTERINFO::default(); enum2.NumAdapters as usize];
         enum2.pAdapters = infos.as_mut_ptr();
         if D3DKMTEnumAdapters2(&mut enum2).is_err() {
-            return Vec::new();
+            return;
         }
 
-        let mut adapters = Vec::new();
         for info in &infos[..enum2.NumAdapters as usize] {
             if info.hAdapter == 0 {
                 continue;
             }
-            if let Some(adapter) = build_adapter(info) {
-                adapters.push(adapter);
-            }
-            // Statistics queries take the LUID, so no handle is retained.
+            f(info);
             let _ = D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER { hAdapter: info.hAdapter });
         }
-        adapters
     }
+}
+
+/// Enumerate dxgkrnl adapters; returns the GPUs/NPUs we track plus the sorted
+/// LUID set of everything enumerated (for the periodic topology check).
+fn detect_adapters() -> (Vec<TrackedAdapter>, Vec<(u32, i32)>) {
+    let mut adapters = Vec::new();
+    let mut luids = Vec::new();
+    for_each_enumerated_adapter(|info| {
+        luids.push((info.AdapterLuid.LowPart, info.AdapterLuid.HighPart));
+        if let Some(adapter) = build_adapter(info) {
+            adapters.push(adapter);
+        }
+    });
+    luids.sort_unstable();
+    (adapters, luids)
+}
+
+/// Sorted LUIDs of every adapter dxgkrnl currently exposes — the cheap probe
+/// behind the periodic topology check.
+fn enumerate_luids() -> Vec<(u32, i32)> {
+    let mut luids = Vec::new();
+    for_each_enumerated_adapter(|info| {
+        luids.push((info.AdapterLuid.LowPart, info.AdapterLuid.HighPart));
+    });
+    luids.sort_unstable();
+    luids
 }
 
 /// Classify one enumerated adapter; returns Some for GPUs and NPUs.
@@ -383,25 +419,46 @@ fn aggregate_gpus(per_adapter: &[(AdapterClass, AdapterMetrics)]) -> Option<Adap
 }
 
 /// Refresh system-wide GPU/NPU metrics. Both fields are None when no tracked
-/// adapter exists; after the one-time detection that path is just a mutex
-/// lock and an empty check.
+/// adapter exists. Steady state is a mutex lock plus the statistics queries;
+/// every TOPOLOGY_CHECK_INTERVAL one extra enumeration syscall compares the
+/// adapter LUID set so drivers installed or removed while running are picked
+/// up without a restart.
 pub fn refresh() -> AdapterSnapshot {
     let mut guard = ADAPTER_STATE.lock().unwrap();
     let state = guard.get_or_insert_with(AdapterState::default);
+    let now = Instant::now();
+
+    // Periodic topology check. A changed LUID set (new NPU driver, removed
+    // eGPU, ...) forces full re-detection below; an unchanged set costs one
+    // syscall and leaves all delta baselines untouched.
+    if state.detected
+        && !state.needs_reenumeration
+        && state
+            .last_topology_check
+            .is_none_or(|t| now.duration_since(t) >= TOPOLOGY_CHECK_INTERVAL)
+    {
+        state.last_topology_check = Some(now);
+        if enumerate_luids() != state.enumerated_luids {
+            state.needs_reenumeration = true;
+        }
+    }
 
     if !state.detected || state.needs_reenumeration {
-        state.adapters = detect_adapters();
+        let (adapters, luids) = detect_adapters();
+        state.adapters = adapters;
+        state.enumerated_luids = luids;
         state.detected = true;
         state.needs_reenumeration = false;
+        state.last_topology_check = Some(now);
         state.last_sample = None;
         state.last_proc_sample = None;
         state.prev_proc_running.clear();
     }
     if state.adapters.is_empty() {
+        state.last_snapshot = AdapterSnapshot::default();
         return AdapterSnapshot::default();
     }
 
-    let now = Instant::now();
     // First sample after (re-)detection only sets baselines and reports 0%.
     let elapsed = state.last_sample.map(|t| now.duration_since(t).as_secs_f64());
     state.last_sample = Some(now);
@@ -410,16 +467,21 @@ pub fn refresh() -> AdapterSnapshot {
     for adapter in &mut state.adapters {
         let Some(metrics) = query_adapter_metrics(adapter, elapsed) else {
             // Driver reset or adapter removal: re-enumerate on the next tick.
+            // Serve the last good snapshot meanwhile so adapter presence
+            // (meters, hardware-aware default columns) doesn't blink off for
+            // one tick; re-detection decides whether it's really gone.
             state.needs_reenumeration = true;
-            return AdapterSnapshot::default();
+            return state.last_snapshot.clone();
         };
         per_adapter.push((adapter.class, metrics));
     }
 
-    AdapterSnapshot {
+    let snapshot = AdapterSnapshot {
         gpu: aggregate_gpus(&per_adapter),
         npu: aggregate_npus(&per_adapter),
-    }
+    };
+    state.last_snapshot = snapshot.clone();
+    snapshot
 }
 
 /// Per-process GPU/NPU stats for the given PIDs. A class is only queried when
