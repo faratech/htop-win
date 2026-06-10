@@ -89,12 +89,15 @@ pub struct Config {
     pub show_clock: bool,
     pub show_hostname: bool,
     pub show_battery: bool,
+    /// GPU meter (auto-hides on machines without a GPU)
+    pub show_gpu_meter: bool,
     /// NPU meter (auto-hides on machines without an NPU)
     pub show_npu_meter: bool,
 
     // Meter modes
     pub cpu_meter_mode: MeterMode,
     pub memory_meter_mode: MeterMode,
+    pub gpu_meter_mode: MeterMode,
     pub npu_meter_mode: MeterMode,
 
     // Column visibility (which columns to show in process list)
@@ -142,11 +145,13 @@ impl Default for Config {
             show_clock: false,
             show_hostname: true,
             show_battery: false,
-            // Harmless default: the meter only appears when an NPU exists
+            // Harmless defaults: these meters only appear when the hardware exists
+            show_gpu_meter: true,
             show_npu_meter: true,
 
             cpu_meter_mode: MeterMode::Bar,
             memory_meter_mode: MeterMode::Bar,
+            gpu_meter_mode: MeterMode::Bar,
             npu_meter_mode: MeterMode::Bar,
 
             visible_columns: vec![
@@ -293,6 +298,7 @@ impl Config {
             show_clock: get_bool("show_clock", defaults.show_clock),
             show_hostname: get_bool("show_hostname", defaults.show_hostname),
             show_battery: get_bool("show_battery", defaults.show_battery),
+            show_gpu_meter: get_bool("show_gpu_meter", defaults.show_gpu_meter),
             show_npu_meter: get_bool("show_npu_meter", defaults.show_npu_meter),
 
             cpu_meter_mode: MeterMode::from_str(&get_str(
@@ -302,6 +308,10 @@ impl Config {
             memory_meter_mode: MeterMode::from_str(&get_str(
                 "memory_meter_mode",
                 defaults.memory_meter_mode.as_str(),
+            )),
+            gpu_meter_mode: MeterMode::from_str(&get_str(
+                "gpu_meter_mode",
+                defaults.gpu_meter_mode.as_str(),
             )),
             npu_meter_mode: MeterMode::from_str(&get_str(
                 "npu_meter_mode",
@@ -427,6 +437,10 @@ impl Config {
         );
         map.insert("show_battery".to_string(), Value::Bool(self.show_battery));
         map.insert(
+            "show_gpu_meter".to_string(),
+            Value::Bool(self.show_gpu_meter),
+        );
+        map.insert(
             "show_npu_meter".to_string(),
             Value::Bool(self.show_npu_meter),
         );
@@ -438,6 +452,10 @@ impl Config {
         map.insert(
             "memory_meter_mode".to_string(),
             Value::String(self.memory_meter_mode.as_str().to_string()),
+        );
+        map.insert(
+            "gpu_meter_mode".to_string(),
+            Value::String(self.gpu_meter_mode.as_str().to_string()),
         );
         map.insert(
             "npu_meter_mode".to_string(),
@@ -512,6 +530,8 @@ mod tests {
         assert_eq!(loaded.refresh_rate_ms, config.refresh_rate_ms);
         assert_eq!(loaded.tree_view_default, config.tree_view_default);
         assert_eq!(loaded.visible_columns, config.visible_columns);
+        assert_eq!(loaded.show_gpu_meter, config.show_gpu_meter);
+        assert_eq!(loaded.gpu_meter_mode, config.gpu_meter_mode);
         assert_eq!(loaded.show_npu_meter, config.show_npu_meter);
         assert_eq!(loaded.npu_meter_mode, config.npu_meter_mode);
     }

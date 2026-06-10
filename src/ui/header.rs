@@ -94,6 +94,13 @@ fn calculate_meter_columns(width: u16, cpu_count: usize) -> usize {
     many_core.min(cpu_count.max(1))
 }
 
+/// Whether the GPU meter row is shown: requires a render-capable hardware
+/// adapter to exist and the meter to be enabled in config. On machines
+/// without a GPU the header layout is unchanged.
+fn gpu_meter_visible(app: &App) -> bool {
+    app.config.show_gpu_meter && app.system_metrics.gpu.is_some()
+}
+
 /// Whether the NPU meter row is shown: requires an NPU (MCDM compute-only
 /// adapter) to exist and the meter to be enabled in config. On machines
 /// without an NPU the header layout is unchanged.
@@ -102,17 +109,18 @@ fn npu_meter_visible(app: &App) -> bool {
 }
 
 /// How many "extra" (non-CPU) meter rows a given column holds.
+/// `adapter_meters` is the number of GPU/NPU rows present (0-2).
 ///
-/// - Leftmost column gets Mem + Swp (2 rows), plus NPU when present.
+/// - Leftmost column gets Mem + Swp (2 rows), plus GPU/NPU when present.
 /// - Rightmost column gets Tasks + Uptime (2 rows).
-/// - On single-column mode the one column holds all (Mem, Swp, [NPU], Tasks, Uptime).
+/// - On single-column mode the one column holds all (Mem, Swp, [GPU], [NPU], Tasks, Uptime).
 /// - Middle columns (only when col_count == 3) have no mandatory extras —
 ///   Net/Dsk/Bat fill empty CPU slots opportunistically inside `draw_meter_column`.
-fn extras_for_column(col_idx: usize, col_count: usize, has_npu: bool) -> usize {
+fn extras_for_column(col_idx: usize, col_count: usize, adapter_meters: usize) -> usize {
     if col_count == 1 {
-        4 + has_npu as usize
+        4 + adapter_meters
     } else if col_idx == 0 {
-        2 + has_npu as usize
+        2 + adapter_meters
     } else if col_idx == col_count - 1 {
         2
     } else {
@@ -152,8 +160,10 @@ pub fn calculate_header_height(app: &App) -> u16 {
     let cols = calculate_meter_columns(app.terminal_width, cpu_count);
     let meter_rows = meter_rows_for(cpu_count, cols);
     // 1-col stacks all 4 extras; multi-col columns hold at most 2 each.
-    // The NPU meter adds one row to the (leftmost) column when present.
-    let extras = (if cols == 1 { 4 } else { 2 }) + npu_meter_visible(app) as usize;
+    // The GPU and NPU meters each add one row to the (leftmost) column.
+    let extras = (if cols == 1 { 4 } else { 2 })
+        + gpu_meter_visible(app) as usize
+        + npu_meter_visible(app) as usize;
     (meter_rows + extras).max(4) as u16
 }
 
@@ -211,8 +221,9 @@ fn draw_meter_column(
     filler_cursor: &mut usize,
 ) {
     let cpu_count = app.system_metrics.cpu.core_usage.len();
+    let has_gpu = gpu_meter_visible(app);
     let has_npu = npu_meter_visible(app);
-    let extras = extras_for_column(col_idx, col_count, has_npu);
+    let extras = extras_for_column(col_idx, col_count, has_gpu as usize + has_npu as usize);
     let total_rows = meter_rows + extras;
     if total_rows == 0 {
         return;
@@ -258,39 +269,35 @@ fn draw_meter_column(
         }
     }
 
-    // Extras block — order depends on column role
+    // Extras block — order depends on column role. Built in a fixed-size
+    // array (max 6: Mem, Swp, [GPU], [NPU], Tasks, Uptime) to keep the
+    // render path allocation-free.
     let is_leftmost = col_idx == 0;
     let is_rightmost = col_idx == col_count - 1;
-    let order: &[ExtraMeter] = if col_count == 1 {
-        if has_npu {
-            &[
-                ExtraMeter::Memory,
-                ExtraMeter::Swap,
-                ExtraMeter::Npu,
-                ExtraMeter::Tasks,
-                ExtraMeter::Uptime,
-            ]
-        } else {
-            &[
-                ExtraMeter::Memory,
-                ExtraMeter::Swap,
-                ExtraMeter::Tasks,
-                ExtraMeter::Uptime,
-            ]
+    let mut order = [ExtraMeter::Memory; 6];
+    let mut order_len = 0;
+    if col_count == 1 || is_leftmost {
+        order[order_len] = ExtraMeter::Memory;
+        order_len += 1;
+        order[order_len] = ExtraMeter::Swap;
+        order_len += 1;
+        if has_gpu {
+            order[order_len] = ExtraMeter::Gpu;
+            order_len += 1;
         }
-    } else if is_leftmost {
         if has_npu {
-            &[ExtraMeter::Memory, ExtraMeter::Swap, ExtraMeter::Npu]
-        } else {
-            &[ExtraMeter::Memory, ExtraMeter::Swap]
+            order[order_len] = ExtraMeter::Npu;
+            order_len += 1;
         }
-    } else if is_rightmost {
-        &[ExtraMeter::Tasks, ExtraMeter::Uptime]
-    } else {
-        &[]
-    };
+    }
+    if col_count == 1 || is_rightmost {
+        order[order_len] = ExtraMeter::Tasks;
+        order_len += 1;
+        order[order_len] = ExtraMeter::Uptime;
+        order_len += 1;
+    }
 
-    for (extra_row, meter) in (meter_rows..).zip(order.iter()) {
+    for (extra_row, meter) in (meter_rows..).zip(order[..order_len].iter()) {
         if extra_row >= rows.len() {
             break;
         }
@@ -316,6 +323,16 @@ fn draw_meter_column(
                 });
                 draw_swap_bar(frame, app, row);
             }
+            ExtraMeter::Gpu => {
+                app.ui_bounds.add_region(UIRegion {
+                    element: UIElement::GpuMeter,
+                    x: row.x,
+                    y: row.y,
+                    width: row.width,
+                    height: row.height,
+                });
+                draw_gpu_bar(frame, app, row);
+            }
             ExtraMeter::Npu => {
                 app.ui_bounds.add_region(UIRegion {
                     element: UIElement::NpuMeter,
@@ -336,6 +353,7 @@ fn draw_meter_column(
 enum ExtraMeter {
     Memory,
     Swap,
+    Gpu,
     Npu,
     Tasks,
     Uptime,
@@ -621,6 +639,77 @@ fn draw_swap_bar(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled(bar_fill(filled), Style::default().fg(bar_color)),
                 Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
                 Span::styled(format!("{}]", swap_info), Style::default().fg(theme.text)),
+            ])
+        }
+    };
+
+    let paragraph = Paragraph::new(line);
+    frame.render_widget(paragraph, area);
+}
+
+/// GPU utilization meter (Task Manager parity). The bar fill is utilization;
+/// the info text prefers dedicated memory (VRAM) when the adapter has any —
+/// an aperture commit limit (~half of system RAM) would dwarf the dedicated
+/// pool and mislead — falling back to dedicated+shared for iGPUs. Only drawn
+/// when a GPU exists (see `gpu_meter_visible`).
+fn draw_gpu_bar(frame: &mut Frame, app: &App, area: Rect) {
+    let mode = app.config.gpu_meter_mode;
+
+    if mode == MeterMode::Hidden {
+        return;
+    }
+
+    let Some(gpu) = &app.system_metrics.gpu else {
+        return;
+    };
+    let usage = gpu.utilization.clamp(0.0, 100.0);
+    let theme = &app.theme;
+
+    let (mem_used, mem_total) = if gpu.dedicated_total > 0 {
+        (gpu.dedicated_used, gpu.dedicated_total)
+    } else {
+        (gpu.mem_used, gpu.mem_total)
+    };
+
+    // htop-style format: "GPU[|||||      X.XX% Y.YG/Z.ZG]"
+    let gpu_info = if mem_total > 0 {
+        format!("{:.1}% {}/{}", usage, format_bytes(mem_used), format_bytes(mem_total))
+    } else {
+        format!("{:.1}% {}", usage, format_bytes(mem_used))
+    };
+
+    let line = match mode {
+        MeterMode::Text => {
+            Line::from(vec![
+                Span::styled("GPU: ", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{:5.1}%", usage),
+                    Style::default().fg(theme.cpu_color(usage)).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" ({})", format_bytes(mem_used)), Style::default().fg(theme.text)),
+            ])
+        }
+        MeterMode::Graph => {
+            let graph_width = (area.width.saturating_sub(gpu_info.len() as u16 + 6) as usize).min(max_bar_width(area.width as usize));
+            let graph_str = render_sparkline(&app.gpu_history, graph_width);
+
+            Line::from(vec![
+                Span::styled("GPU[", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+                Span::styled(graph_str, Style::default().fg(theme.cpu_color(usage)).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("{}]", gpu_info), Style::default().fg(theme.text)),
+            ])
+        }
+        MeterMode::Bar | MeterMode::Hidden => {
+            let info_len = gpu_info.len() + 1; // +1 for the closing bracket
+            let bar_width = (area.width.saturating_sub(4 + info_len as u16) as usize).min(max_bar_width(area.width as usize)); // 4 for "GPU["
+            let filled = ((usage as usize) * bar_width / 100).min(bar_width);
+            let empty = bar_width - filled;
+
+            Line::from(vec![
+                Span::styled("GPU[", Style::default().fg(theme.meter_label).add_modifier(Modifier::BOLD)),
+                Span::styled(bar_fill(filled), Style::default().fg(theme.cpu_color(usage))),
+                Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
+                Span::styled(format!("{}]", gpu_info), Style::default().fg(theme.text)),
             ])
         }
     };

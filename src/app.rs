@@ -17,6 +17,8 @@ pub enum UIElement {
     MemoryMeter,
     /// Swap meter bar
     SwapMeter,
+    /// GPU meter bar (only present on machines with a GPU)
+    GpuMeter,
     /// NPU meter bar (only present on NPU machines)
     NpuMeter,
     /// Column header (for sorting)
@@ -608,6 +610,7 @@ pub struct App {
     /// Memory usage history for graph mode (last N samples)
     pub mem_history: VecDeque<f32>,
     pub swap_history: VecDeque<f32>,
+    pub gpu_history: VecDeque<f32>,
     pub npu_history: VecDeque<f32>,
     /// Cached visible columns (updated when column config changes)
     pub cached_visible_columns: Vec<SortColumn>,
@@ -678,6 +681,7 @@ impl App {
             max_iterations: None,
             iteration_count: 0,
             cpu_history: Vec::new(),
+            gpu_history: VecDeque::new(),
             mem_history: VecDeque::new(),
             swap_history: VecDeque::new(),
             npu_history: VecDeque::new(),
@@ -1057,6 +1061,13 @@ impl App {
             self.swap_history.pop_front();
         }
         self.swap_history.push_back(self.system_metrics.memory.swap_percent);
+
+        // Add current GPU usage to history (only meaningful on GPU machines)
+        if self.gpu_history.len() >= MAX_HISTORY {
+            self.gpu_history.pop_front();
+        }
+        self.gpu_history
+            .push_back(self.system_metrics.gpu.as_ref().map_or(0.0, |g| g.utilization));
 
         // Add current NPU usage to history (only meaningful on NPU machines)
         if self.npu_history.len() >= MAX_HISTORY {

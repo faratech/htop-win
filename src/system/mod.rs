@@ -1,13 +1,13 @@
 mod cpu;
+mod d3dkmt;
 mod memory;
 mod native;
-mod npu;
 pub mod cache;
 mod process;
 
 pub use cpu::CpuInfo;
+pub use d3dkmt::{set_process_stats_enabled as set_npu_process_stats_enabled, GpuInfo, NpuInfo};
 pub use memory::{format_bytes, MemoryInfo};
-pub use npu::{set_process_stats_enabled as set_npu_process_stats_enabled, NpuInfo};
 pub use process::{
     enable_debug_privilege, enrich_processes, get_process_affinity, get_process_exe_path,
     get_process_io_counters, kill_process, set_efficiency_mode, set_priority_class,
@@ -38,6 +38,8 @@ pub struct SystemMetrics {
     // Battery
     pub battery_percent: Option<f32>,
     pub battery_charging: bool,
+    // GPU (None when no render-capable hardware adapter exists)
+    pub gpu: Option<GpuInfo>,
     // NPU (None when no MCDM compute-only adapter exists)
     pub npu: Option<NpuInfo>,
     // Previous values for rate calculation
@@ -71,6 +73,7 @@ impl Default for SystemMetrics {
             disk_write_rate: 0,
             battery_percent: None,
             battery_charging: false,
+            gpu: None,
             npu: None,
             prev_net_rx: 0,
             prev_net_tx: 0,
@@ -188,8 +191,10 @@ impl SystemMetrics {
         // Update battery status
         self.update_battery();
 
-        // Update NPU metrics (no-op on machines without an NPU)
-        self.npu = npu::refresh();
+        // Update GPU/NPU metrics (no-op on machines without tracked adapters)
+        let adapters = d3dkmt::refresh();
+        self.gpu = adapters.gpu;
+        self.npu = adapters.npu;
     }
 
     fn update_battery(&mut self) {
@@ -284,7 +289,7 @@ impl SystemMetrics {
             // Per-process NPU stats (empty unless an NPU exists and an NPU
             // column is currently visible or sorted)
             let pids: Vec<u32> = proc_list.iter().map(|p| p.pid()).collect();
-            let npu_stats = npu::process_stats(&pids);
+            let npu_stats = d3dkmt::process_stats(&pids);
 
             // Iterate raw processes
             for raw_proc in proc_list.iter() {

@@ -568,7 +568,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if let DialogState::Setup { ref mut selected } = app.dialog
-                && *selected < 13 {
+                && *selected < 14 {
                     // Number of setup items - 1
                     *selected += 1;
                 }
@@ -597,40 +597,44 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     app.config.memory_meter_mode = cycle_meter_mode(app.config.memory_meter_mode);
                 }
                 3 => {
+                    // Cycle GPU meter mode (meter only appears on GPU machines)
+                    app.config.gpu_meter_mode = cycle_meter_mode(app.config.gpu_meter_mode);
+                }
+                4 => {
                     // Cycle NPU meter mode (meter only appears on NPU machines)
                     app.config.npu_meter_mode = cycle_meter_mode(app.config.npu_meter_mode);
                 }
-                4 => {
+                5 => {
                     // Toggle show kernel threads
                     app.config.show_kernel_threads = !app.config.show_kernel_threads;
                 }
-                5 => {
+                6 => {
                     // Toggle show user threads
                     app.config.show_user_threads = !app.config.show_user_threads;
                 }
-                6 => {
+                7 => {
                     // Toggle show program path
                     app.config.show_program_path = !app.config.show_program_path;
                     app.needs_process_update = true;
                 }
-                7 => {
+                8 => {
                     // Toggle highlight new processes
                     app.config.highlight_new_processes = !app.config.highlight_new_processes;
                 }
-                8 => {
+                9 => {
                     // Toggle highlight large numbers
                     app.config.highlight_large_numbers = !app.config.highlight_large_numbers;
                 }
-                9 => {
+                10 => {
                     // Toggle tree view
                     app.toggle_tree_view();
                     app.config.tree_view_default = app.tree_view;
                 }
-                10 => {
+                11 => {
                     // Toggle confirm before kill
                     app.config.confirm_kill = !app.config.confirm_kill;
                 }
-                11 => {
+                12 => {
                     // Open color scheme selection
                     let schemes = ColorScheme::all();
                     let index = schemes.iter()
@@ -638,11 +642,11 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                         .unwrap_or(0);
                     app.dialog = DialogState::ColorScheme { index };
                 }
-                12 => {
+                13 => {
                     // Open column configuration
                     app.enter_column_config_mode();
                 }
-                13 => {
+                14 => {
                     // Reset all settings to defaults
                     app.config.reset_to_defaults();
                     app.reset_screen_tabs();
@@ -701,6 +705,14 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     }
                 }
                 3 => {
+                    // Adjust GPU meter mode
+                    if key.code == KeyCode::Right {
+                        app.config.gpu_meter_mode = cycle_meter_mode(app.config.gpu_meter_mode);
+                    } else {
+                        app.config.gpu_meter_mode = cycle_meter_mode_rev(app.config.gpu_meter_mode);
+                    }
+                }
+                4 => {
                     // Adjust NPU meter mode
                     if key.code == KeyCode::Right {
                         app.config.npu_meter_mode = cycle_meter_mode(app.config.npu_meter_mode);
@@ -822,7 +834,7 @@ fn handle_color_scheme_keys(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Esc => {
-            app.dialog = DialogState::Setup { selected: 11 };
+            app.dialog = DialogState::Setup { selected: 12 };
         }
         KeyCode::Enter => {
             if let DialogState::ColorScheme { index } = app.dialog
@@ -831,7 +843,7 @@ fn handle_color_scheme_keys(app: &mut App, key: KeyEvent) -> bool {
                     app.update_theme();
                     app.save_config();
                 }
-            app.dialog = DialogState::Setup { selected: 11 };
+            app.dialog = DialogState::Setup { selected: 12 };
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if let DialogState::ColorScheme { ref mut index } = app.dialog
@@ -870,7 +882,7 @@ fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Esc => {
-            app.dialog = DialogState::Setup { selected: 12 };
+            app.dialog = DialogState::Setup { selected: 13 };
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -1171,6 +1183,12 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
             // Swap meter click - cycle meter mode (shares with memory)
             (UIElement::SwapMeter, UIAction::Click) => {
                 app.config.memory_meter_mode = app.config.memory_meter_mode.next();
+                app.save_config();
+            }
+
+            // GPU meter click - cycle meter mode
+            (UIElement::GpuMeter, UIAction::Click) => {
+                app.config.gpu_meter_mode = app.config.gpu_meter_mode.next();
                 app.save_config();
             }
 

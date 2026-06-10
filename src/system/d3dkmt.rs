@@ -1,11 +1,12 @@
-//! NPU (Neural Processing Unit) monitoring via D3DKMT.
+//! GPU and NPU adapter monitoring via D3DKMT.
 //!
-//! NPUs are exposed as MCDM (Microsoft Compute Driver Model) compute-only
-//! adapters managed by dxgkrnl, sharing the GPU scheduling and memory
-//! infrastructure. Task Manager's NPU columns (Windows 11 KB5094126) read an
-//! undocumented PDH counterset, so we use the documented D3DKMT statistics
-//! DDI instead (the same route SystemInformer takes): node running-time
-//! deltas for utilization, segment commitments for memory.
+//! dxgkrnl manages render-capable adapters (GPUs) and MCDM (Microsoft Compute
+//! Driver Model) compute-only adapters (NPUs) through the same scheduling and
+//! memory infrastructure. Task Manager's GPU/NPU columns read undocumented PDH
+//! countersets, so we use the documented D3DKMT statistics DDI instead (the
+//! same route SystemInformer takes): node running-time deltas for utilization,
+//! segment commitments for memory. One enumeration pass tracks both adapter
+//! classes so machines with a GPU and an NPU pay for a single state machine.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,9 +24,9 @@ use windows::Wdk::Graphics::Direct3D::{
 };
 use windows::Win32::Foundation::{CloseHandle, LUID};
 
-/// System-wide NPU snapshot stored in `SystemMetrics` (cheap to clone).
+/// System-wide adapter snapshot stored in `SystemMetrics` (cheap to clone).
 #[derive(Clone, Default)]
-pub struct NpuInfo {
+pub struct AdapterMetrics {
     /// Adapter name from the driver, e.g. "Intel(R) AI Boost"
     pub name: String,
     /// 0-100, max across all engine nodes (Task Manager semantics)
@@ -35,7 +36,19 @@ pub struct NpuInfo {
     /// Sum of segment commit limits (0 if the driver reports none)
     pub mem_total: u64,
     pub dedicated_used: u64,
+    /// Sum of non-aperture segment commit limits (VRAM size on a discrete GPU)
+    pub dedicated_total: u64,
     pub shared_used: u64,
+}
+
+pub type NpuInfo = AdapterMetrics;
+pub type GpuInfo = AdapterMetrics;
+
+/// Per-class results of one refresh pass over all tracked adapters.
+#[derive(Clone, Default)]
+pub struct AdapterSnapshot {
+    pub gpu: Option<GpuInfo>,
+    pub npu: Option<NpuInfo>,
 }
 
 /// Per-process NPU usage row.
@@ -47,8 +60,15 @@ pub struct ProcNpu {
     pub memory: u64,
 }
 
-/// One detected MCDM compute-only adapter.
-struct NpuAdapter {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AdapterClass {
+    Gpu,
+    Npu,
+}
+
+/// One detected dxgkrnl adapter (render-capable or MCDM compute-only).
+struct TrackedAdapter {
+    class: AdapterClass,
     luid: LUID,
     name: String,
     node_count: u32,
@@ -62,8 +82,8 @@ struct NpuAdapter {
 /// Delta-tracking state. Lives in a static (not SystemMetrics) because the
 /// metrics struct is cloned for every snapshot sent to the UI thread.
 #[derive(Default)]
-struct NpuState {
-    adapters: Vec<NpuAdapter>,
+struct AdapterState {
+    adapters: Vec<TrackedAdapter>,
     detected: bool,
     /// Set when a statistics query fails (driver reset); triggers re-detection
     needs_reenumeration: bool,
@@ -73,7 +93,7 @@ struct NpuState {
     prev_proc_running: HashMap<u32, Vec<i64>>,
 }
 
-static NPU_STATE: Mutex<Option<NpuState>> = Mutex::new(None);
+static ADAPTER_STATE: Mutex<Option<AdapterState>> = Mutex::new(None);
 
 /// Per-process collection gate, set from the UI thread (NPU column visible or
 /// sorted), read by the data-collector thread. Per-process stats cost a handle
@@ -84,12 +104,25 @@ pub fn set_process_stats_enabled(enabled: bool) {
     PROCESS_STATS_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-/// MCDM adapters report ComputeOnly (bit 11); exclude software renderers (bit 2).
+/// Adapter classification from D3DKMT_ADAPTERTYPE flags. Software renderers
+/// (bit 2, e.g. Microsoft Basic Render Driver) are excluded outright; MCDM
+/// compute-only adapters (bit 11) are NPUs; anything else render-capable
+/// (bit 0) is a GPU.
 #[inline]
-fn is_compute_only_adapter(adapter_type_value: u32) -> bool {
+fn classify_adapter(adapter_type_value: u32) -> Option<AdapterClass> {
+    const RENDER_SUPPORTED: u32 = 1 << 0;
     const SOFTWARE_DEVICE: u32 = 1 << 2;
     const COMPUTE_ONLY: u32 = 1 << 11;
-    adapter_type_value & COMPUTE_ONLY != 0 && adapter_type_value & SOFTWARE_DEVICE == 0
+    if adapter_type_value & SOFTWARE_DEVICE != 0 {
+        return None;
+    }
+    if adapter_type_value & COMPUTE_ONLY != 0 {
+        return Some(AdapterClass::Npu);
+    }
+    if adapter_type_value & RENDER_SUPPORTED != 0 {
+        return Some(AdapterClass::Gpu);
+    }
+    None
 }
 
 /// Δ RunningTime (100ns units) over Δ wall-clock, as a clamped percentage.
@@ -116,8 +149,8 @@ unsafe fn query_statistics(query: &mut D3DKMT_QUERYSTATISTICS) -> bool {
     unsafe { D3DKMTQueryStatistics(&raw const *query).is_ok() }
 }
 
-/// Enumerate dxgkrnl adapters and keep the MCDM compute-only ones (NPUs).
-fn detect_adapters() -> Vec<NpuAdapter> {
+/// Enumerate dxgkrnl adapters and keep the GPUs and NPUs.
+fn detect_adapters() -> Vec<TrackedAdapter> {
     unsafe {
         // First call with a null buffer returns the adapter count.
         let mut enum2 = D3DKMT_ENUMADAPTERS2::default();
@@ -136,7 +169,7 @@ fn detect_adapters() -> Vec<NpuAdapter> {
             if info.hAdapter == 0 {
                 continue;
             }
-            if let Some(adapter) = build_npu_adapter(info) {
+            if let Some(adapter) = build_adapter(info) {
                 adapters.push(adapter);
             }
             // Statistics queries take the LUID, so no handle is retained.
@@ -146,10 +179,10 @@ fn detect_adapters() -> Vec<NpuAdapter> {
     }
 }
 
-/// Classify one enumerated adapter; returns Some only for NPUs.
-fn build_npu_adapter(info: &D3DKMT_ADAPTERINFO) -> Option<NpuAdapter> {
+/// Classify one enumerated adapter; returns Some for GPUs and NPUs.
+fn build_adapter(info: &D3DKMT_ADAPTERINFO) -> Option<TrackedAdapter> {
     unsafe {
-        // Adapter type: skip everything that isn't an MCDM compute-only device.
+        // Adapter type: skip software devices and anything we don't track.
         let mut adapter_type = D3DKMT_ADAPTERTYPE::default();
         let mut query = D3DKMT_QUERYADAPTERINFO {
             hAdapter: info.hAdapter,
@@ -157,11 +190,14 @@ fn build_npu_adapter(info: &D3DKMT_ADAPTERINFO) -> Option<NpuAdapter> {
             pPrivateDriverData: &mut adapter_type as *mut _ as *mut std::ffi::c_void,
             PrivateDriverDataSize: std::mem::size_of::<D3DKMT_ADAPTERTYPE>() as u32,
         };
-        if D3DKMTQueryAdapterInfo(&mut query).is_err()
-            || !is_compute_only_adapter(adapter_type.Anonymous.Value)
-        {
+        if D3DKMTQueryAdapterInfo(&mut query).is_err() {
             return None;
         }
+        let class = classify_adapter(adapter_type.Anonymous.Value)?;
+        let fallback_name = match class {
+            AdapterClass::Gpu => "GPU",
+            AdapterClass::Npu => "NPU",
+        };
 
         // Friendly name from the driver registry info (best effort).
         let mut registry_info = D3DKMT_ADAPTERREGISTRYINFO::default();
@@ -173,9 +209,9 @@ fn build_npu_adapter(info: &D3DKMT_ADAPTERINFO) -> Option<NpuAdapter> {
         };
         let name = if D3DKMTQueryAdapterInfo(&mut query).is_ok() {
             let s = utf16_to_string(&registry_info.AdapterString);
-            if s.is_empty() { "NPU".to_string() } else { s }
+            if s.is_empty() { fallback_name.to_string() } else { s }
         } else {
-            "NPU".to_string()
+            fallback_name.to_string()
         };
 
         // Node/segment counts for the statistics loops.
@@ -206,7 +242,8 @@ fn build_npu_adapter(info: &D3DKMT_ADAPTERINFO) -> Option<NpuAdapter> {
             aperture_segment.push(aperture);
         }
 
-        Some(NpuAdapter {
+        Some(TrackedAdapter {
+            class,
             luid: info.AdapterLuid,
             name,
             node_count,
@@ -217,11 +254,127 @@ fn build_npu_adapter(info: &D3DKMT_ADAPTERINFO) -> Option<NpuAdapter> {
     }
 }
 
-/// Refresh system-wide NPU metrics. Returns None when no NPU exists; after the
-/// one-time detection that path is just a mutex lock and an empty check.
-pub fn refresh() -> Option<NpuInfo> {
-    let mut guard = NPU_STATE.lock().unwrap();
-    let state = guard.get_or_insert_with(NpuState::default);
+/// Query utilization and memory for one adapter. Returns None on a statistics
+/// failure (driver reset / adapter removal), which triggers re-enumeration.
+fn query_adapter_metrics(
+    adapter: &mut TrackedAdapter,
+    elapsed: Option<f64>,
+) -> Option<AdapterMetrics> {
+    let mut metrics = AdapterMetrics {
+        name: adapter.name.clone(),
+        ..Default::default()
+    };
+
+    // Utilization: max across engine nodes of the running-time deltas.
+    for node_id in 0..adapter.node_count {
+        let mut stats = D3DKMT_QUERYSTATISTICS {
+            Type: D3DKMT_QUERYSTATISTICS_NODE,
+            AdapterLuid: adapter.luid,
+            ..Default::default()
+        };
+        stats.Anonymous.QueryNode = D3DKMT_QUERYSTATISTICS_QUERY_NODE { NodeId: node_id };
+        if !unsafe { query_statistics(&mut stats) } {
+            return None;
+        }
+        let running = unsafe {
+            stats.QueryResult.NodeInformation.GlobalInformation.RunningTime
+        };
+        if let Some(secs) = elapsed {
+            let pct = running_time_to_percent(
+                adapter.prev_node_running[node_id as usize],
+                running,
+                secs,
+            );
+            metrics.utilization = metrics.utilization.max(pct);
+        }
+        adapter.prev_node_running[node_id as usize] = running;
+    }
+
+    // Memory: resident bytes per segment, split by aperture (shared) flag.
+    for segment_id in 0..adapter.segment_count {
+        let mut stats = D3DKMT_QUERYSTATISTICS {
+            Type: D3DKMT_QUERYSTATISTICS_SEGMENT,
+            AdapterLuid: adapter.luid,
+            ..Default::default()
+        };
+        stats.Anonymous.QuerySegment = D3DKMT_QUERYSTATISTICS_QUERY_SEGMENT {
+            SegmentId: segment_id,
+        };
+        if !unsafe { query_statistics(&mut stats) } {
+            return None;
+        }
+        let segment = unsafe { stats.QueryResult.SegmentInformation };
+        let used = if segment.BytesResident > 0 {
+            segment.BytesResident
+        } else {
+            segment.BytesCommitted
+        };
+        if adapter.aperture_segment.get(segment_id as usize).copied().unwrap_or(false) {
+            metrics.shared_used += used;
+        } else {
+            metrics.dedicated_used += used;
+            metrics.dedicated_total += segment.CommitLimit;
+        }
+        metrics.mem_total += segment.CommitLimit;
+    }
+
+    metrics.mem_used = metrics.dedicated_used + metrics.shared_used;
+    Some(metrics)
+}
+
+/// Aggregate NPU adapters: max utilization, summed memory, first adapter's
+/// name with a "(+N)" suffix when more exist.
+fn aggregate_npus(per_adapter: &[(AdapterClass, AdapterMetrics)]) -> Option<AdapterMetrics> {
+    let mut npus = per_adapter
+        .iter()
+        .filter(|(class, _)| *class == AdapterClass::Npu)
+        .map(|(_, metrics)| metrics);
+    let mut info = npus.next()?.clone();
+    let mut extra = 0;
+    for m in npus {
+        info.utilization = info.utilization.max(m.utilization);
+        info.mem_used += m.mem_used;
+        info.mem_total += m.mem_total;
+        info.dedicated_used += m.dedicated_used;
+        info.dedicated_total += m.dedicated_total;
+        info.shared_used += m.shared_used;
+        extra += 1;
+    }
+    if extra > 0 {
+        info.name.push_str(&format!(" (+{})", extra));
+    }
+    Some(info)
+}
+
+/// Pick the primary GPU: largest dedicated commit limit selects the discrete
+/// card over an iGPU; ties and all-zero fall back to enumeration order. The
+/// meter shows only the primary adapter — summing one card's VRAM with
+/// another adapter's aperture limit would produce nonsense totals.
+fn aggregate_gpus(per_adapter: &[(AdapterClass, AdapterMetrics)]) -> Option<AdapterMetrics> {
+    let mut primary: Option<&AdapterMetrics> = None;
+    let mut count = 0;
+    for (class, metrics) in per_adapter {
+        if *class != AdapterClass::Gpu {
+            continue;
+        }
+        count += 1;
+        if primary.is_none_or(|p| metrics.dedicated_total > p.dedicated_total) {
+            primary = Some(metrics);
+        }
+    }
+    let mut info = primary?.clone();
+    if count > 1 {
+        info.name.push_str(&format!(" (+{})", count - 1));
+    }
+    Some(info)
+}
+
+/// Refresh system-wide GPU/NPU metrics. Both fields are None when no tracked
+/// adapter exists; after the one-time detection that path is just a mutex
+/// lock and an empty check.
+pub fn refresh() -> AdapterSnapshot {
+    let mut guard = ADAPTER_STATE.lock().unwrap();
+    let state = guard.get_or_insert_with(AdapterState::default);
 
     if !state.detected || state.needs_reenumeration {
         state.adapters = detect_adapters();
@@ -232,7 +385,7 @@ pub fn refresh() -> Option<NpuInfo> {
         state.prev_proc_running.clear();
     }
     if state.adapters.is_empty() {
-        return None;
+        return AdapterSnapshot::default();
     }
 
     let now = Instant::now();
@@ -240,95 +393,30 @@ pub fn refresh() -> Option<NpuInfo> {
     let elapsed = state.last_sample.map(|t| now.duration_since(t).as_secs_f64());
     state.last_sample = Some(now);
 
-    let mut info = NpuInfo {
-        name: state.adapters[0].name.clone(),
-        ..Default::default()
-    };
-    if state.adapters.len() > 1 {
-        info.name.push_str(&format!(" (+{})", state.adapters.len() - 1));
-    }
-
-    let mut failed = false;
+    let mut per_adapter = Vec::with_capacity(state.adapters.len());
     for adapter in &mut state.adapters {
-        // Utilization: max across engine nodes of the running-time deltas.
-        for node_id in 0..adapter.node_count {
-            let mut stats = D3DKMT_QUERYSTATISTICS {
-                Type: D3DKMT_QUERYSTATISTICS_NODE,
-                AdapterLuid: adapter.luid,
-                ..Default::default()
-            };
-            stats.Anonymous.QueryNode = D3DKMT_QUERYSTATISTICS_QUERY_NODE { NodeId: node_id };
-            if !unsafe { query_statistics(&mut stats) } {
-                failed = true;
-                break;
-            }
-            let running = unsafe {
-                stats.QueryResult.NodeInformation.GlobalInformation.RunningTime
-            };
-            if let Some(secs) = elapsed {
-                let pct = running_time_to_percent(
-                    adapter.prev_node_running[node_id as usize],
-                    running,
-                    secs,
-                );
-                info.utilization = info.utilization.max(pct);
-            }
-            adapter.prev_node_running[node_id as usize] = running;
-        }
-        if failed {
-            break;
-        }
-
-        // Memory: resident bytes per segment, split by aperture (shared) flag.
-        for segment_id in 0..adapter.segment_count {
-            let mut stats = D3DKMT_QUERYSTATISTICS {
-                Type: D3DKMT_QUERYSTATISTICS_SEGMENT,
-                AdapterLuid: adapter.luid,
-                ..Default::default()
-            };
-            stats.Anonymous.QuerySegment = D3DKMT_QUERYSTATISTICS_QUERY_SEGMENT {
-                SegmentId: segment_id,
-            };
-            if !unsafe { query_statistics(&mut stats) } {
-                failed = true;
-                break;
-            }
-            let segment = unsafe { stats.QueryResult.SegmentInformation };
-            let used = if segment.BytesResident > 0 {
-                segment.BytesResident
-            } else {
-                segment.BytesCommitted
-            };
-            if adapter.aperture_segment.get(segment_id as usize).copied().unwrap_or(false) {
-                info.shared_used += used;
-            } else {
-                info.dedicated_used += used;
-            }
-            info.mem_total += segment.CommitLimit;
-        }
-        if failed {
-            break;
-        }
+        let Some(metrics) = query_adapter_metrics(adapter, elapsed) else {
+            // Driver reset or adapter removal: re-enumerate on the next tick.
+            state.needs_reenumeration = true;
+            return AdapterSnapshot::default();
+        };
+        per_adapter.push((adapter.class, metrics));
     }
 
-    if failed {
-        // Driver reset or adapter removal: re-enumerate on the next tick.
-        state.needs_reenumeration = true;
-        return None;
+    AdapterSnapshot {
+        gpu: aggregate_gpus(&per_adapter),
+        npu: aggregate_npus(&per_adapter),
     }
-
-    info.mem_used = info.dedicated_used + info.shared_used;
-    Some(info)
 }
 
 /// Per-process NPU stats for the given PIDs. Returns an empty map unless an
 /// NPU exists and `set_process_stats_enabled(true)` was called.
 pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcNpu> {
-    let mut guard = NPU_STATE.lock().unwrap();
+    let mut guard = ADAPTER_STATE.lock().unwrap();
     let Some(state) = guard.as_mut() else {
         return HashMap::new();
     };
-    if state.adapters.is_empty() {
+    if !state.adapters.iter().any(|a| a.class == AdapterClass::Npu) {
         return HashMap::new();
     }
     if !PROCESS_STATS_ENABLED.load(Ordering::Relaxed) {
@@ -345,7 +433,9 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcNpu> {
     state.last_proc_sample = Some(now);
 
     // Split borrows so adapters and the baseline map can be used together.
-    let NpuState { adapters, prev_proc_running, .. } = state;
+    let AdapterState { adapters, prev_proc_running, .. } = state;
+    // Baseline slots cover every node of every adapter (GPUs included) so the
+    // flattened indices stay stable regardless of which classes are queried.
     let total_nodes: usize = adapters.iter().map(|a| a.node_count as usize).sum();
 
     let mut result = HashMap::with_capacity(pids.len());
@@ -367,6 +457,10 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcNpu> {
         let mut entry = ProcNpu::default();
         let mut node_index = 0;
         for adapter in adapters.iter() {
+            if adapter.class != AdapterClass::Npu {
+                node_index += adapter.node_count as usize;
+                continue;
+            }
             for node_id in 0..adapter.node_count {
                 let mut stats = D3DKMT_QUERYSTATISTICS {
                     Type: D3DKMT_QUERYSTATISTICS_PROCESS_NODE,
@@ -420,19 +514,90 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcNpu> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_compute_only_adapter, running_time_to_percent, utf16_to_string};
+    use super::{
+        aggregate_gpus, aggregate_npus, classify_adapter, running_time_to_percent,
+        utf16_to_string, AdapterClass, AdapterMetrics,
+    };
 
     #[test]
-    fn test_compute_only_detection() {
+    fn test_classify_adapter() {
+        // Render-capable (bit 0) -> GPU
+        assert!(matches!(classify_adapter(1 << 0), Some(AdapterClass::Gpu)));
         // ComputeOnly (bit 11) alone -> NPU
-        assert!(is_compute_only_adapter(1 << 11));
-        // ComputeOnly + SoftwareDevice (bit 2) -> software renderer, not NPU
-        assert!(!is_compute_only_adapter((1 << 11) | (1 << 2)));
-        // Render-capable GPU (bit 0) without ComputeOnly -> not NPU
-        assert!(!is_compute_only_adapter(1 << 0));
-        assert!(!is_compute_only_adapter(0));
+        assert!(matches!(classify_adapter(1 << 11), Some(AdapterClass::Npu)));
+        // SoftwareDevice (bit 2) excludes regardless of other capabilities
+        // (WARP / Microsoft Basic Render Driver)
+        assert!(classify_adapter((1 << 0) | (1 << 2)).is_none());
+        assert!(classify_adapter((1 << 11) | (1 << 2)).is_none());
+        // ComputeOnly wins over render-capable
+        assert!(matches!(
+            classify_adapter((1 << 0) | (1 << 11)),
+            Some(AdapterClass::Npu)
+        ));
+        // Neither render nor compute (e.g. display-only) -> untracked
+        assert!(classify_adapter(0).is_none());
         // Other flags alongside ComputeOnly don't disqualify
-        assert!(is_compute_only_adapter((1 << 11) | (1 << 13)));
+        assert!(matches!(
+            classify_adapter((1 << 11) | (1 << 13)),
+            Some(AdapterClass::Npu)
+        ));
+    }
+
+    fn metrics(name: &str, utilization: f32, dedicated_total: u64) -> AdapterMetrics {
+        AdapterMetrics {
+            name: name.to_string(),
+            utilization,
+            mem_used: 100,
+            mem_total: 200,
+            dedicated_used: 50,
+            dedicated_total,
+            shared_used: 50,
+        }
+    }
+
+    #[test]
+    fn test_aggregate_gpus_picks_largest_dedicated() {
+        // dGPU (large VRAM) wins over iGPU even when enumerated second
+        let per_adapter = vec![
+            (AdapterClass::Gpu, metrics("iGPU", 80.0, 128 << 20)),
+            (AdapterClass::Gpu, metrics("dGPU", 10.0, 8 << 30)),
+            (AdapterClass::Npu, metrics("NPU", 99.0, 0)),
+        ];
+        let gpu = aggregate_gpus(&per_adapter).unwrap();
+        assert_eq!(gpu.name, "dGPU (+1)");
+        assert_eq!(gpu.utilization, 10.0);
+        assert_eq!(gpu.dedicated_total, 8 << 30);
+    }
+
+    #[test]
+    fn test_aggregate_gpus_tie_prefers_enumeration_order() {
+        let per_adapter = vec![
+            (AdapterClass::Gpu, metrics("first", 1.0, 0)),
+            (AdapterClass::Gpu, metrics("second", 2.0, 0)),
+        ];
+        let gpu = aggregate_gpus(&per_adapter).unwrap();
+        assert_eq!(gpu.name, "first (+1)");
+    }
+
+    #[test]
+    fn test_aggregate_gpus_none_without_gpus() {
+        let per_adapter = vec![(AdapterClass::Npu, metrics("NPU", 1.0, 0))];
+        assert!(aggregate_gpus(&per_adapter).is_none());
+        assert!(aggregate_gpus(&[]).is_none());
+    }
+
+    #[test]
+    fn test_aggregate_npus_max_util_summed_memory() {
+        let per_adapter = vec![
+            (AdapterClass::Gpu, metrics("GPU", 90.0, 8 << 30)),
+            (AdapterClass::Npu, metrics("NPU A", 20.0, 0)),
+            (AdapterClass::Npu, metrics("NPU B", 60.0, 0)),
+        ];
+        let npu = aggregate_npus(&per_adapter).unwrap();
+        assert_eq!(npu.name, "NPU A (+1)");
+        assert_eq!(npu.utilization, 60.0);
+        assert_eq!(npu.mem_used, 200);
+        assert_eq!(npu.mem_total, 400);
     }
 
     #[test]
