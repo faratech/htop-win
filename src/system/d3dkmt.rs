@@ -88,6 +88,9 @@ enum AdapterClass {
     Npu,
 }
 
+/// Adapter LUID flattened to a comparable/sortable key: (LowPart, HighPart).
+type LuidKey = (u32, i32);
+
 /// One detected dxgkrnl adapter (render-capable or MCDM compute-only).
 struct TrackedAdapter {
     class: AdapterClass,
@@ -119,7 +122,12 @@ struct AdapterState {
     /// Sorted LUIDs of every adapter seen at the last (re-)detection; compared
     /// against fresh enumerations to spot topology changes (driver installs,
     /// removals) that never fail an existing statistics query
-    enumerated_luids: Vec<(u32, i32)>,
+    enumerated_luids: Vec<LuidKey>,
+    /// LUIDs of render/compute adapters that enumerated but whose statistics
+    /// were unavailable at detection (commonly a discrete GPU in a low-power
+    /// state). Non-empty forces a retry on the next topology check so the
+    /// adapter appears once it powers up.
+    pending_luids: Vec<LuidKey>,
     last_topology_check: Option<Instant>,
     /// Last successful snapshot, served during the one-tick window after a
     /// statistics failure so adapter presence (meters, hardware-aware default
@@ -230,24 +238,42 @@ fn for_each_enumerated_adapter(mut f: impl FnMut(&D3DKMT_ADAPTERINFO)) {
     }
 }
 
-/// Enumerate dxgkrnl adapters; returns the GPUs/NPUs we track plus the sorted
-/// LUID set of everything enumerated (for the periodic topology check).
-fn detect_adapters() -> (Vec<TrackedAdapter>, Vec<(u32, i32)>) {
+/// Result of probing one enumerated adapter.
+enum AdapterProbe {
+    /// A GPU/NPU we can monitor right now.
+    Tracked(TrackedAdapter),
+    /// A render/compute adapter whose statistics are currently unavailable
+    /// (commonly a discrete GPU parked in a low-power D3 state on a hybrid
+    /// laptop). We retry these so they appear once powered up.
+    Pending,
+    /// Not a GPU/NPU (software/WARP, display-only) or unidentifiable; ignored.
+    Untrackable,
+}
+
+/// Enumerate dxgkrnl adapters; returns the GPUs/NPUs we can track now, the
+/// sorted LUID set of everything enumerated (for the periodic topology check),
+/// and the sorted LUIDs of trackable-but-currently-unavailable adapters to retry.
+fn detect_adapters() -> (Vec<TrackedAdapter>, Vec<LuidKey>, Vec<LuidKey>) {
     let mut adapters = Vec::new();
     let mut luids = Vec::new();
+    let mut pending = Vec::new();
     for_each_enumerated_adapter(|info| {
-        luids.push((info.AdapterLuid.LowPart, info.AdapterLuid.HighPart));
-        if let Some(adapter) = build_adapter(info) {
-            adapters.push(adapter);
+        let luid = (info.AdapterLuid.LowPart, info.AdapterLuid.HighPart);
+        luids.push(luid);
+        match build_adapter(info) {
+            AdapterProbe::Tracked(adapter) => adapters.push(adapter),
+            AdapterProbe::Pending => pending.push(luid),
+            AdapterProbe::Untrackable => {}
         }
     });
     luids.sort_unstable();
-    (adapters, luids)
+    pending.sort_unstable();
+    (adapters, luids, pending)
 }
 
 /// Sorted LUIDs of every adapter dxgkrnl currently exposes — the cheap probe
 /// behind the periodic topology check.
-fn enumerate_luids() -> Vec<(u32, i32)> {
+fn enumerate_luids() -> Vec<LuidKey> {
     let mut luids = Vec::new();
     for_each_enumerated_adapter(|info| {
         luids.push((info.AdapterLuid.LowPart, info.AdapterLuid.HighPart));
@@ -256,8 +282,8 @@ fn enumerate_luids() -> Vec<(u32, i32)> {
     luids
 }
 
-/// Classify one enumerated adapter; returns Some for GPUs and NPUs.
-fn build_adapter(info: &D3DKMT_ADAPTERINFO) -> Option<TrackedAdapter> {
+/// Classify and probe one enumerated adapter.
+fn build_adapter(info: &D3DKMT_ADAPTERINFO) -> AdapterProbe {
     unsafe {
         // Adapter type: skip software devices and anything we don't track.
         let mut adapter_type = D3DKMT_ADAPTERTYPE::default();
@@ -268,9 +294,13 @@ fn build_adapter(info: &D3DKMT_ADAPTERINFO) -> Option<TrackedAdapter> {
             PrivateDriverDataSize: std::mem::size_of::<D3DKMT_ADAPTERTYPE>() as u32,
         };
         if D3DKMTQueryAdapterInfo(&mut query).is_err() {
-            return None;
+            // Can't even read the type (deep power-down / driver hiccup). We
+            // don't know if it's a GPU, so don't retry it as pending.
+            return AdapterProbe::Untrackable;
         }
-        let class = classify_adapter(adapter_type.Anonymous.Value)?;
+        let Some(class) = classify_adapter(adapter_type.Anonymous.Value) else {
+            return AdapterProbe::Untrackable;
+        };
         let fallback_name = match class {
             AdapterClass::Gpu => "GPU",
             AdapterClass::Npu => "NPU",
@@ -298,7 +328,9 @@ fn build_adapter(info: &D3DKMT_ADAPTERINFO) -> Option<TrackedAdapter> {
             ..Default::default()
         };
         if !query_statistics(&mut stats) {
-            return None;
+            // It's a GPU/NPU class but statistics aren't available yet (likely
+            // powered down). Mark pending so refresh() retries it.
+            return AdapterProbe::Pending;
         }
         let node_count = stats.QueryResult.AdapterInformation.NodeCount;
         let segment_count = stats.QueryResult.AdapterInformation.NbSegments;
@@ -319,7 +351,7 @@ fn build_adapter(info: &D3DKMT_ADAPTERINFO) -> Option<TrackedAdapter> {
             aperture_segment.push(aperture);
         }
 
-        Some(TrackedAdapter {
+        AdapterProbe::Tracked(TrackedAdapter {
             class,
             luid: info.AdapterLuid,
             name,
@@ -471,19 +503,43 @@ pub fn refresh() -> AdapterSnapshot {
             .is_none_or(|t| now.duration_since(t) >= TOPOLOGY_CHECK_INTERVAL)
     {
         state.last_topology_check = Some(now);
-        if enumerate_luids() != state.enumerated_luids {
+        // Re-detect when the adapter set changed, or when a previously-down
+        // adapter is pending — retry it in case it has since powered up.
+        if enumerate_luids() != state.enumerated_luids || !state.pending_luids.is_empty() {
             state.needs_reenumeration = true;
         }
     }
 
     if !state.detected || state.needs_reenumeration {
-        let (adapters, luids) = detect_adapters();
+        let old = std::mem::take(&mut state.adapters);
+        let (mut adapters, luids, pending) = detect_adapters();
+        // Preserve per-adapter utilization baselines for adapters that survived
+        // the re-detection (matched by LUID), so a re-enumeration triggered by a
+        // pending/transient adapter doesn't reset the working adapters' meters.
+        // Seed baselines for freshly-appeared adapters so their first sample
+        // reads ~0% instead of spiking to 100%.
+        for a in &mut adapters {
+            match old
+                .iter()
+                .find(|o| o.luid.LowPart == a.luid.LowPart && o.luid.HighPart == a.luid.HighPart)
+            {
+                Some(o) if o.prev_node_running.len() == a.prev_node_running.len() => {
+                    a.prev_node_running.clone_from(&o.prev_node_running);
+                }
+                _ => {
+                    let _ = query_adapter_metrics(a, None);
+                }
+            }
+        }
         state.adapters = adapters;
         state.enumerated_luids = luids;
+        state.pending_luids = pending;
         state.detected = true;
         state.needs_reenumeration = false;
         state.last_topology_check = Some(now);
-        state.last_sample = None;
+        // Keep last_sample so surviving adapters retain utilization continuity
+        // (a counter reset clamps to 0% for one tick via running_time_to_percent).
+        // The per-process node layout may have shifted, so reset those baselines.
         state.last_proc_sample = None;
         state.prev_proc_running.clear();
     }
@@ -622,9 +678,12 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcAdapterStats> {
                     let committed = unsafe {
                         stats.QueryResult.ProcessSegmentInformation.BytesCommitted
                     };
+                    // Treat the u64::MAX "no limit" sentinel as 0 and saturate so
+                    // a quirky driver can't overflow the per-process total.
+                    let committed = if committed == u64::MAX { 0 } else { committed };
                     match adapter.class {
-                        AdapterClass::Gpu => entry.gpu_memory += committed,
-                        AdapterClass::Npu => entry.npu_memory += committed,
+                        AdapterClass::Gpu => entry.gpu_memory = entry.gpu_memory.saturating_add(committed),
+                        AdapterClass::Npu => entry.npu_memory = entry.npu_memory.saturating_add(committed),
                     }
                 }
             }
