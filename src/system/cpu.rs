@@ -37,6 +37,45 @@ impl CpuInfo {
     }
 }
 
+/// Flat list of (group, processor-in-group) for every active logical processor
+/// across all Windows processor groups, in group-then-index order.
+///
+/// Windows splits systems with >64 logical processors into groups of up to 64.
+/// `GetSystemInfo`/`dwNumberOfProcessors` and the legacy `\Processor(N)` PDH
+/// counterset only ever see the *current* group (<=64), so high-core-count
+/// servers/HEDT would show only the first 64 CPUs. Enumerating every group and
+/// using the group-aware `\Processor Information(group,n)` counters makes them
+/// all visible. Falls back to a single GetSystemInfo-sized group if the group
+/// APIs report nothing.
+#[cfg(windows)]
+fn processor_layout() -> Vec<(u16, u32)> {
+    use windows::Win32::System::Threading::{
+        GetActiveProcessorCount, GetActiveProcessorGroupCount,
+    };
+    let mut layout = Vec::new();
+    unsafe {
+        let groups = GetActiveProcessorGroupCount();
+        for group in 0..groups {
+            let count = GetActiveProcessorCount(group);
+            for n in 0..count {
+                layout.push((group, n));
+            }
+        }
+    }
+    if layout.is_empty() {
+        use windows::Win32::System::SystemInformation::GetSystemInfo;
+        let count = unsafe {
+            let mut si = std::mem::zeroed();
+            GetSystemInfo(&mut si);
+            si.dwNumberOfProcessors
+        };
+        for n in 0..count {
+            layout.push((0, n));
+        }
+    }
+    layout
+}
+
 /// PDH-based CPU info collection using Windows Performance Counters
 /// This is the same method Task Manager uses
 #[cfg(windows)]
@@ -48,7 +87,6 @@ fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
         PdhGetFormattedCounterValue, PdhOpenQueryW, PDH_CSTATUS_VALID_DATA,
         PDH_FMT_DOUBLE, PDH_FMT_COUNTERVALUE, PDH_HCOUNTER, PDH_HQUERY,
     };
-    use windows::Win32::System::SystemInformation::GetSystemInfo;
 
     /// Wrapper to make PDH handles Send (they're only accessed with mutex held)
     struct SendPtr(*mut std::ffi::c_void);
@@ -134,12 +172,10 @@ fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
     let mut state_guard = PDH_STATE.lock().unwrap();
     let state = state_guard.get_or_insert_with(PdhState::default);
 
-    // Get CPU count
-    let cpu_count = unsafe {
-        let mut sys_info = std::mem::zeroed();
-        GetSystemInfo(&mut sys_info);
-        sys_info.dwNumberOfProcessors as usize
-    };
+    // Every logical processor across all processor groups (handles >64-CPU
+    // systems, which Windows splits into groups of up to 64).
+    let layout = processor_layout();
+    let cpu_count = layout.len();
 
     // Initialize PDH query if needed
     if !state.initialized {
@@ -152,19 +188,22 @@ fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
             }
             state.query = SendPtr(query.0);
 
-            // Add counters for each processor:
+            // Add per-processor counters using the group-aware "Processor
+            // Information(group,n)" counterset so every group is covered:
             // - % User Time: time in user mode
             // - % Privileged Time: time in kernel mode (system)
             state.core_counters.reserve(cpu_count);
-            for i in 0..cpu_count {
-                let user = match add_counter(query, &format!("\\Processor({})\\% User Time", i)) {
+            for &(group, n) in &layout {
+                let user_path = format!("\\Processor Information({group},{n})\\% User Time");
+                let priv_path = format!("\\Processor Information({group},{n})\\% Privileged Time");
+                let user = match add_counter(query, &user_path) {
                     Some(c) => c,
                     None => {
                         let _ = PdhCloseQuery(query);
                         return fallback_cpu_info(cpu_count);
                     }
                 };
-                let privileged = match add_counter(query, &format!("\\Processor({})\\% Privileged Time", i)) {
+                let privileged = match add_counter(query, &priv_path) {
                     Some(c) => c,
                     None => {
                         let _ = PdhCloseQuery(query);
@@ -221,4 +260,33 @@ fn fallback_cpu_info(cpu_count: usize) -> (Vec<f32>, Vec<CpuBreakdown>) {
     let core_usage = vec![0.0; cpu_count];
     let breakdowns = vec![CpuBreakdown { user: 0.0, system: 0.0, idle: 100.0 }; cpu_count];
     (core_usage, breakdowns)
+}
+
+/// Diagnostics for CPU/processor-group enumeration (`--cpu-debug`): samples
+/// per-core usage twice (PDH needs two samples) and reports the group layout.
+#[cfg(windows)]
+pub fn debug_dump() -> String {
+    use std::fmt::Write as _;
+    let layout = processor_layout();
+    let groups = layout.iter().map(|(g, _)| *g).max().map(|g| g + 1).unwrap_or(0);
+    let _ = get_cpu_info_pdh(); // first sample primes the counters (returns zeros)
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let (usage, breakdown) = get_cpu_info_pdh();
+
+    let mut out = String::new();
+    let _ = writeln!(out, "Logical processors: {}", layout.len());
+    let _ = writeln!(out, "Processor groups:   {groups}");
+    let per_group: std::collections::BTreeMap<u16, usize> =
+        layout.iter().fold(std::collections::BTreeMap::new(), |mut m, (g, _)| {
+            *m.entry(*g).or_default() += 1;
+            m
+        });
+    for (g, n) in &per_group {
+        let _ = writeln!(out, "  group {g}: {n} processors");
+    }
+    let _ = writeln!(out, "\nper-core usage (after 300ms):");
+    for (i, (u, bd)) in usage.iter().zip(breakdown.iter()).enumerate() {
+        let _ = writeln!(out, "  CPU {i:>3}: {u:5.1}%  (user {:.1} sys {:.1})", bd.user, bd.system);
+    }
+    out
 }

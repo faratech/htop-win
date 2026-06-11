@@ -5,7 +5,7 @@ mod native;
 pub mod cache;
 mod process;
 
-pub use cpu::CpuInfo;
+pub use cpu::{debug_dump as cpu_debug_dump, CpuInfo};
 pub use d3dkmt::{
     debug_dump as gpu_debug_dump, gpu_names, set_gpu_process_stats_enabled, set_gpu_selection,
     set_npu_process_stats_enabled, GpuInfo, NpuInfo,

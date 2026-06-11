@@ -46,6 +46,7 @@ struct Args {
     update: bool,
     force: bool,
     gpu_debug: bool,
+    cpu_debug: bool,
 }
 
 /// Benchmark statistics for performance measurement
@@ -130,6 +131,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Long("gpu-debug") => {
                 args.gpu_debug = true;
             }
+            Long("cpu-debug") => {
+                args.cpu_debug = true;
+            }
             _ => return Err(arg.unexpected()),
         }
     }
@@ -159,6 +163,7 @@ fn print_help() {
     println!("      --update                 Check for updates and install if available");
     println!("  -f, --force                  Force install/update even if same version");
     println!("      --gpu-debug              Print GPU/NPU adapter diagnostics and exit");
+    println!("      --cpu-debug              Print CPU / processor-group diagnostics and exit");
     println!("  -h, --help                   Print help");
     println!("  -V, --version                Print version");
 }
@@ -339,6 +344,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.gpu_debug {
         print!("{}", crate::system::gpu_debug_dump());
+        return Ok(());
+    }
+
+    if args.cpu_debug {
+        print!("{}", crate::system::cpu_debug_dump());
         return Ok(());
     }
 
