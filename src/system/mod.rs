@@ -289,9 +289,15 @@ impl SystemMetrics {
             let mut new_processes = Vec::new();
 
             // Per-process GPU/NPU stats (empty unless the hardware exists and
-            // one of its columns is currently visible or sorted)
-            let pids: Vec<u32> = proc_list.iter().map(|p| p.pid()).collect();
-            let adapter_stats = d3dkmt::process_stats(&pids);
+            // one of its columns is currently visible or sorted). Skip allocating
+            // the all-PIDs vector on the common path where stats are disabled;
+            // still call process_stats(&[]) so its gate-change bookkeeping runs.
+            let adapter_stats = if d3dkmt::process_stats_enabled() {
+                let pids: Vec<u32> = proc_list.iter().map(|p| p.pid()).collect();
+                d3dkmt::process_stats(&pids)
+            } else {
+                d3dkmt::process_stats(&[])
+            };
 
             // Iterate raw processes
             for raw_proc in proc_list.iter() {

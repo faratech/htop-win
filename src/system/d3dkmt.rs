@@ -130,6 +130,16 @@ pub fn set_npu_process_stats_enabled(enabled: bool) {
     NPU_PROCESS_STATS_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// Cheap (lock-free) pre-check for whether per-process GPU/NPU stats might be
+/// wanted. When this is false the caller can skip building the all-PIDs vector
+/// and pass an empty slice to `process_stats` (which still runs its gate-change
+/// bookkeeping). `process_stats` remains the authoritative gate — it also
+/// requires the matching adapter class to actually exist.
+pub fn process_stats_enabled() -> bool {
+    GPU_PROCESS_STATS_ENABLED.load(Ordering::Relaxed)
+        || NPU_PROCESS_STATS_ENABLED.load(Ordering::Relaxed)
+}
+
 /// Adapter classification from D3DKMT_ADAPTERTYPE flags. Software renderers
 /// (bit 2, e.g. Microsoft Basic Render Driver) are excluded outright; MCDM
 /// compute-only adapters (bit 11) are NPUs; anything else render-capable

@@ -309,6 +309,11 @@ struct EnrichedProcessData {
     pid: u32,
     shared_mem: u64,
     efficiency_mode: bool,
+    /// True only when efficiency_mode was freshly queried this pass (handle opened
+    /// and GetProcessInformation ran). When false the value came from cache, so the
+    /// cache's TTL timestamp must NOT be bumped — otherwise it never expires and the
+    /// indicator freezes at its first-seen value for any continuously-visible process.
+    efficiency_fresh: bool,
     is_elevated: bool,
     arch: ProcessArch,
     user: Option<String>,
@@ -349,6 +354,7 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                     pid,
                     shared_mem: 0,
                     efficiency_mode: false,
+                    efficiency_fresh: false,
                     is_elevated: pid == 4,  // System process is elevated
                     arch: ProcessArch::Native,
                     user: Some(SYSTEM_STR.to_string()),
@@ -405,6 +411,7 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                     pid,
                     shared_mem: 0,
                     efficiency_mode,
+                    efficiency_fresh: false, // served from cache (no handle)
                     is_elevated,
                     arch,
                     user,
@@ -570,6 +577,8 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                 pid,
                 shared_mem,
                 efficiency_mode,
+                // Fresh only when we actually opened a handle and queried it.
+                efficiency_fresh: need_efficiency && handle.is_some(),
                 is_elevated,
                 arch,
                 user,
@@ -594,8 +603,13 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                 entry.is_elevated = Some(data.is_elevated);
                 entry.arch = Some(data.arch);
                 entry.exe_path = Some(data.exe_path.clone());
-                entry.efficiency_mode = Some(data.efficiency_mode);
-                entry.efficiency_updated = Some(std::time::Instant::now());
+                // Only refresh the efficiency TTL when it was actually re-queried;
+                // bumping it on cache-served values would keep the 30s TTL from ever
+                // expiring, freezing the indicator for continuously-visible rows.
+                if data.efficiency_fresh {
+                    entry.efficiency_mode = Some(data.efficiency_mode);
+                    entry.efficiency_updated = Some(std::time::Instant::now());
+                }
             }
         });
     }
