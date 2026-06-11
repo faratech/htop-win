@@ -17,6 +17,26 @@ fn handle_scroll_keys(scroll: &mut usize, key: KeyCode) -> bool {
     }
 }
 
+/// Move a bounded selection index for list/menu dialogs. Returns true if the
+/// key was a navigation key. Never closes the dialog — stray keys return false
+/// so each handler's own arms (or nothing) deal with them. This gives every
+/// list dialog identical Up/Down/j/k/PgUp/PgDn/Home/End behavior.
+fn handle_list_nav(selected: &mut usize, len: usize, key: KeyCode) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let last = len - 1;
+    match key {
+        KeyCode::Up | KeyCode::Char('k') => { *selected = selected.saturating_sub(1); true }
+        KeyCode::Down | KeyCode::Char('j') => { *selected = (*selected + 1).min(last); true }
+        KeyCode::PageUp => { *selected = selected.saturating_sub(10); true }
+        KeyCode::PageDown => { *selected = (*selected + 10).min(last); true }
+        KeyCode::Home => { *selected = 0; true }
+        KeyCode::End => { *selected = last; true }
+        _ => false,
+    }
+}
+
 /// Handle keyboard events. Returns true if the app should quit.
 pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     // Only handle key press events, ignore release and repeat
@@ -288,13 +308,10 @@ fn handle_help_keys(app: &mut App, key: KeyEvent) -> bool {
             app.dialog = DialogState::None;
         }
         other => {
-            let handled = if let DialogState::Help { ref mut scroll } = app.dialog {
-                handle_scroll_keys(scroll, other)
-            } else {
-                false
-            };
-            if !handled {
-                app.dialog = DialogState::None;
+            // Scroll on nav keys; ignore any other stray key (previously a
+            // stray key closed Help, unlike the other scrollable dialogs).
+            if let DialogState::Help { ref mut scroll } = app.dialog {
+                handle_scroll_keys(scroll, other);
             }
         }
     }
@@ -398,29 +415,11 @@ fn handle_sort_select_keys(app: &mut App, key: KeyEvent) -> bool {
                 }
             app.dialog = DialogState::None;
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if let DialogState::SortSelect { ref mut index } = app.dialog
-                && *index > 0 {
-                    *index -= 1;
-                }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if let DialogState::SortSelect { ref mut index } = app.dialog
-                && *index < columns.len() - 1 {
-                    *index += 1;
-                }
-        }
-        KeyCode::Home => {
+        other => {
             if let DialogState::SortSelect { ref mut index } = app.dialog {
-                *index = 0;
+                handle_list_nav(index, columns.len(), other);
             }
         }
-        KeyCode::End => {
-            if let DialogState::SortSelect { ref mut index } = app.dialog {
-                *index = columns.len() - 1;
-            }
-        }
-        _ => {}
     }
     false
 }
@@ -489,20 +488,6 @@ fn handle_priority_keys(app: &mut App, key: KeyEvent) -> bool {
             }
             app.dialog = DialogState::None;
         }
-        // Up = move up in list (lower index)
-        KeyCode::Up => {
-            if let DialogState::Priority { ref mut class_index, .. } = app.dialog
-                && *class_index > 0 {
-                    *class_index -= 1;
-                }
-        }
-        // Down = move down in list (higher index)
-        KeyCode::Down => {
-            if let DialogState::Priority { ref mut class_index, .. } = app.dialog
-                && *class_index < max_index {
-                    *class_index += 1;
-                }
-        }
         // Right = increase priority (higher index)
         KeyCode::Right => {
             if let DialogState::Priority { ref mut class_index, .. } = app.dialog
@@ -521,7 +506,12 @@ fn handle_priority_keys(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('e') | KeyCode::Char('E') => {
             app.toggle_efficiency_mode();
         }
-        _ => {}
+        // Up/Down/j/k/PgUp/PgDn/Home/End select a priority class.
+        other => {
+            if let DialogState::Priority { ref mut class_index, .. } = app.dialog {
+                handle_list_nav(class_index, max_index + 1, other);
+            }
+        }
     }
     false
 }
@@ -559,19 +549,6 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Esc | KeyCode::F(2) => {
             app.save_config();
             app.dialog = DialogState::None;
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if let DialogState::Setup { ref mut selected } = app.dialog
-                && *selected > 0 {
-                    *selected -= 1;
-                }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if let DialogState::Setup { ref mut selected } = app.dialog
-                && *selected < 14 {
-                    // Number of setup items - 1
-                    *selected += 1;
-                }
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             // Toggle selected setting or open submenu
@@ -723,7 +700,12 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                 _ => {}
             }
         }
-        _ => {}
+        // Up/Down/j/k/PgUp/PgDn/Home/End move the selection (15 setup items).
+        other => {
+            if let DialogState::Setup { ref mut selected } = app.dialog {
+                handle_list_nav(selected, 15, other);
+            }
+        }
     }
     false
 }
@@ -763,19 +745,11 @@ fn handle_signal_select_keys(app: &mut App, key: KeyEvent) -> bool {
             }
             app.dialog = DialogState::None;
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if let DialogState::SignalSelect { ref mut index, .. } = app.dialog
-                && *index > 0 {
-                    *index -= 1;
-                }
+        other => {
+            if let DialogState::SignalSelect { ref mut index, .. } = app.dialog {
+                handle_list_nav(index, signal_count(), other);
+            }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if let DialogState::SignalSelect { ref mut index, .. } = app.dialog
-                && *index < signal_count() - 1 {
-                    *index += 1;
-                }
-        }
-        _ => {}
     }
     false
 }
@@ -797,19 +771,12 @@ fn handle_user_select_keys(app: &mut App, key: KeyEvent) -> bool {
             app.needs_process_update = true;
             app.dialog = DialogState::None;
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if let DialogState::UserSelect { ref mut index, .. } = app.dialog
-                && *index > 0 {
-                    *index -= 1;
-                }
+        other => {
+            // List length is users + 1 for the "[All users]" row.
+            if let DialogState::UserSelect { ref mut index, ref users } = app.dialog {
+                handle_list_nav(index, users.len() + 1, other);
+            }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if let DialogState::UserSelect { ref mut index, ref users } = app.dialog
-                && *index < users.len() {
-                    *index += 1;
-                }
-        }
-        _ => {}
     }
     false
 }
@@ -845,19 +812,11 @@ fn handle_color_scheme_keys(app: &mut App, key: KeyEvent) -> bool {
                 }
             app.dialog = DialogState::Setup { selected: 12 };
         }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if let DialogState::ColorScheme { ref mut index } = app.dialog
-                && *index > 0 {
-                    *index -= 1;
-                }
+        other => {
+            if let DialogState::ColorScheme { ref mut index } = app.dialog {
+                handle_list_nav(index, schemes.len(), other);
+            }
         }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if let DialogState::ColorScheme { ref mut index } = app.dialog
-                && *index < schemes.len() - 1 {
-                    *index += 1;
-                }
-        }
-        _ => {}
     }
     false
 }
@@ -929,7 +888,14 @@ fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
                     app.save_config();
                 }
         }
-        _ => {}
+        // Home/End/PgUp/PgDn (Up/Down/j/k are handled above with Shift-reorder).
+        // The two trailing footer rows aren't selectable, so the navigable
+        // length is just the column count.
+        other => {
+            if let DialogState::ColumnConfig { ref mut index } = app.dialog {
+                handle_list_nav(index, all_columns.len(), other);
+            }
+        }
     }
     false
 }
@@ -941,18 +907,6 @@ fn handle_affinity_keys(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             app.dialog = DialogState::None;
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if let DialogState::Affinity { ref mut selected, .. } = app.dialog
-                && *selected > 0 {
-                    *selected -= 1;
-                }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if let DialogState::Affinity { ref mut selected, .. } = app.dialog
-                && *selected < cpu_count.saturating_sub(1) {
-                    *selected += 1;
-                }
         }
         KeyCode::Char(' ') => {
             // Toggle CPU in affinity mask
@@ -978,7 +932,12 @@ fn handle_affinity_keys(app: &mut App, key: KeyEvent) -> bool {
                 *mask = 0;
             }
         }
-        _ => {}
+        // Up/Down/j/k/PgUp/PgDn/Home/End move the CPU selection.
+        other => {
+            if let DialogState::Affinity { ref mut selected, .. } = app.dialog {
+                handle_list_nav(selected, cpu_count, other);
+            }
+        }
     }
     false
 }
@@ -996,60 +955,7 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            // Handle dialogs specially
-            if is_in_dialog {
-                if matches!(app.dialog, DialogState::Kill { .. }) {
-                    // Kill dialog: left-click confirms the kill
-                    if !app.tagged_pids.is_empty() {
-                        app.kill_tagged(15);
-                    } else {
-                        app.kill_target_process(15);
-                    }
-                    app.dialog = DialogState::None;
-                    return;
-                } else if let DialogState::SignalSelect { index, .. } = app.dialog {
-                    // SignalSelect: left-click confirms
-                    let signal = crate::ui::dialogs::get_signal_by_index(index);
-                    if !app.tagged_pids.is_empty() {
-                        app.kill_tagged(signal);
-                    } else {
-                        app.kill_target_process(signal);
-                    }
-                    app.dialog = DialogState::None;
-                    return;
-                } else if matches!(app.dialog, DialogState::Setup { .. }) {
-                    // Setup dialog: click to select item
-                    // Get terminal size and calculate dialog area (60% width/height centered)
-                    if let Ok((term_width, term_height)) = crossterm::terminal::size() {
-                        let dialog_width = term_width * 60 / 100;
-                        let dialog_height = term_height * 60 / 100;
-                        let dialog_x = (term_width.saturating_sub(dialog_width)) / 2;
-                        let dialog_y = (term_height.saturating_sub(dialog_height)) / 2;
-
-                        // Check if click is inside dialog (accounting for border)
-                        if x > dialog_x && x < dialog_x + dialog_width - 1 &&
-                           y > dialog_y && y < dialog_y + dialog_height - 1 {
-                            // Calculate which item was clicked (y - dialog_y - 1 for border)
-                            let item_index = (y.saturating_sub(dialog_y).saturating_sub(1)) as usize;
-                            let num_items = 14; // Setup has 14 items
-                            if item_index < num_items
-                                && let DialogState::Setup { ref mut selected } = app.dialog {
-                                    *selected = item_index;
-                                }
-                            return;
-                        }
-                    }
-                    // Click outside dialog closes it
-                    app.dialog = DialogState::None;
-                    return;
-                } else {
-                    // Other dialogs: close on click outside, or handle click inside
-                    app.dialog = DialogState::None;
-                    return;
-                }
-            }
-
-            // Check for double-click
+            // Double-click detection (shared by the dialog and main-screen paths).
             let now = Instant::now();
             let is_double_click = if let (Some(last_pos), Some(last_time)) =
                 (app.last_click_pos, app.last_click_time)
@@ -1064,11 +970,19 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
             // Update click tracking
             app.last_click_pos = Some((x, y));
             app.last_click_time = Some(now);
-
-            let action = if is_double_click {
-                // Clear for next potential double-click sequence
+            if is_double_click {
+                // Clear for the next potential double-click sequence
                 app.last_click_pos = None;
                 app.last_click_time = None;
+            }
+
+            // Dialogs route through the unified click handler.
+            if is_in_dialog {
+                handle_dialog_click(app, x, y, is_double_click);
+                return;
+            }
+
+            let action = if is_double_click {
                 UIAction::DoubleClick
             } else {
                 UIAction::Click
@@ -1089,19 +1003,9 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
         }
         MouseEventKind::ScrollUp => {
             if is_in_dialog {
-                match &mut app.dialog {
-                    DialogState::Help { scroll }
-                    | DialogState::Environment { scroll, .. }
-                    | DialogState::CommandWrap { scroll, .. }
-                    | DialogState::ProcessInfo { scroll, .. } => {
-                        *scroll = scroll.saturating_sub(3);
-                    }
-                    DialogState::SortSelect { index }
-                    | DialogState::UserSelect { index, .. }
-                    | DialogState::SignalSelect { index, .. } => {
-                        *index = index.saturating_sub(3);
-                    }
-                    _ => {}
+                // Scroll a text dialog, otherwise move a list dialog's selection.
+                if !scroll_dialog_content(app, true) {
+                    move_dialog_selection(app, false);
                 }
             } else {
                 app.select_up();
@@ -1111,28 +1015,8 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
         }
         MouseEventKind::ScrollDown => {
             if is_in_dialog {
-                match &mut app.dialog {
-                    DialogState::Help { scroll }
-                    | DialogState::Environment { scroll, .. }
-                    | DialogState::CommandWrap { scroll, .. }
-                    | DialogState::ProcessInfo { scroll, .. } => {
-                        // Clamped to content length at render time
-                        *scroll = scroll.saturating_add(3);
-                    }
-                    DialogState::SortSelect { index } => {
-                        let max = SortColumn::all().len().saturating_sub(1);
-                        *index = (*index + 3).min(max);
-                    }
-                    DialogState::UserSelect { index, users } => {
-                        let max = users.len();
-                        *index = (*index + 3).min(max);
-                    }
-                    DialogState::SignalSelect { index, .. } => {
-                        use crate::ui::dialogs::signal_count;
-                        let max = signal_count().saturating_sub(1);
-                        *index = (*index + 3).min(max);
-                    }
-                    _ => {}
+                if !scroll_dialog_content(app, false) {
+                    move_dialog_selection(app, true);
                 }
             } else {
                 app.select_down();
@@ -1141,6 +1025,150 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
             }
         }
         _ => {}
+    }
+}
+
+/// True if `(x, y)` lies within `r` (inclusive of its top-left, exclusive of
+/// its bottom-right edge).
+fn rect_contains(r: crate::terminal::Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
+}
+
+/// The number of navigable (selectable) rows in the active list dialog, or 0
+/// for dialogs without a selection. Excludes pinned header/footer rows.
+fn dialog_nav_len(app: &App) -> usize {
+    match &app.dialog {
+        DialogState::SortSelect { .. } | DialogState::ColumnConfig { .. } => SortColumn::all().len(),
+        DialogState::Setup { .. } => 15,
+        DialogState::Priority { .. } => crate::app::WindowsPriorityClass::all().len(),
+        DialogState::UserSelect { users, .. } => users.len() + 1,
+        DialogState::ColorScheme { .. } => crate::ui::colors::ColorScheme::all().len(),
+        DialogState::SignalSelect { .. } => crate::ui::dialogs::signal_count(),
+        DialogState::Affinity { .. } => app.system_metrics.cpu.core_usage.len(),
+        _ => 0,
+    }
+}
+
+/// Mutable handle to the active list dialog's selection field, regardless of
+/// whether the variant names it `index`, `selected`, or `class_index`.
+fn dialog_selection_mut(dialog: &mut DialogState) -> Option<&mut usize> {
+    match dialog {
+        DialogState::SortSelect { index }
+        | DialogState::ColorScheme { index }
+        | DialogState::ColumnConfig { index }
+        | DialogState::SignalSelect { index, .. }
+        | DialogState::UserSelect { index, .. } => Some(index),
+        DialogState::Setup { selected } | DialogState::Affinity { selected, .. } => Some(selected),
+        DialogState::Priority { class_index, .. } => Some(class_index),
+        _ => None,
+    }
+}
+
+/// Scroll a text/content dialog by 3 lines. Returns true if the active dialog
+/// was a scrollable text dialog (so the caller can fall back to list selection).
+fn scroll_dialog_content(app: &mut App, up: bool) -> bool {
+    match &mut app.dialog {
+        DialogState::Help { scroll }
+        | DialogState::Environment { scroll, .. }
+        | DialogState::CommandWrap { scroll, .. }
+        | DialogState::ProcessInfo { scroll, .. } => {
+            // Clamped to content length at render time.
+            *scroll = if up { scroll.saturating_sub(3) } else { scroll.saturating_add(3) };
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Move the active list dialog's selection by 3, clamped to its navigable range.
+fn move_dialog_selection(app: &mut App, down: bool) {
+    let last = dialog_nav_len(app).saturating_sub(1);
+    if let Some(sel) = dialog_selection_mut(&mut app.dialog) {
+        *sel = if down { (*sel + 3).min(last) } else { sel.saturating_sub(3) };
+    }
+}
+
+/// Unified left-click handling for any open dialog. Confirmation dialogs keep
+/// their click-to-confirm behavior; otherwise a click outside the dialog closes
+/// it, a click on the border is ignored, and a click on a selectable list row
+/// selects it (a double-click also activates it, as if Enter were pressed).
+fn handle_dialog_click(app: &mut App, x: u16, y: u16, double: bool) {
+    // Confirmation-style dialogs: a click anywhere confirms (legacy behavior).
+    match app.dialog {
+        DialogState::Kill { .. } => {
+            if !app.tagged_pids.is_empty() {
+                app.kill_tagged(15);
+            } else {
+                app.kill_target_process(15);
+            }
+            app.dialog = DialogState::None;
+            return;
+        }
+        DialogState::SignalSelect { index, .. } => {
+            let signal = crate::ui::dialogs::get_signal_by_index(index);
+            if !app.tagged_pids.is_empty() {
+                app.kill_tagged(signal);
+            } else {
+                app.kill_target_process(signal);
+            }
+            app.dialog = DialogState::None;
+            return;
+        }
+        _ => {}
+    }
+
+    // A click outside the dialog closes it; without cached geometry, fail safe
+    // by closing rather than guessing.
+    let Some(area) = app.dialog_area else {
+        app.dialog = DialogState::None;
+        return;
+    };
+    if !rect_contains(area, x, y) {
+        app.dialog = DialogState::None;
+        return;
+    }
+
+    // Inside the border but on it (or on a content/scrollable dialog): do nothing.
+    let Some(inner) = app.dialog_inner else { return; };
+    if !rect_contains(inner, x, y) {
+        return;
+    }
+
+    // Map the clicked row to a selectable item. Header rows (above) and footer
+    // rows (below the visible selectable rows) aren't selectable.
+    let row = (y - inner.y) as usize;
+    if row < app.dialog_header_rows {
+        return;
+    }
+    let scroll_row = row - app.dialog_header_rows;
+    if scroll_row >= app.dialog_scroll_rows {
+        return;
+    }
+    let nav_value = app.dialog_list_offset + scroll_row;
+
+    if !select_dialog_row(app, nav_value) {
+        return; // clicked a blank/footer row — no selectable item there
+    }
+
+    // Single click selects only; double-click also activates (like Enter).
+    if double {
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+        let _ = handle_key_event(app, enter);
+    }
+}
+
+/// Set the active list dialog's selection to `nav_value` if it is within the
+/// navigable range. Returns true if a selectable row was set.
+fn select_dialog_row(app: &mut App, nav_value: usize) -> bool {
+    let len = dialog_nav_len(app);
+    if nav_value >= len {
+        return false;
+    }
+    if let Some(sel) = dialog_selection_mut(&mut app.dialog) {
+        *sel = nav_value;
+        true
+    } else {
+        false
     }
 }
 

@@ -117,12 +117,105 @@ fn render_scrollable_dialog(
             1,
             area.height.saturating_sub(2),
         );
-        let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_lines))
+        let mut scrollbar_state = ScrollbarState::new(total_lines)
+            .viewport_content_length(visible_lines)
             .position(*scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
             .style(Style::default().fg(Color::DarkGray));
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
+}
+
+/// Cache a dialog's geometry on `app` for the mouse handler. Text/content
+/// dialogs have no selectable rows, so the list offset/header rows are zeroed.
+fn cache_dialog_geometry(app: &mut App, area: Rect) {
+    app.dialog_area = Some(area);
+    app.dialog_inner = Some(area.inner(1));
+    app.dialog_list_offset = 0;
+    app.dialog_header_rows = 0;
+}
+
+/// Render a selectable list dialog with a unified scroll model:
+/// `header_rows` leading items pinned to the top, a scrollable middle region
+/// that auto-scrolls to keep `selected` visible, and `footer_rows` trailing
+/// items pinned to the bottom. A scrollbar is drawn beside the middle region
+/// only when it overflows. `selected` is an index into `items` within the
+/// scrollable range (`header_rows ..= items.len()-footer_rows-1`). The drawn
+/// geometry (area, inner rect, scroll offset, header rows) is cached on `app`
+/// so the mouse handler can map a click back to the item under it.
+#[allow(clippy::too_many_arguments)]
+fn render_list_dialog(
+    frame: &mut Frame,
+    app: &mut App,
+    area: Rect,
+    block: Block,
+    style: Style,
+    items: Vec<ListItem>,
+    selected: usize,
+    header_rows: usize,
+    footer_rows: usize,
+) {
+    let inner = area.inner(1);
+    let inner_height = inner.height as usize;
+    let total = items.len();
+    let pinned = header_rows + footer_rows;
+
+    // Rows available to the scrollable middle region, and how many items it holds.
+    let scroll_height = inner_height.saturating_sub(pinned);
+    let scrollable_len = total.saturating_sub(pinned);
+
+    // Derive the offset that keeps `selected` visible. Anchored so the selection
+    // sits at the bottom of the region once scrolled past the first page; this is
+    // a pure function of selection + sizes, so no offset needs to be stored.
+    let sel_in_scroll = selected.saturating_sub(header_rows).min(scrollable_len.saturating_sub(1));
+    let max_offset = scrollable_len.saturating_sub(scroll_height);
+    let offset = if scroll_height == 0 || sel_in_scroll < scroll_height {
+        0
+    } else {
+        (sel_in_scroll - scroll_height + 1).min(max_offset)
+    };
+
+    let footer_start = total.saturating_sub(footer_rows);
+    let scroll_start = header_rows + offset;
+    let scroll_end = scroll_start + scroll_height;
+
+    // Collect the visible items in order: header, scrolled middle, footer.
+    let visible: Vec<ListItem> = items
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, item)| {
+            let keep = i < header_rows
+                || i >= footer_start
+                || (i >= scroll_start && i < scroll_end);
+            keep.then_some(item)
+        })
+        .collect();
+
+    let list = List::new(visible).block(block).style(style);
+    frame.render_widget(Clear, area);
+    frame.render_widget(list, area);
+
+    // Scrollbar beside the middle region only when it overflows.
+    if scrollable_len > scroll_height && scroll_height > 0 {
+        let scrollbar_area = Rect::new(
+            area.x + area.width - 1,
+            inner.y + header_rows as u16,
+            1,
+            scroll_height as u16,
+        );
+        let mut scrollbar_state = ScrollbarState::new(scrollable_len)
+            .viewport_content_length(scroll_height)
+            .position(offset);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .style(Style::default().fg(Color::DarkGray));
+        frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
+    }
+
+    app.dialog_area = Some(area);
+    app.dialog_inner = Some(inner);
+    app.dialog_list_offset = offset;
+    app.dialog_header_rows = header_rows;
+    app.dialog_scroll_rows = scroll_height.min(scrollable_len);
 }
 
 /// Windows signal names and values
@@ -237,7 +330,8 @@ pub fn draw_help(frame: &mut Frame, app: &mut App) {
         "    Click meter        Cycle meter mode (Bar/Text/Graph/Hidden)",
         "    Click F-key        Trigger function key action",
         "    Scroll             Scroll process list (or dialog content)",
-        "    Click in dialog    Close dialog",
+        "    Click dialog row   Select item (double-click to activate)",
+        "    Click outside      Close dialog",
         "",
         "  ─────────────────────────────────────────────────────────────",
         "  COMMAND LINE OPTIONS",
@@ -279,12 +373,13 @@ pub fn draw_help(frame: &mut Frame, app: &mut App) {
         lines,
         scroll,
     );
+    cache_dialog_geometry(app, area);
 }
 
 /// Draw search dialog
-pub fn draw_search(frame: &mut Frame, app: &App) {
+pub fn draw_search(frame: &mut Frame, app: &mut App) {
     let (buffer, cursor) = match app.dialog.input_buffer() {
-        Some((b, c)) => (b, c),
+        Some((b, c)) => (b.to_string(), c),
         None => return,
     };
     let area = centered_rect_fixed(50, 3, frame.area());
@@ -303,12 +398,13 @@ pub fn draw_search(frame: &mut Frame, app: &App) {
 
     // Set cursor position
     frame.set_cursor_position((area.x + 1 + cursor as u16 + 1, area.y + 1));
+    cache_dialog_geometry(app, area);
 }
 
 /// Draw filter dialog
-pub fn draw_filter(frame: &mut Frame, app: &App) {
+pub fn draw_filter(frame: &mut Frame, app: &mut App) {
     let (buffer, cursor) = match app.dialog.input_buffer() {
-        Some((b, c)) => (b, c),
+        Some((b, c)) => (b.to_string(), c),
         None => return,
     };
     let area = centered_rect_fixed(50, 3, frame.area());
@@ -327,11 +423,13 @@ pub fn draw_filter(frame: &mut Frame, app: &App) {
 
     // Set cursor position
     frame.set_cursor_position((area.x + 9 + cursor as u16, area.y + 1));
+    cache_dialog_geometry(app, area);
 }
 
 /// Draw sort selection dialog
-pub fn draw_sort_select(frame: &mut Frame, app: &App) {
+pub fn draw_sort_select(frame: &mut Frame, app: &mut App) {
     let DialogState::SortSelect { index } = &app.dialog else { return; };
+    let index = *index;
     let theme = &app.theme;
     let columns = SortColumn::all();
     let area = centered_rect_fixed(30, (columns.len() + 2) as u16, frame.area());
@@ -347,7 +445,7 @@ pub fn draw_sort_select(frame: &mut Frame, app: &App) {
             };
 
             ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:<12}{}", col.name(), indicator), item_style(idx == *index, theme)),
+                Span::styled(format!(" {:<12}{}", col.name(), indicator), item_style(idx == index, theme)),
             ]))
         })
         .collect();
@@ -358,16 +456,12 @@ pub fn draw_sort_select(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Green))
         .style(Style::default().bg(theme.background));
 
-    let list = List::new(items)
-        .block(block)
-        .style(Style::default().fg(theme.text).bg(theme.background));
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(list, area);
+    let style = Style::default().fg(theme.text).bg(theme.background);
+    render_list_dialog(frame, app, area, block, style, items, index, 0, 0);
 }
 
 /// Draw kill confirmation dialog
-pub fn draw_kill_confirm(frame: &mut Frame, app: &App) {
+pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
     let DialogState::Kill { pid, name, command } = &app.dialog else { return; };
     let tagged_count = app.tagged_pids.len();
 
@@ -452,33 +546,36 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, area);
     frame.render_widget(dialog, area);
+    cache_dialog_geometry(app, area);
 }
 
 /// Draw priority class dialog
-pub fn draw_priority(frame: &mut Frame, app: &App) {
+pub fn draw_priority(frame: &mut Frame, app: &mut App) {
     use crate::app::WindowsPriorityClass;
 
     let DialogState::Priority { class_index, pid, name, .. } = &app.dialog else { return; };
+    let class_index = *class_index;
+    let pid = *pid;
+    let process_info = format!("PID: {} - {}", pid, name);
     let classes = WindowsPriorityClass::all();
     let area = centered_rect_fixed(55, (classes.len() + 8) as u16, frame.area());
-    let theme = &app.theme;
-
-    let process_info = format!("PID: {} - {}", pid, name);
 
     // Read efficiency state from the captured pid (not the live selection): a
     // background re-sort can move a different process under the cursor while the
     // dialog is open, which would otherwise display a mismatched flag.
-    let efficiency_mode = app.process_by_pid(*pid)
+    let efficiency_mode = app.process_by_pid(pid)
         .map(|p| p.efficiency_mode)
         .unwrap_or(false);
+
+    let theme = &app.theme;
 
     // Build list of priority classes with base priority values
     let mut items: Vec<ListItem> = classes
         .iter()
         .enumerate()
         .map(|(idx, class)| {
-            let indicator = if idx == *class_index { "▶ " } else { "  " };
-            let style = if idx == *class_index {
+            let indicator = if idx == class_index { "▶ " } else { "  " };
+            let style = if idx == class_index {
                 selected_style(theme)
             } else {
                 normal_style(theme)
@@ -490,7 +587,8 @@ pub fn draw_priority(frame: &mut Frame, app: &App) {
         })
         .collect();
 
-    // Add separator and efficiency mode option
+    // Add separator and efficiency mode option (rendered inline after the
+    // classes; they are not selectable, so they stay out of the scroll range).
     items.push(ListItem::new(Line::from("")));
     let efficiency_status = if efficiency_mode { "ON 🌿" } else { "OFF" };
     items.push(ListItem::new(Line::from(vec![
@@ -504,14 +602,10 @@ pub fn draw_priority(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Yellow))
         .style(Style::default().bg(theme.background));
 
-    let list = List::new(items)
-        .block(block)
-        .style(Style::default().fg(theme.text).bg(theme.background));
+    let style = Style::default().fg(theme.text).bg(theme.background);
+    render_list_dialog(frame, app, area, block, style, items, class_index, 0, 0);
 
-    frame.render_widget(Clear, area);
-    frame.render_widget(list, area);
-
-    // Draw footer hint
+    // Draw footer hint on the dialog's bottom inner row.
     let hint_area = Rect::new(area.x + 1, area.y + area.height - 2, area.width - 2, 1);
     let hint = Paragraph::new("↑↓ select, E efficiency, Enter apply, Esc cancel")
         .style(Style::default().fg(Color::DarkGray));
@@ -519,8 +613,9 @@ pub fn draw_priority(frame: &mut Frame, app: &App) {
 }
 
 /// Draw setup menu
-pub fn draw_setup(frame: &mut Frame, app: &App) {
+pub fn draw_setup(frame: &mut Frame, app: &mut App) {
     let DialogState::Setup { selected } = &app.dialog else { return; };
+    let selected = *selected;
     let theme = &app.theme;
     let area = centered_rect(60, 60, frame.area());
 
@@ -548,7 +643,7 @@ pub fn draw_setup(frame: &mut Frame, app: &App) {
         .enumerate()
         .map(|(idx, (label, value))| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:<30} ", label), item_style(idx == *selected, theme)),
+                Span::styled(format!(" {:<30} ", label), item_style(idx == selected, theme)),
                 Span::styled(value.to_string(), Style::default().fg(Color::Green)),
             ]))
         })
@@ -560,12 +655,8 @@ pub fn draw_setup(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Cyan))
         .style(Style::default().bg(theme.background));
 
-    let list = List::new(items)
-        .block(block)
-        .style(Style::default().fg(theme.text).bg(theme.background));
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(list, area);
+    let style = Style::default().fg(theme.text).bg(theme.background);
+    render_list_dialog(frame, app, area, block, style, items, selected, 0, 0);
 }
 
 fn bool_to_str(val: bool) -> String {
@@ -712,6 +803,7 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
         lines,
         scroll,
     );
+    cache_dialog_geometry(app, area);
 }
 
 /// Draw error message
@@ -756,8 +848,10 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 }
 
 /// Draw signal selection dialog
-pub fn draw_signal_select(frame: &mut Frame, app: &App) {
+pub fn draw_signal_select(frame: &mut Frame, app: &mut App) {
     let DialogState::SignalSelect { index, pid, name, .. } = &app.dialog else { return; };
+    let index = *index;
+    let title = format!(" Send Signal to {} ({}) ", name, pid);
     let theme = &app.theme;
     let area = centered_rect_fixed(40, (SIGNALS.len() + 4) as u16, frame.area());
 
@@ -765,7 +859,7 @@ pub fn draw_signal_select(frame: &mut Frame, app: &App) {
         .iter()
         .enumerate()
         .map(|(idx, (num, sig_name, desc))| {
-            let style = item_style(idx == *index, theme);
+            let style = item_style(idx == index, theme);
             ListItem::new(Line::from(vec![
                 Span::styled(format!(" {:2} ", num), style),
                 Span::styled(format!("{:<10}", sig_name), style),
@@ -774,25 +868,20 @@ pub fn draw_signal_select(frame: &mut Frame, app: &App) {
         })
         .collect();
 
-    let title = format!(" Send Signal to {} ({}) ", name, pid);
-
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Red))
         .style(Style::default().bg(theme.background));
 
-    let list = List::new(items)
-        .block(block)
-        .style(Style::default().fg(theme.text).bg(theme.background));
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(list, area);
+    let style = Style::default().fg(theme.text).bg(theme.background);
+    render_list_dialog(frame, app, area, block, style, items, index, 0, 0);
 }
 
 /// Draw user selection dialog
-pub fn draw_user_select(frame: &mut Frame, app: &App) {
+pub fn draw_user_select(frame: &mut Frame, app: &mut App) {
     let DialogState::UserSelect { index, users } = &app.dialog else { return; };
+    let index = *index;
     let theme = &app.theme;
     let num_items = users.len() + 1; // +1 for "All users"
     let area = centered_rect_fixed(35, (num_items + 2).min(20) as u16, frame.area());
@@ -802,14 +891,14 @@ pub fn draw_user_select(frame: &mut Frame, app: &App) {
     // "All users" option
     items.push(ListItem::new(Line::from(Span::styled(
         " [All users]",
-        item_style(*index == 0, theme),
+        item_style(index == 0, theme),
     ))));
 
     // Individual users
     for (idx, user) in users.iter().enumerate() {
         items.push(ListItem::new(Line::from(Span::styled(
             format!(" {}", user),
-            item_style(idx + 1 == *index, theme),
+            item_style(idx + 1 == index, theme),
         ))));
     }
 
@@ -819,12 +908,8 @@ pub fn draw_user_select(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Yellow))
         .style(Style::default().bg(theme.background));
 
-    let list = List::new(items)
-        .block(block)
-        .style(Style::default().fg(theme.text).bg(theme.background));
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(list, area);
+    let style = Style::default().fg(theme.text).bg(theme.background);
+    render_list_dialog(frame, app, area, block, style, items, index, 0, 0);
 }
 
 /// Draw environment variables dialog
@@ -865,11 +950,13 @@ pub fn draw_environment(frame: &mut Frame, app: &mut App) {
         lines,
         scroll,
     );
+    cache_dialog_geometry(app, area);
 }
 
 /// Draw color scheme selection dialog
-pub fn draw_color_scheme(frame: &mut Frame, app: &App) {
+pub fn draw_color_scheme(frame: &mut Frame, app: &mut App) {
     let DialogState::ColorScheme { index } = &app.dialog else { return; };
+    let index = *index;
     let theme = &app.theme;
     let schemes = ColorScheme::all();
     let area = centered_rect_fixed(30, (schemes.len() + 2) as u16, frame.area());
@@ -880,7 +967,7 @@ pub fn draw_color_scheme(frame: &mut Frame, app: &App) {
         .map(|(idx, scheme)| {
             let indicator = if *scheme == app.config.color_scheme { " ●" } else { "  " };
             ListItem::new(Line::from(vec![
-                Span::styled(format!("{} {}", indicator, scheme.name()), item_style(idx == *index, theme)),
+                Span::styled(format!("{} {}", indicator, scheme.name()), item_style(idx == index, theme)),
             ]))
         })
         .collect();
@@ -891,12 +978,8 @@ pub fn draw_color_scheme(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Green))
         .style(Style::default().bg(theme.background));
 
-    let list = List::new(items)
-        .block(block)
-        .style(Style::default().fg(theme.text).bg(theme.background));
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(list, area);
+    let style = Style::default().fg(theme.text).bg(theme.background);
+    render_list_dialog(frame, app, area, block, style, items, index, 0, 0);
 }
 
 /// Get signal value by index
@@ -949,11 +1032,13 @@ pub fn draw_command_wrap(frame: &mut Frame, app: &mut App) {
         .border_style(Style::default().fg(Color::Cyan));
 
     render_scrollable_dialog(frame, area, block, Style::default(), lines, scroll);
+    cache_dialog_geometry(app, area);
 }
 
 /// Draw column configuration dialog
-pub fn draw_column_config(frame: &mut Frame, app: &App) {
+pub fn draw_column_config(frame: &mut Frame, app: &mut App) {
     let DialogState::ColumnConfig { index } = &app.dialog else { return; };
+    let index = *index;
     let theme = &app.theme;
     let columns = SortColumn::all();
     let area = centered_rect_fixed(50, (columns.len() + 4) as u16, frame.area());
@@ -971,7 +1056,7 @@ pub fn draw_column_config(frame: &mut Frame, app: &App) {
             } else {
                 "  ".to_string()
             };
-            let style = if idx == *index {
+            let style = if idx == index {
                 selected_style(theme)
             } else if is_visible {
                 Style::default().fg(Color::Green).bg(theme.background)
@@ -985,7 +1070,8 @@ pub fn draw_column_config(frame: &mut Frame, app: &App) {
         })
         .collect();
 
-    // Add help text at bottom
+    // Add help text at bottom (pinned as footer rows so it stays visible while
+    // the column list scrolls on short terminals).
     items.push(ListItem::new(Line::from("")));
     items.push(ListItem::new(Line::from(vec![
         Span::styled("Shift+↑↓ to reorder", Style::default().fg(Color::DarkGray)),
@@ -997,28 +1083,31 @@ pub fn draw_column_config(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Yellow))
         .style(Style::default().bg(theme.background));
 
-    let list = List::new(items)
-        .block(block)
-        .style(Style::default().fg(theme.text).bg(theme.background));
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(list, area);
+    let style = Style::default().fg(theme.text).bg(theme.background);
+    render_list_dialog(frame, app, area, block, style, items, index, 0, 2);
 }
 
 /// Draw CPU affinity dialog
-pub fn draw_affinity(frame: &mut Frame, app: &App) {
+pub fn draw_affinity(frame: &mut Frame, app: &mut App) {
     let DialogState::Affinity { mask, selected, pid } = &app.dialog else { return; };
-    let theme = &app.theme;
+    let mask = *mask;
+    let selected = *selected;
+    let pid = *pid;
     let cpu_count = app.system_metrics.cpu.core_usage.len();
     let height = (cpu_count + 4).min(20) as u16;
     let area = centered_rect_fixed(35, height, frame.area());
 
     // Display the captured target, matching the process apply_affinity() acts on.
     let proc_name = app
-        .process_by_pid(*pid)
+        .process_by_pid(pid)
         .map(|p| format!("{} (PID: {})", p.name, p.pid))
         .unwrap_or_else(|| "Unknown".to_string());
 
+    let theme = &app.theme;
+
+    // Rows 0 and 1 (process name + blank) are pinned header rows; the CPU rows
+    // that follow are the selectable region, so the navigable `selected` (a CPU
+    // index) maps to item index `selected + 2`.
     let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(vec![
         Span::styled(proc_name, Style::default().fg(theme.meter_label).bg(theme.background)),
     ]))];
@@ -1028,7 +1117,7 @@ pub fn draw_affinity(frame: &mut Frame, app: &App) {
     for cpu_idx in 0..cpu_count {
         let is_set = (mask & (1u64 << cpu_idx)) != 0;
         let checkbox = if is_set { "[✓]" } else { "[ ]" };
-        let style = if cpu_idx == *selected {
+        let style = if cpu_idx == selected {
             selected_style(theme)
         } else if is_set {
             Style::default().fg(Color::Green).bg(theme.background)
@@ -1047,12 +1136,8 @@ pub fn draw_affinity(frame: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Magenta))
         .style(Style::default().bg(theme.background));
 
-    let list = List::new(items)
-        .block(block)
-        .style(Style::default().fg(theme.text).bg(theme.background));
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(list, area);
+    let style = Style::default().fg(theme.text).bg(theme.background);
+    render_list_dialog(frame, app, area, block, style, items, selected + 2, 2, 0);
 }
 
 #[cfg(test)]

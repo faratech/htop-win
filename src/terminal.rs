@@ -1808,4 +1808,26 @@ mod tests {
         // ...and did not vanish into (or flood) the rest of the track.
         assert_ne!(buf.get(0, 0).unwrap().symbol, thumb);
     }
+
+    #[test]
+    fn test_scrollbar_thumb_proportional_to_viewport() {
+        // With a viewport covering 1/4 of the content, the thumb should be
+        // ~1/4 of the track and sit at the top when scrolled to position 0.
+        // Regression: dialogs that omit viewport_content_length collapse the
+        // thumb to a single cell regardless of how much content is visible.
+        let area = Rect::new(0, 0, 1, 12);
+        let mut buf = Buffer::empty(area);
+        let mut state = ScrollbarState::new(40)
+            .viewport_content_length(10)
+            .position(0);
+        Scrollbar::new(ScrollbarOrientation::VerticalRight).render(area, &mut buf, &mut state);
+
+        let thumb = "█";
+        let thumb_cells = (0..12).filter(|&y| buf.get(0, y).unwrap().symbol == thumb).count();
+        // 12 * 10 / 40 = 3 cells, not the degenerate 1-cell thumb.
+        assert_eq!(thumb_cells, 3);
+        // At position 0 the thumb starts at the top of the track.
+        assert_eq!(buf.get(0, 0).unwrap().symbol, thumb);
+        assert_ne!(buf.get(0, 11).unwrap().symbol, thumb);
+    }
 }

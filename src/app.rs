@@ -1,5 +1,6 @@
 use crate::config::Config;
 use crate::system::{ProcessInfo, SystemMetrics};
+use crate::terminal::Rect;
 use crate::ui::colors::Theme;
 use std::collections::{HashSet, VecDeque};
 use std::time::Instant;
@@ -643,6 +644,20 @@ pub struct App {
     /// UI layout bounds (populated during render for accurate mouse/keyboard navigation)
     pub ui_bounds: UIBounds,
 
+    // Cached dialog geometry (written during render, read by the mouse handler so
+    // hit-testing matches exactly what was drawn — mirrors the ui_bounds pattern).
+    /// Full dialog rect including its border.
+    pub dialog_area: Option<Rect>,
+    /// Inner content rect (inside the border).
+    pub dialog_inner: Option<Rect>,
+    /// Index of the first visible scrollable list item this frame.
+    pub dialog_list_offset: usize,
+    /// Non-selectable rows pinned to the top of a list dialog (for row→index mapping).
+    pub dialog_header_rows: usize,
+    /// Number of selectable list rows currently visible (excludes header/footer),
+    /// so a click below them (on a footer row) maps to no item.
+    pub dialog_scroll_rows: usize,
+
     // Mouse interaction state
     /// Last click position for double-click detection
     pub last_click_pos: Option<(u16, u16)>,
@@ -712,6 +727,11 @@ impl App {
             cached_visible_columns: visible_columns,
             needs_process_update: false,
             ui_bounds: UIBounds::default(),
+            dialog_area: None,
+            dialog_inner: None,
+            dialog_list_offset: 0,
+            dialog_header_rows: 0,
+            dialog_scroll_rows: 0,
             last_click_pos: None,
             last_click_time: None,
             double_click_ms: 500, // Standard double-click threshold

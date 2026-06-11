@@ -21,6 +21,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Clear UI regions from previous frame (they'll be repopulated during this render)
     app.ui_bounds.clear_regions();
 
+    // Reset cached dialog geometry; the active dialog's draw fn repopulates it.
+    app.dialog_area = None;
+    app.dialog_inner = None;
+    app.dialog_list_offset = 0;
+    app.dialog_header_rows = 0;
+    app.dialog_scroll_rows = 0;
+
     // Fill entire screen with theme background color
     let bg_block = Block::default().style(Style::default().bg(theme.background));
     frame.render_widget(bg_block, size);
