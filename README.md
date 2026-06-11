@@ -28,6 +28,7 @@ Windows Task Manager is fine, but power users deserve better. **htop-win** bring
 - **Tiny footprint** - ~500KB binary with minimal dependencies
 - **Full htop compatibility** - Same keyboard shortcuts you already know
 - **Windows-native features** - Efficiency Mode, CPU affinity, elevation detection
+- **GPU/NPU monitoring** - Task Manager parity via D3DKMT, auto-enabled when hardware exists
 - **Automatic updates** - Background update checks with one-command upgrades
 
 ---
@@ -37,17 +38,40 @@ Windows Task Manager is fine, but power users deserve better. **htop-win** bring
 ### Real-time System Monitoring
 - Per-core CPU usage with color-coded gradient bars (green → yellow → red)
 - Memory and swap usage visualization
-- System uptime and task count display
+- **GPU meter** - Total GPU utilization bar (shown automatically when a GPU is present)
+- **NPU meter** - NPU utilization bar (shown automatically on Copilot+ and AI PC hardware)
+- Network I/O rates (Rx/Tx)
+- Disk I/O rates (read/write)
+- Battery status and charge indicator
+- System uptime and task/thread counts
 - Configurable meter modes: Bar, Text, Graph, or Hidden
+- Responsive header: scales gracefully from narrow to ultrawide terminals
 
 ### Interactive Process Management
-- **18 sortable columns**: PID, CPU%, MEM%, TIME+, Command, User, and more
+- **27 sortable columns**: PID, CPU%, MEM%, GPU%, NPU%, I/O rate, TIME+, Command, and more
+- **Screen tabs**: Switch between the Main view and the dedicated I/O tab
 - **Tree view**: Visualize parent-child process relationships with collapsible branches
 - **Search & Filter**: Find processes instantly with live search
 - **Process tagging**: Select multiple processes for batch operations
 - **Kill processes**: Graceful termination or force kill
 - **Priority control**: Change process priority class (Idle → Realtime)
 - **CPU affinity**: Pin processes to specific CPU cores
+
+### GPU & NPU Monitoring (Task Manager Parity)
+- System-wide GPU utilization meter in the header
+- System-wide NPU utilization meter in the header (Copilot+ PCs)
+- Per-process **GPU%** and **GPU-MEM** columns
+- Per-process **NPU%** and **NPU-MEM** columns
+- Uses the D3DKMT statistics DDI — the same source as Task Manager
+- Automatically detected and enabled; hidden on machines without the hardware
+
+### I/O Tab
+A dedicated tab focused on disk I/O activity:
+- **IO_RATE** - Combined read + write rate per process
+- **IO_R/s** - Read rate
+- **IO_W/s** - Write rate
+- **HNDL** - Open handle count
+- Sorted by I/O rate by default
 
 ### Windows-Specific Features
 - **Efficiency Mode (EcoQoS)**: Reduce power consumption for background processes
@@ -62,10 +86,11 @@ Windows Task Manager is fine, but power users deserve better. **htop-win** bring
 - Click column headers to sort
 - Scroll wheel navigation
 - Click meters to cycle display modes
+- Click tabs to switch views
 
 ### Customization
 - **8 color themes**: Default, Monochrome, Light Terminal, Midnight, Nord, and more
-- **Configurable columns**: Show/hide and reorder any column
+- **Configurable columns**: Show/hide and reorder any column, saved per-tab
 - **Adjustable refresh rate**: 100ms to 5 seconds
 - **Persistent settings**: Configuration saved to `%APPDATA%\htop-win\config`
 
@@ -182,6 +207,7 @@ htop -p 1234,5678,9012
 | `Home` / `g` | Jump to first process |
 | `End` / `G` | Jump to last process |
 | `Tab` | Cycle focus: Header → Process List → Footer |
+| `1` / `2` | Switch to Main / I/O tab |
 
 ### Main Controls (Function Keys)
 
@@ -282,6 +308,8 @@ Access via Setup (`F2`) → Color Scheme:
 
 ## Columns Reference
 
+### Main Tab
+
 | Column | Description | Width |
 |--------|-------------|-------|
 | `PID` | Process ID | 7 |
@@ -296,12 +324,32 @@ Access via Setup (`F2`) → Color Scheme:
 | `S` | Status (R=Running, S=Sleeping) | 3 |
 | `CPU%` | CPU usage percentage | 6 |
 | `MEM%` | Memory usage percentage | 6 |
+| `GPU%` | GPU utilization % (max across all GPU engines) | 6 |
+| `GPU-MEM` | GPU committed memory across all adapters | 8 |
+| `NPU%` | NPU utilization % | 6 |
+| `NPU-MEM` | NPU dedicated + shared memory | 8 |
 | `TIME+` | Cumulative CPU time | 10 |
 | `START` | Process start time | 8 |
 | `Command` | Command line | Flexible |
 | `ELEV` | Elevated/Admin status | 4 |
 | `ARCH` | Architecture (x86/x64/ARM64) | 5 |
 | `ECO` | Efficiency Mode status | 4 |
+
+> GPU% / GPU-MEM and NPU% / NPU-MEM are automatically added to the default column set the first time htop-win detects the relevant hardware.
+
+### I/O Tab
+
+| Column | Description |
+|--------|-------------|
+| `PID` | Process ID |
+| `USER` | Process owner |
+| `IO_RATE` | Combined read + write rate (bytes/refresh) |
+| `IO_R/s` | Read rate |
+| `IO_W/s` | Write rate |
+| `IO_RD` | Cumulative bytes read |
+| `IO_WR` | Cumulative bytes written |
+| `HNDL` | Open handle count |
+| `Command` | Command line |
 
 ---
 
@@ -337,10 +385,9 @@ htop-win is designed for efficiency:
 - **~500KB binary** - Minimal dependencies, LTO optimization
 - **Efficiency Mode by default** - Runs with reduced CPU priority
 - **Smart caching** - Minimizes Windows API calls
+- **Background data collection** - System metrics refresh off the UI thread
 - **Diff-based rendering** - Only updates changed terminal cells
 - **Direct API access** - No abstraction layers
-
-Benchmark mode available: `htop --benchmark 100`
 
 ---
 
@@ -353,7 +400,9 @@ Benchmark mode available: `htop --benchmark 100`
 | Tree view | Yes | Yes | Yes |
 | Process search | Yes | Yes | Yes |
 | CPU affinity | Yes | Yes | Yes |
+| GPU/NPU monitoring | Yes | Yes | No |
 | Efficiency Mode | Yes | Yes | No |
+| I/O per-process | Yes | No | Yes |
 | Custom columns | Yes | Limited | Yes |
 | Color themes | 8 themes | No | No |
 | Binary size | ~500KB | N/A | ~2MB |
