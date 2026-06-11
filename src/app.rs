@@ -537,6 +537,8 @@ pub enum DialogState {
     UserSelect { index: usize, users: Vec<String> },
     Environment { scroll: usize, pid: u32 },
     ColorScheme { index: usize },
+    /// GPU adapter selector for the meter (index 0 = Auto, then `names`).
+    GpuSelect { index: usize, names: Vec<String> },
     CommandWrap { scroll: usize, pid: u32 },
     ColumnConfig { index: usize },
     Affinity { mask: u64, selected: usize, pid: u32 },
@@ -1164,6 +1166,9 @@ impl App {
                 .iter()
                 .any(|c| matches!(c, SortColumn::Npu | SortColumn::NpuMem));
         crate::system::set_npu_process_stats_enabled(npu_wanted);
+
+        // Keep the pinned-GPU selection in sync with config (Setup can change it).
+        crate::system::set_gpu_selection(self.config.gpu_meter_adapter.clone());
     }
 
     /// Update displayed processes based on filter and sort
@@ -2054,6 +2059,20 @@ impl App {
     /// Enter column configuration mode
     pub fn enter_column_config_mode(&mut self) {
         self.dialog = DialogState::ColumnConfig { index: 0 };
+    }
+
+    /// Open the GPU-adapter selector. Entry 0 is "Auto"; the rest are the
+    /// detected GPU names. Pre-selects the currently pinned adapter, if any.
+    pub fn enter_gpu_select_mode(&mut self) {
+        let names = crate::system::gpu_names();
+        let index = self
+            .config
+            .gpu_meter_adapter
+            .as_ref()
+            .and_then(|sel| names.iter().position(|n| n == sel))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        self.dialog = DialogState::GpuSelect { index, names };
     }
 }
 

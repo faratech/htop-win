@@ -636,6 +636,7 @@ pub fn draw_setup(frame: &mut Frame, app: &mut App) {
         ("Color scheme", app.config.color_scheme.name().to_string()),
         ("Configure columns", "→".to_string()),
         ("Reset all settings", "⚠".to_string()),
+        ("GPU meter adapter", app.config.gpu_meter_adapter.clone().unwrap_or_else(|| "Auto".to_string())),
     ];
 
     let items: Vec<ListItem> = setup_items
@@ -978,6 +979,38 @@ pub fn draw_color_scheme(frame: &mut Frame, app: &mut App) {
         .border_style(Style::default().fg(Color::Green))
         .style(Style::default().bg(theme.background));
 
+    let style = Style::default().fg(theme.text).bg(theme.background);
+    render_list_dialog(frame, app, area, block, style, items, index, 0, 0);
+}
+
+/// Draw GPU meter adapter selection dialog
+pub fn draw_gpu_select(frame: &mut Frame, app: &mut App) {
+    let DialogState::GpuSelect { index, names } = &app.dialog else { return; };
+    let index = *index;
+    let names = names.clone();
+    let theme = &app.theme;
+    let num = names.len() + 1;
+    let area = centered_rect_fixed(44, (num + 2).min(16) as u16, frame.area());
+
+    let current = app.config.gpu_meter_adapter.as_deref();
+    let mut items: Vec<ListItem> = Vec::with_capacity(num);
+    items.push(ListItem::new(Line::from(Span::styled(
+        format!("{} Auto (most VRAM)", if current.is_none() { "●" } else { " " }),
+        item_style(index == 0, theme),
+    ))));
+    for (i, name) in names.iter().enumerate() {
+        let marker = if current == Some(name.as_str()) { "●" } else { " " };
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("{} {}", marker, name),
+            item_style(i + 1 == index, theme),
+        ))));
+    }
+
+    let block = Block::default()
+        .title(" GPU Meter Adapter ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green))
+        .style(Style::default().bg(theme.background));
     let style = Style::default().fg(theme.text).bg(theme.background);
     render_list_dialog(frame, app, area, block, style, items, index, 0, 0);
 }

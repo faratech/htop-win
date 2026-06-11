@@ -65,6 +65,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         DialogState::UserSelect { .. } => handle_user_select_keys(app, key),
         DialogState::Environment { .. } => handle_environment_keys(app, key),
         DialogState::ColorScheme { .. } => handle_color_scheme_keys(app, key),
+        DialogState::GpuSelect { .. } => handle_gpu_select_keys(app, key),
         DialogState::CommandWrap { .. } => handle_command_wrap_keys(app, key),
         DialogState::ColumnConfig { .. } => handle_column_config_keys(app, key),
         DialogState::Affinity { .. } => handle_affinity_keys(app, key),
@@ -635,6 +636,10 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                         std::time::Instant::now(),
                     ));
                 }
+                15 => {
+                    // Open the GPU adapter selector.
+                    app.enter_gpu_select_mode();
+                }
                 _ => {}
             }
         }
@@ -703,7 +708,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
         // Up/Down/j/k/PgUp/PgDn/Home/End move the selection (15 setup items).
         other => {
             if let DialogState::Setup { ref mut selected } = app.dialog {
-                handle_list_nav(selected, 15, other);
+                handle_list_nav(selected, 16, other);
             }
         }
     }
@@ -815,6 +820,36 @@ fn handle_color_scheme_keys(app: &mut App, key: KeyEvent) -> bool {
         other => {
             if let DialogState::ColorScheme { ref mut index } = app.dialog {
                 handle_list_nav(index, schemes.len(), other);
+            }
+        }
+    }
+    false
+}
+
+fn handle_gpu_select_keys(app: &mut App, key: KeyEvent) -> bool {
+    let len = match &app.dialog {
+        DialogState::GpuSelect { names, .. } => names.len() + 1, // +1 for "Auto"
+        _ => return false,
+    };
+    match key.code {
+        KeyCode::Esc => {
+            app.dialog = DialogState::Setup { selected: 15 };
+        }
+        KeyCode::Enter => {
+            // Index 0 = Auto (None); otherwise the (index-1)th adapter name.
+            let choice = match &app.dialog {
+                DialogState::GpuSelect { index: 0, .. } => None,
+                DialogState::GpuSelect { index, names } => names.get(index - 1).cloned(),
+                _ => None,
+            };
+            app.config.gpu_meter_adapter = choice;
+            crate::system::set_gpu_selection(app.config.gpu_meter_adapter.clone());
+            app.save_config();
+            app.dialog = DialogState::Setup { selected: 15 };
+        }
+        other => {
+            if let DialogState::GpuSelect { ref mut index, .. } = app.dialog {
+                handle_list_nav(index, len, other);
             }
         }
     }
@@ -1039,10 +1074,11 @@ fn rect_contains(r: crate::terminal::Rect, x: u16, y: u16) -> bool {
 fn dialog_nav_len(app: &App) -> usize {
     match &app.dialog {
         DialogState::SortSelect { .. } | DialogState::ColumnConfig { .. } => SortColumn::all().len(),
-        DialogState::Setup { .. } => 15,
+        DialogState::Setup { .. } => 16,
         DialogState::Priority { .. } => crate::app::WindowsPriorityClass::all().len(),
         DialogState::UserSelect { users, .. } => users.len() + 1,
         DialogState::ColorScheme { .. } => crate::ui::colors::ColorScheme::all().len(),
+        DialogState::GpuSelect { names, .. } => names.len() + 1, // +1 for Auto
         DialogState::SignalSelect { .. } => crate::ui::dialogs::signal_count(),
         DialogState::Affinity { .. } => app.system_metrics.cpu.core_usage.len(),
         _ => 0,
@@ -1057,6 +1093,7 @@ fn dialog_selection_mut(dialog: &mut DialogState) -> Option<&mut usize> {
         | DialogState::ColorScheme { index }
         | DialogState::ColumnConfig { index }
         | DialogState::SignalSelect { index, .. }
+        | DialogState::GpuSelect { index, .. }
         | DialogState::UserSelect { index, .. } => Some(index),
         DialogState::Setup { selected } | DialogState::Affinity { selected, .. } => Some(selected),
         DialogState::Priority { class_index, .. } => Some(class_index),

@@ -156,6 +156,32 @@ pub fn set_npu_process_stats_enabled(enabled: bool) {
     NPU_PROCESS_STATS_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// User's pinned GPU adapter (by name). None = auto-select the card with the
+/// most dedicated VRAM. Lets multi-GPU machines choose which card the meter
+/// and per-process columns follow.
+static GPU_SELECTION: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn set_gpu_selection(name: Option<String>) {
+    *GPU_SELECTION.lock().unwrap() = name;
+}
+
+/// Names of the GPU adapters currently tracked, in enumeration order, for the
+/// Setup selector. Empty when no GPU is present or detection hasn't run yet.
+pub fn gpu_names() -> Vec<String> {
+    ADAPTER_STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|s| {
+            s.adapters
+                .iter()
+                .filter(|a| a.class == AdapterClass::Gpu)
+                .map(|a| a.name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Cheap (lock-free) pre-check for whether per-process GPU/NPU stats might be
 /// wanted. When this is false the caller can skip building the all-PIDs vector
 /// and pass an empty slice to `process_stats` (which still runs its gate-change
@@ -460,23 +486,33 @@ fn aggregate_npus(per_adapter: &[(AdapterClass, AdapterMetrics)]) -> Option<Adap
     Some(info)
 }
 
-/// Pick the primary GPU: largest dedicated commit limit selects the discrete
-/// card over an iGPU; ties and all-zero fall back to enumeration order. The
-/// meter shows only the primary adapter — summing one card's VRAM with
-/// another adapter's aperture limit would produce nonsense totals.
+/// Pick the primary GPU. If the user pinned an adapter by name (Setup), use the
+/// first GPU matching it; otherwise auto-select the largest dedicated commit
+/// limit (the discrete card over an iGPU), with ties and all-zero falling back
+/// to enumeration order. The meter shows only the primary adapter — summing one
+/// card's VRAM with another adapter's aperture limit would produce nonsense.
 fn aggregate_gpus(per_adapter: &[(AdapterClass, AdapterMetrics)]) -> Option<AdapterMetrics> {
+    let selection = GPU_SELECTION.lock().unwrap().clone();
     let mut primary: Option<&AdapterMetrics> = None;
+    let mut selected: Option<&AdapterMetrics> = None;
     let mut count = 0;
     for (class, metrics) in per_adapter {
         if *class != AdapterClass::Gpu {
             continue;
         }
         count += 1;
+        if let Some(ref sel) = selection
+            && selected.is_none()
+            && metrics.name == *sel
+        {
+            selected = Some(metrics);
+        }
         if primary.is_none_or(|p| metrics.dedicated_total > p.dedicated_total) {
             primary = Some(metrics);
         }
     }
-    let mut info = primary?.clone();
+    // A pinned-but-absent adapter falls back to auto so the meter never blanks.
+    let mut info = selected.or(primary)?.clone();
     if count > 1 {
         info.name.push_str(&format!(" (+{})", count - 1));
     }

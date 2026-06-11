@@ -230,7 +230,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::ColorScheme { .. } => vec![
+        DialogState::ColorScheme { .. } | DialogState::GpuSelect { .. } => vec![
             (None, "Enter", "Select"),
             (None, "Esc", "Back"),
             (None, "", ""),

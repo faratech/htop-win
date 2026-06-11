@@ -100,6 +100,11 @@ pub struct Config {
     pub gpu_meter_mode: MeterMode,
     pub npu_meter_mode: MeterMode,
 
+    /// Which GPU the meter/columns track by adapter name. None = auto (the
+    /// adapter with the most dedicated VRAM). Lets multi-GPU machines pin a
+    /// specific card.
+    pub gpu_meter_adapter: Option<String>,
+
     // Column visibility (which columns to show in process list)
     pub visible_columns: Vec<String>,
 
@@ -153,6 +158,7 @@ impl Default for Config {
             memory_meter_mode: MeterMode::Bar,
             gpu_meter_mode: MeterMode::Bar,
             npu_meter_mode: MeterMode::Bar,
+            gpu_meter_adapter: None,
 
             visible_columns: vec![
                 "PID".to_string(),
@@ -317,6 +323,10 @@ impl Config {
                 "npu_meter_mode",
                 defaults.npu_meter_mode.as_str(),
             )),
+            gpu_meter_adapter: match get_str("gpu_meter_adapter", "") {
+                s if s.is_empty() => None,
+                s => Some(s),
+            },
 
             visible_columns,
 
@@ -460,6 +470,10 @@ impl Config {
         map.insert(
             "npu_meter_mode".to_string(),
             Value::String(self.npu_meter_mode.as_str().to_string()),
+        );
+        map.insert(
+            "gpu_meter_adapter".to_string(),
+            Value::String(self.gpu_meter_adapter.clone().unwrap_or_default()),
         );
 
         map.insert(

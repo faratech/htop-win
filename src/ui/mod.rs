@@ -97,6 +97,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         DialogState::UserSelect { .. } => dialogs::draw_user_select(frame, app),
         DialogState::Environment { .. } => dialogs::draw_environment(frame, app),
         DialogState::ColorScheme { .. } => dialogs::draw_color_scheme(frame, app),
+        DialogState::GpuSelect { .. } => dialogs::draw_gpu_select(frame, app),
         DialogState::CommandWrap { .. } => dialogs::draw_command_wrap(frame, app),
         DialogState::ColumnConfig { .. } => dialogs::draw_column_config(frame, app),
         DialogState::Affinity { .. } => dialogs::draw_affinity(frame, app),
