@@ -7,7 +7,8 @@ mod process;
 
 pub use cpu::CpuInfo;
 pub use d3dkmt::{
-    set_gpu_process_stats_enabled, set_npu_process_stats_enabled, GpuInfo, NpuInfo,
+    debug_dump as gpu_debug_dump, set_gpu_process_stats_enabled, set_npu_process_stats_enabled,
+    GpuInfo, NpuInfo,
 };
 pub use memory::{format_bytes, MemoryInfo};
 pub use process::{

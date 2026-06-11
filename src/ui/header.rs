@@ -665,17 +665,14 @@ fn draw_gpu_bar(frame: &mut Frame, app: &App, area: Rect) {
     let usage = gpu.utilization.clamp(0.0, 100.0);
     let theme = &app.theme;
 
-    let (mem_used, mem_total) = if gpu.dedicated_total > 0 {
-        (gpu.dedicated_used, gpu.dedicated_total)
-    } else {
-        (gpu.mem_used, gpu.mem_total)
-    };
+    let (mem_used, mem_total) = gpu.meter_memory();
 
-    // htop-style format: "GPU[|||||      X.XX% Y.YG/Z.ZG]"
+    // htop-style format: "GPU[|||||      Y.YG/Z.ZG X.X%]" — memory first, then the
+    // utilization % at the right edge so it lines up with the CPU meters.
     let gpu_info = if mem_total > 0 {
-        format!("{:.1}% {}/{}", usage, format_bytes(mem_used), format_bytes(mem_total))
+        format!("{}/{} {:.1}%", format_bytes(mem_used), format_bytes(mem_total), usage)
     } else {
-        format!("{:.1}% {}", usage, format_bytes(mem_used))
+        format!("{} {:.1}%", format_bytes(mem_used), usage)
     };
 
     let line = match mode {
@@ -734,11 +731,14 @@ fn draw_npu_bar(frame: &mut Frame, app: &App, area: Rect) {
     let usage = npu.utilization.clamp(0.0, 100.0);
     let theme = &app.theme;
 
-    // htop-style format: "NPU[|||||      X.XX% Y.YG/Z.ZG]"
-    let npu_info = if npu.mem_total > 0 {
-        format!("{:.1}% {}/{}", usage, format_bytes(npu.mem_used), format_bytes(npu.mem_total))
+    let (mem_used, mem_total) = npu.meter_memory();
+
+    // htop-style format: "NPU[|||||      Y.YG/Z.ZG X.X%]" — memory first, then the
+    // utilization % at the right edge so it lines up with the CPU meters.
+    let npu_info = if mem_total > 0 {
+        format!("{}/{} {:.1}%", format_bytes(mem_used), format_bytes(mem_total), usage)
     } else {
-        format!("{:.1}% {}", usage, format_bytes(npu.mem_used))
+        format!("{} {:.1}%", format_bytes(mem_used), usage)
     };
 
     let line = match mode {
@@ -749,7 +749,7 @@ fn draw_npu_bar(frame: &mut Frame, app: &App, area: Rect) {
                     format!("{:5.1}%", usage),
                     Style::default().fg(theme.cpu_color(usage)).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!(" ({})", format_bytes(npu.mem_used)), Style::default().fg(theme.text)),
+                Span::styled(format!(" ({})", format_bytes(mem_used)), Style::default().fg(theme.text)),
             ])
         }
         MeterMode::Graph => {

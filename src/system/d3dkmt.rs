@@ -41,6 +41,24 @@ pub struct AdapterMetrics {
     pub shared_used: u64,
 }
 
+impl AdapterMetrics {
+    /// Memory pool the meter should display, as (used, total).
+    ///
+    /// A discrete GPU exposes its VRAM as a large dedicated pool, so we show
+    /// that. An integrated GPU exposes only a small dedicated carveout (often
+    /// 128 MB, ~0 used) and does its real work in shared system memory — so for
+    /// those we show the combined pool instead, which is where the usage lives.
+    /// The 1 GiB threshold cleanly separates an iGPU carveout from real VRAM.
+    pub fn meter_memory(&self) -> (u64, u64) {
+        const DISCRETE_VRAM_MIN: u64 = 1 << 30; // 1 GiB
+        if self.dedicated_total >= DISCRETE_VRAM_MIN {
+            (self.dedicated_used, self.dedicated_total)
+        } else {
+            (self.mem_used, self.mem_total)
+        }
+    }
+}
+
 pub type NpuInfo = AdapterMetrics;
 pub type GpuInfo = AdapterMetrics;
 
@@ -363,21 +381,26 @@ fn query_adapter_metrics(
             return None;
         }
         let segment = unsafe { stats.QueryResult.SegmentInformation };
+        // Some drivers (e.g. Adreno) report a u64::MAX "no limit" CommitLimit on
+        // aperture/shared segments. Treat it as 0 so it neither overflows the
+        // total (panic in debug, garbage wrap in release) nor reports a nonsense
+        // multi-exabyte capacity. saturating_add guards the remaining sums too.
+        let limit = if segment.CommitLimit == u64::MAX { 0 } else { segment.CommitLimit };
         let used = if segment.BytesResident > 0 {
             segment.BytesResident
         } else {
             segment.BytesCommitted
         };
         if adapter.aperture_segment.get(segment_id as usize).copied().unwrap_or(false) {
-            metrics.shared_used += used;
+            metrics.shared_used = metrics.shared_used.saturating_add(used);
         } else {
-            metrics.dedicated_used += used;
-            metrics.dedicated_total += segment.CommitLimit;
+            metrics.dedicated_used = metrics.dedicated_used.saturating_add(used);
+            metrics.dedicated_total = metrics.dedicated_total.saturating_add(limit);
         }
-        metrics.mem_total += segment.CommitLimit;
+        metrics.mem_total = metrics.mem_total.saturating_add(limit);
     }
 
-    metrics.mem_used = metrics.dedicated_used + metrics.shared_used;
+    metrics.mem_used = metrics.dedicated_used.saturating_add(metrics.shared_used);
     Some(metrics)
 }
 
@@ -618,6 +641,123 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcAdapterStats> {
     result
 }
 
+/// Human-readable dump of every dxgkrnl adapter and its raw segment statistics,
+/// for diagnosing GPU/NPU memory reporting (`--gpu-debug`). Enumerates ALL
+/// adapters, including ones we don't track, so a dropped/powered-down discrete
+/// GPU is visible.
+pub fn debug_dump() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mut idx = 0usize;
+    for_each_enumerated_adapter(|info| {
+        let _ = writeln!(
+            out,
+            "Adapter #{idx}  LUID {:#010x}:{}",
+            info.AdapterLuid.LowPart, info.AdapterLuid.HighPart
+        );
+        idx += 1;
+        unsafe {
+            // Adapter type + classification.
+            let mut atype = D3DKMT_ADAPTERTYPE::default();
+            let mut q = D3DKMT_QUERYADAPTERINFO {
+                hAdapter: info.hAdapter,
+                Type: KMTQAITYPE_ADAPTERTYPE,
+                pPrivateDriverData: &mut atype as *mut _ as *mut std::ffi::c_void,
+                PrivateDriverDataSize: std::mem::size_of::<D3DKMT_ADAPTERTYPE>() as u32,
+            };
+            let type_ok = D3DKMTQueryAdapterInfo(&mut q).is_ok();
+            let tval = if type_ok { atype.Anonymous.Value } else { 0 };
+            let class = match classify_adapter(tval) {
+                Some(AdapterClass::Gpu) => "GPU",
+                Some(AdapterClass::Npu) => "NPU",
+                None => "(untracked)",
+            };
+
+            // Friendly name.
+            let mut reg = D3DKMT_ADAPTERREGISTRYINFO::default();
+            let mut q2 = D3DKMT_QUERYADAPTERINFO {
+                hAdapter: info.hAdapter,
+                Type: KMTQAITYPE_ADAPTERREGISTRYINFO,
+                pPrivateDriverData: &mut reg as *mut _ as *mut std::ffi::c_void,
+                PrivateDriverDataSize: std::mem::size_of::<D3DKMT_ADAPTERREGISTRYINFO>() as u32,
+            };
+            let name = if D3DKMTQueryAdapterInfo(&mut q2).is_ok() {
+                utf16_to_string(&reg.AdapterString)
+            } else {
+                "?".to_string()
+            };
+            let _ = writeln!(out, "  name : {name}");
+            let _ = writeln!(out, "  type : {tval:#06x} (queryOk={type_ok}) class={class}");
+
+            // Node/segment counts.
+            let mut stats = D3DKMT_QUERYSTATISTICS {
+                Type: D3DKMT_QUERYSTATISTICS_ADAPTER,
+                AdapterLuid: info.AdapterLuid,
+                ..Default::default()
+            };
+            if !query_statistics(&mut stats) {
+                let _ = writeln!(out, "  ADAPTER stats query FAILED (adapter likely powered down)");
+                return;
+            }
+            let node_count = stats.QueryResult.AdapterInformation.NodeCount;
+            let seg_count = stats.QueryResult.AdapterInformation.NbSegments;
+            let _ = writeln!(out, "  nodes={node_count} segments={seg_count}");
+
+            let (mut ded_used, mut ded_total, mut shared_used, mut mem_total) = (0u64, 0u64, 0u64, 0u64);
+            for sid in 0..seg_count {
+                let mut s = D3DKMT_QUERYSTATISTICS {
+                    Type: D3DKMT_QUERYSTATISTICS_SEGMENT,
+                    AdapterLuid: info.AdapterLuid,
+                    ..Default::default()
+                };
+                s.Anonymous.QuerySegment = D3DKMT_QUERYSTATISTICS_QUERY_SEGMENT { SegmentId: sid };
+                if !query_statistics(&mut s) {
+                    let _ = writeln!(out, "    seg {sid}: query FAILED");
+                    continue;
+                }
+                let seg = s.QueryResult.SegmentInformation;
+                let ap = seg.Aperture != 0;
+                let used = if seg.BytesResident > 0 { seg.BytesResident } else { seg.BytesCommitted };
+                let _ = writeln!(
+                    out,
+                    "    seg {sid}: aperture={ap} commitLimit={cl:#x} ({cl}) committed={cm:#x} resident={rs:#x}",
+                    cl = seg.CommitLimit, cm = seg.BytesCommitted, rs = seg.BytesResident
+                );
+                if ap {
+                    shared_used = shared_used.saturating_add(used);
+                } else {
+                    ded_used = ded_used.saturating_add(used);
+                    ded_total = ded_total.saturating_add(seg.CommitLimit);
+                }
+                mem_total = mem_total.saturating_add(seg.CommitLimit);
+            }
+            let _ = writeln!(
+                out,
+                "  => dedicated {ded_used}/{ded_total}  shared_used={shared_used}  mem_total={mem_total}"
+            );
+        }
+    });
+    if idx == 0 {
+        out.push_str("No dxgkrnl adapters enumerated.\n");
+    }
+
+    // End-to-end: what the meter would show via the real refresh()+aggregation.
+    let snap = refresh();
+    let _ = writeln!(out, "\n--- meter (via refresh + aggregation) ---");
+    if let Some(g) = &snap.gpu {
+        let (u, t) = g.meter_memory();
+        let _ = writeln!(out, "GPU: {} util={:.1}% mem={u}/{t} (dedicated {}/{}, shared_used {}, mem_total {})",
+            g.name, g.utilization, g.dedicated_used, g.dedicated_total, g.shared_used, g.mem_total);
+    } else {
+        let _ = writeln!(out, "GPU: none");
+    }
+    if let Some(n) = &snap.npu {
+        let (u, t) = n.meter_memory();
+        let _ = writeln!(out, "NPU: {} util={:.1}% mem={u}/{t}", n.name, n.utilization);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -659,6 +799,31 @@ mod tests {
             dedicated_total,
             shared_used: 50,
         }
+    }
+
+    #[test]
+    fn test_meter_memory_picks_pool_by_vram_size() {
+        // Discrete card: large dedicated VRAM -> show the dedicated pool.
+        let discrete = AdapterMetrics {
+            dedicated_used: 2 << 30,
+            dedicated_total: 8 << 30,
+            mem_used: 3 << 30,
+            mem_total: 24 << 30,
+            ..Default::default()
+        };
+        assert_eq!(discrete.meter_memory(), (2 << 30, 8 << 30));
+
+        // Integrated GPU (Adreno-shaped): tiny unused 128 MB dedicated carveout,
+        // real usage in shared -> show the combined pool, not "0/128M".
+        let integrated = AdapterMetrics {
+            dedicated_used: 0,
+            dedicated_total: 128 << 20,
+            shared_used: 1_739_767_808,
+            mem_used: 1_739_767_808,
+            mem_total: 8_722_055_168,
+            ..Default::default()
+        };
+        assert_eq!(integrated.meter_memory(), (1_739_767_808, 8_722_055_168));
     }
 
     #[test]

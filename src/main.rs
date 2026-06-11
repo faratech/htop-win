@@ -45,6 +45,7 @@ struct Args {
     install: bool,
     update: bool,
     force: bool,
+    gpu_debug: bool,
 }
 
 /// Benchmark statistics for performance measurement
@@ -126,6 +127,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Long("force") | Short('f') => {
                 args.force = true;
             }
+            Long("gpu-debug") => {
+                args.gpu_debug = true;
+            }
             _ => return Err(arg.unexpected()),
         }
     }
@@ -154,6 +158,7 @@ fn print_help() {
     println!("      --install                Install to PATH (requires admin, will prompt UAC)");
     println!("      --update                 Check for updates and install if available");
     println!("  -f, --force                  Force install/update even if same version");
+    println!("      --gpu-debug              Print GPU/NPU adapter diagnostics and exit");
     println!("  -h, --help                   Print help");
     println!("  -V, --version                Print version");
 }
@@ -329,6 +334,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if args.version {
         println!("htop-win {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
+    if args.gpu_debug {
+        print!("{}", crate::system::gpu_debug_dump());
         return Ok(());
     }
 
