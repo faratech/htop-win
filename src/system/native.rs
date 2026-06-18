@@ -10,7 +10,13 @@ use windows::Win32::Foundation::{HANDLE, UNICODE_STRING};
 
 // Reusable buffer for NtQuerySystemInformation to avoid repeated allocations
 thread_local! {
-    static QUERY_BUFFER: std::cell::RefCell<Vec<u8>> = std::cell::RefCell::new(Vec::with_capacity(1024 * 1024));
+    static QUERY_BUFFER: std::cell::RefCell<Vec<usize>> =
+        std::cell::RefCell::new(Vec::with_capacity(bytes_to_words(1024 * 1024)));
+}
+
+#[inline]
+fn bytes_to_words(bytes: usize) -> usize {
+    bytes.div_ceil(std::mem::size_of::<usize>())
 }
 
 /// Wrapper around raw SystemProcessInfo to provide safe accessors
@@ -45,6 +51,10 @@ impl<'a> SystemProcess<'a> {
 
     pub fn private_bytes(&self) -> u64 {
         self.info.private_page_count as u64
+    }
+
+    pub fn private_working_set(&self) -> u64 {
+        self.info.working_set_private_size.max(0) as u64
     }
 
     pub fn virtual_size(&self) -> u64 {
@@ -92,7 +102,8 @@ impl<'a> SystemProcess<'a> {
 
 /// Iterator over system processes
 pub struct SystemProcessIterator<'a> {
-    buffer: &'a [u8],
+    buffer: &'a [usize],
+    byte_len: usize,
     offset: usize,
     finished: bool,
 }
@@ -105,11 +116,13 @@ impl<'a> Iterator for SystemProcessIterator<'a> {
             return None;
         }
 
-        if self.offset + std::mem::size_of::<SystemProcessInfo>() > self.buffer.len() {
+        if self.offset + std::mem::size_of::<SystemProcessInfo>() > self.byte_len {
             return None;
         }
 
-        let proc_info = unsafe { &*(self.buffer.as_ptr().add(self.offset) as *const SystemProcessInfo) };
+        let proc_info = unsafe {
+            &*((self.buffer.as_ptr() as *const u8).add(self.offset) as *const SystemProcessInfo)
+        };
 
         if proc_info.next_entry_offset == 0 {
             self.finished = true;
@@ -123,13 +136,15 @@ impl<'a> Iterator for SystemProcessIterator<'a> {
 
 /// Helper struct to access the process list
 pub struct SystemProcessList<'a> {
-    buffer: &'a [u8],
+    buffer: &'a [usize],
+    byte_len: usize,
 }
 
 impl<'a> SystemProcessList<'a> {
     pub fn iter(&self) -> SystemProcessIterator<'a> {
         SystemProcessIterator {
             buffer: self.buffer,
+            byte_len: self.byte_len,
             offset: 0,
             finished: false,
         }
@@ -148,9 +163,10 @@ where
 {
     QUERY_BUFFER.with(|buf| {
         let mut buffer = buf.borrow_mut();
+        let min_words = bytes_to_words(1024 * 1024);
         let cap = buffer.capacity();
-        if cap < 1024 * 1024 {
-            buffer.reserve(1024 * 1024 - cap);
+        if cap < min_words {
+            buffer.reserve(min_words - cap);
         }
         // Only resize (zeroing) when the buffer needs to grow;
         // NtQuerySystemInformation overwrites the buffer contents.
@@ -167,7 +183,7 @@ where
                 NtQuerySystemInformation(
                     SystemProcessInformation,
                     buffer.as_mut_ptr() as *mut _,
-                    buffer.len() as u32,
+                    (buffer.len() * std::mem::size_of::<usize>()) as u32,
                     &mut return_length,
                 )
             };
@@ -178,7 +194,10 @@ where
 
             // STATUS_INFO_LENGTH_MISMATCH - need bigger buffer
             if status.0 as u32 == 0xC0000004 {
-                buffer.resize(return_length as usize + 65536, 0);
+                let current_bytes = buffer.len() * std::mem::size_of::<usize>();
+                let requested = return_length as usize + 65536;
+                let next_bytes = (current_bytes.saturating_mul(2)).max(requested);
+                buffer.resize(bytes_to_words(next_bytes), 0);
                 continue;
             }
 
@@ -188,7 +207,10 @@ where
             return None;
         }
 
-        Some(f(SystemProcessList { buffer: &buffer }))
+        Some(f(SystemProcessList {
+            buffer: &buffer,
+            byte_len: buffer.len() * std::mem::size_of::<usize>(),
+        }))
     })
 }
 
@@ -203,10 +225,7 @@ pub struct ProcessRates {
 }
 
 /// Calculate CPU percentages and I/O rates for all processes using cache deltas
-pub fn calculate_process_rates(
-    list: &SystemProcessList,
-    total_cpu_delta: u64,
-) -> ProcessRates {
+pub fn calculate_process_rates(list: &SystemProcessList, total_cpu_delta: u64) -> ProcessRates {
     use super::cache::CACHE;
 
     let now = std::time::Instant::now();
@@ -217,6 +236,7 @@ pub fn calculate_process_rates(
 
         for proc in list.iter() {
             let pid = proc.pid();
+            let create_time = proc.create_time();
 
             if pid == 0 {
                 percentages.insert(0, 0.0);
@@ -229,7 +249,10 @@ pub fn calculate_process_rates(
                 let prev_total = entry.kernel_time + entry.user_time;
                 let time_delta = total_time.saturating_sub(prev_total);
 
-                if now > entry.cpu_time_updated && total_cpu_delta > 0 {
+                if entry.create_time == create_time
+                    && now > entry.cpu_time_updated
+                    && total_cpu_delta > 0
+                {
                     (time_delta as f64 / total_cpu_delta as f64 * 100.0) as f32
                 } else {
                     0.0
@@ -256,7 +279,10 @@ pub fn calculate_process_rates(
     // Batch update cache and get I/O rates back
     let io_rates = CACHE.update_times_batch(&updates);
 
-    ProcessRates { cpu_percentages, io_rates }
+    ProcessRates {
+        cpu_percentages,
+        io_rates,
+    }
 }
 
 /// Convert FILETIME (100-ns intervals since 1601) to Unix timestamp
@@ -308,4 +334,3 @@ struct SystemProcessInfo {
     write_transfer_count: i64,
     other_transfer_count: i64,
 }
-

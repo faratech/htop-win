@@ -8,19 +8,20 @@
 //! segment commitments for memory. One enumeration pass tracks both adapter
 //! classes so machines with a GPU and an NPU pay for a single state machine.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Wdk::Graphics::Direct3D::{
-    D3DKMTCloseAdapter, D3DKMTEnumAdapters2, D3DKMTQueryAdapterInfo, D3DKMTQueryStatistics,
     D3DKMT_ADAPTERINFO, D3DKMT_ADAPTERREGISTRYINFO, D3DKMT_ADAPTERTYPE, D3DKMT_CLOSEADAPTER,
     D3DKMT_ENUMADAPTERS2, D3DKMT_QUERYADAPTERINFO, D3DKMT_QUERYSTATISTICS,
     D3DKMT_QUERYSTATISTICS_ADAPTER, D3DKMT_QUERYSTATISTICS_NODE,
     D3DKMT_QUERYSTATISTICS_PROCESS_NODE, D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT,
     D3DKMT_QUERYSTATISTICS_QUERY_NODE, D3DKMT_QUERYSTATISTICS_QUERY_SEGMENT,
-    D3DKMT_QUERYSTATISTICS_SEGMENT, KMTQAITYPE_ADAPTERREGISTRYINFO, KMTQAITYPE_ADAPTERTYPE,
+    D3DKMT_QUERYSTATISTICS_SEGMENT, D3DKMTCloseAdapter, D3DKMTEnumAdapters2,
+    D3DKMTQueryAdapterInfo, D3DKMTQueryStatistics, KMTQAITYPE_ADAPTERREGISTRYINFO,
+    KMTQAITYPE_ADAPTERTYPE,
 };
 use windows::Win32::Foundation::{CloseHandle, LUID};
 
@@ -114,8 +115,8 @@ struct AdapterState {
     needs_reenumeration: bool,
     last_sample: Option<Instant>,
     last_proc_sample: Option<Instant>,
-    /// pid -> previous RunningTime per node, flattened across adapters
-    prev_proc_running: HashMap<u32, Vec<i64>>,
+    /// (pid, process create time) -> previous RunningTime per node, flattened across adapters
+    prev_proc_running: HashMap<(u32, u64), Vec<i64>>,
     /// (gpu, npu) gates last seen by process_stats; a change invalidates the
     /// flattened baselines (a disabled class keeps stale RunningTime values)
     prev_proc_gates: (bool, bool),
@@ -259,7 +260,9 @@ fn for_each_enumerated_adapter(mut f: impl FnMut(&D3DKMT_ADAPTERINFO)) {
                 continue;
             }
             f(info);
-            let _ = D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER { hAdapter: info.hAdapter });
+            let _ = D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER {
+                hAdapter: info.hAdapter,
+            });
         }
     }
 }
@@ -342,7 +345,11 @@ fn build_adapter(info: &D3DKMT_ADAPTERINFO) -> AdapterProbe {
         };
         let name = if D3DKMTQueryAdapterInfo(&mut query).is_ok() {
             let s = utf16_to_string(&registry_info.AdapterString);
-            if s.is_empty() { fallback_name.to_string() } else { s }
+            if s.is_empty() {
+                fallback_name.to_string()
+            } else {
+                s
+            }
         } else {
             fallback_name.to_string()
         };
@@ -412,14 +419,15 @@ fn query_adapter_metrics(
             return None;
         }
         let running = unsafe {
-            stats.QueryResult.NodeInformation.GlobalInformation.RunningTime
+            stats
+                .QueryResult
+                .NodeInformation
+                .GlobalInformation
+                .RunningTime
         };
         if let Some(secs) = elapsed {
-            let pct = running_time_to_percent(
-                adapter.prev_node_running[node_id as usize],
-                running,
-                secs,
-            );
+            let pct =
+                running_time_to_percent(adapter.prev_node_running[node_id as usize], running, secs);
             metrics.utilization = metrics.utilization.max(pct);
         }
         adapter.prev_node_running[node_id as usize] = running;
@@ -443,13 +451,22 @@ fn query_adapter_metrics(
         // aperture/shared segments. Treat it as 0 so it neither overflows the
         // total (panic in debug, garbage wrap in release) nor reports a nonsense
         // multi-exabyte capacity. saturating_add guards the remaining sums too.
-        let limit = if segment.CommitLimit == u64::MAX { 0 } else { segment.CommitLimit };
+        let limit = if segment.CommitLimit == u64::MAX {
+            0
+        } else {
+            segment.CommitLimit
+        };
         let used = if segment.BytesResident > 0 {
             segment.BytesResident
         } else {
             segment.BytesCommitted
         };
-        if adapter.aperture_segment.get(segment_id as usize).copied().unwrap_or(false) {
+        if adapter
+            .aperture_segment
+            .get(segment_id as usize)
+            .copied()
+            .unwrap_or(false)
+        {
             metrics.shared_used = metrics.shared_used.saturating_add(used);
         } else {
             metrics.dedicated_used = metrics.dedicated_used.saturating_add(used);
@@ -585,7 +602,9 @@ pub fn refresh() -> AdapterSnapshot {
     }
 
     // First sample after (re-)detection only sets baselines and reports 0%.
-    let elapsed = state.last_sample.map(|t| now.duration_since(t).as_secs_f64());
+    let elapsed = state
+        .last_sample
+        .map(|t| now.duration_since(t).as_secs_f64());
     state.last_sample = Some(now);
 
     let mut per_adapter = Vec::with_capacity(state.adapters.len());
@@ -612,7 +631,7 @@ pub fn refresh() -> AdapterSnapshot {
 /// Per-process GPU/NPU stats for the given PIDs. A class is only queried when
 /// its adapters exist and its `set_*_process_stats_enabled(true)` gate is on;
 /// with both gates off this returns an empty map without opening any handles.
-pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcAdapterStats> {
+pub fn process_stats(processes: &[(u32, u64)]) -> HashMap<u32, ProcAdapterStats> {
     let mut guard = ADAPTER_STATE.lock().unwrap();
     let Some(state) = guard.as_mut() else {
         return HashMap::new();
@@ -635,17 +654,25 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcAdapterStats> {
     }
 
     let now = Instant::now();
-    let elapsed = state.last_proc_sample.map(|t| now.duration_since(t).as_secs_f64());
+    let elapsed = state
+        .last_proc_sample
+        .map(|t| now.duration_since(t).as_secs_f64());
     state.last_proc_sample = Some(now);
 
     // Split borrows so adapters and the baseline map can be used together.
-    let AdapterState { adapters, prev_proc_running, .. } = state;
+    let AdapterState {
+        adapters,
+        prev_proc_running,
+        ..
+    } = state;
     // Baseline slots cover every node of every adapter so the flattened
     // indices stay stable regardless of which classes are queried.
     let total_nodes: usize = adapters.iter().map(|a| a.node_count as usize).sum();
 
-    let mut result = HashMap::with_capacity(pids.len());
-    for &pid in pids {
+    let mut result = HashMap::with_capacity(processes.len());
+    let mut current_keys = HashSet::with_capacity(processes.len());
+    for &(pid, create_time) in processes {
+        let key = (pid, create_time);
         // Idle and System pseudo-processes can't be opened.
         if pid == 0 || pid == 4 {
             continue;
@@ -655,13 +682,14 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcAdapterStats> {
         };
 
         // A PID seen for the first time only sets baselines (reports 0%).
-        let fresh = !prev_proc_running.contains_key(&pid);
+        let fresh = !prev_proc_running.contains_key(&key);
         let prev = prev_proc_running
-            .entry(pid)
+            .entry(key)
             .or_insert_with(|| vec![0; total_nodes]);
 
         let mut entry = ProcAdapterStats::default();
         let mut node_index = 0;
+        let mut sampled_running_time = false;
         for adapter in adapters.iter() {
             let class_enabled = match adapter.class {
                 AdapterClass::Gpu => gpu_enabled,
@@ -683,17 +711,13 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcAdapterStats> {
                 // Failures here are per-process (exited, no adapter reference);
                 // leave zeros rather than tearing down the adapter state.
                 if unsafe { query_statistics(&mut stats) } {
-                    let running =
-                        unsafe { stats.QueryResult.ProcessNodeInformation.RunningTime };
+                    sampled_running_time = true;
+                    let running = unsafe { stats.QueryResult.ProcessNodeInformation.RunningTime };
                     if !fresh && let Some(secs) = elapsed {
                         let pct = running_time_to_percent(prev[node_index], running, secs);
                         match adapter.class {
-                            AdapterClass::Gpu => {
-                                entry.gpu_percent = entry.gpu_percent.max(pct)
-                            }
-                            AdapterClass::Npu => {
-                                entry.npu_percent = entry.npu_percent.max(pct)
-                            }
+                            AdapterClass::Gpu => entry.gpu_percent = entry.gpu_percent.max(pct),
+                            AdapterClass::Npu => entry.npu_percent = entry.npu_percent.max(pct),
                         }
                     }
                     prev[node_index] = running;
@@ -711,15 +735,18 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcAdapterStats> {
                     SegmentId: segment_id,
                 };
                 if unsafe { query_statistics(&mut stats) } {
-                    let committed = unsafe {
-                        stats.QueryResult.ProcessSegmentInformation.BytesCommitted
-                    };
+                    let committed =
+                        unsafe { stats.QueryResult.ProcessSegmentInformation.BytesCommitted };
                     // Treat the u64::MAX "no limit" sentinel as 0 and saturate so
                     // a quirky driver can't overflow the per-process total.
                     let committed = if committed == u64::MAX { 0 } else { committed };
                     match adapter.class {
-                        AdapterClass::Gpu => entry.gpu_memory = entry.gpu_memory.saturating_add(committed),
-                        AdapterClass::Npu => entry.npu_memory = entry.npu_memory.saturating_add(committed),
+                        AdapterClass::Gpu => {
+                            entry.gpu_memory = entry.gpu_memory.saturating_add(committed)
+                        }
+                        AdapterClass::Npu => {
+                            entry.npu_memory = entry.npu_memory.saturating_add(committed)
+                        }
                     }
                 }
             }
@@ -727,11 +754,14 @@ pub fn process_stats(pids: &[u32]) -> HashMap<u32, ProcAdapterStats> {
         unsafe {
             let _ = CloseHandle(handle);
         }
+        if sampled_running_time {
+            current_keys.insert(key);
+        }
         result.insert(pid, entry);
     }
 
     // Prune baselines for PIDs that died or could no longer be opened.
-    prev_proc_running.retain(|pid, _| result.contains_key(pid));
+    prev_proc_running.retain(|key, _| current_keys.contains(key));
 
     result
 }
@@ -782,7 +812,10 @@ pub fn debug_dump() -> String {
                 "?".to_string()
             };
             let _ = writeln!(out, "  name : {name}");
-            let _ = writeln!(out, "  type : {tval:#06x} (queryOk={type_ok}) class={class}");
+            let _ = writeln!(
+                out,
+                "  type : {tval:#06x} (queryOk={type_ok}) class={class}"
+            );
 
             // Node/segment counts.
             let mut stats = D3DKMT_QUERYSTATISTICS {
@@ -791,14 +824,18 @@ pub fn debug_dump() -> String {
                 ..Default::default()
             };
             if !query_statistics(&mut stats) {
-                let _ = writeln!(out, "  ADAPTER stats query FAILED (adapter likely powered down)");
+                let _ = writeln!(
+                    out,
+                    "  ADAPTER stats query FAILED (adapter likely powered down)"
+                );
                 return;
             }
             let node_count = stats.QueryResult.AdapterInformation.NodeCount;
             let seg_count = stats.QueryResult.AdapterInformation.NbSegments;
             let _ = writeln!(out, "  nodes={node_count} segments={seg_count}");
 
-            let (mut ded_used, mut ded_total, mut shared_used, mut mem_total) = (0u64, 0u64, 0u64, 0u64);
+            let (mut ded_used, mut ded_total, mut shared_used, mut mem_total) =
+                (0u64, 0u64, 0u64, 0u64);
             for sid in 0..seg_count {
                 let mut s = D3DKMT_QUERYSTATISTICS {
                     Type: D3DKMT_QUERYSTATISTICS_SEGMENT,
@@ -812,11 +849,17 @@ pub fn debug_dump() -> String {
                 }
                 let seg = s.QueryResult.SegmentInformation;
                 let ap = seg.Aperture != 0;
-                let used = if seg.BytesResident > 0 { seg.BytesResident } else { seg.BytesCommitted };
+                let used = if seg.BytesResident > 0 {
+                    seg.BytesResident
+                } else {
+                    seg.BytesCommitted
+                };
                 let _ = writeln!(
                     out,
                     "    seg {sid}: aperture={ap} commitLimit={cl:#x} ({cl}) committed={cm:#x} resident={rs:#x}",
-                    cl = seg.CommitLimit, cm = seg.BytesCommitted, rs = seg.BytesResident
+                    cl = seg.CommitLimit,
+                    cm = seg.BytesCommitted,
+                    rs = seg.BytesResident
                 );
                 if ap {
                     shared_used = shared_used.saturating_add(used);
@@ -841,14 +884,21 @@ pub fn debug_dump() -> String {
     let _ = writeln!(out, "\n--- meter (via refresh + aggregation) ---");
     if let Some(g) = &snap.gpu {
         let (u, t) = g.meter_memory();
-        let _ = writeln!(out, "GPU: {} util={:.1}% mem={u}/{t} (dedicated {}/{}, shared_used {}, mem_total {})",
-            g.name, g.utilization, g.dedicated_used, g.dedicated_total, g.shared_used, g.mem_total);
+        let _ = writeln!(
+            out,
+            "GPU: {} util={:.1}% mem={u}/{t} (dedicated {}/{}, shared_used {}, mem_total {})",
+            g.name, g.utilization, g.dedicated_used, g.dedicated_total, g.shared_used, g.mem_total
+        );
     } else {
         let _ = writeln!(out, "GPU: none");
     }
     if let Some(n) = &snap.npu {
         let (u, t) = n.meter_memory();
-        let _ = writeln!(out, "NPU: {} util={:.1}% mem={u}/{t}", n.name, n.utilization);
+        let _ = writeln!(
+            out,
+            "NPU: {} util={:.1}% mem={u}/{t}",
+            n.name, n.utilization
+        );
     }
     out
 }
@@ -856,8 +906,8 @@ pub fn debug_dump() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        aggregate_gpus, aggregate_npus, classify_adapter, running_time_to_percent,
-        utf16_to_string, AdapterClass, AdapterMetrics,
+        AdapterClass, AdapterMetrics, aggregate_gpus, aggregate_npus, classify_adapter,
+        running_time_to_percent, utf16_to_string,
     };
 
     #[test]
@@ -981,9 +1031,7 @@ mod tests {
 
     #[test]
     fn test_utf16_to_string() {
-        let buf: Vec<u16> = "Intel(R) AI Boost\0\0extra"
-            .encode_utf16()
-            .collect();
+        let buf: Vec<u16> = "Intel(R) AI Boost\0\0extra".encode_utf16().collect();
         assert_eq!(utf16_to_string(&buf), "Intel(R) AI Boost");
         let no_nul: Vec<u16> = "NPU".encode_utf16().collect();
         assert_eq!(utf16_to_string(&no_nul), "NPU");

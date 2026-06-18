@@ -67,7 +67,7 @@ Windows Task Manager is fine, but power users deserve better. **htop-win** bring
 
 ### I/O Tab
 A dedicated tab focused on disk I/O activity:
-- **IO_RATE** - Combined read + write rate per process
+- **IO_RATE** - Combined read + write rate per process (bytes/sec)
 - **IO_R/s** - Read rate
 - **IO_W/s** - Write rate
 - **HNDL** - Open handle count
@@ -158,17 +158,23 @@ Options:
   -d, --delay <MS>          Refresh rate in milliseconds [default: 1500]
   -u, --user <USER>         Show only processes from this user
   -p, --pid <PID,...>       Show only these PIDs (comma-separated)
-  -s, --sort <COLUMN>       Sort by: pid, cpu, mem, time, command, user
+  -s, --sort <COLUMN>       Sort by: pid, ppid, cpu, mem, time, command, user, threads
   -t, --tree                Start in tree view mode
   -F, --filter <STRING>     Initial filter string
   -H, --highlight <SECS>    Highlight new processes for N seconds
   -n, --iterations <N>      Exit after N updates (for scripting)
+      --benchmark[=<N>]     Run N iterations and print timing stats [default: 20]
+      --benchmark-iterations <N>
+                            Run benchmark mode with N iterations
+      --inefficient         Disable Efficiency Mode / EcoQoS
       --no-color            Monochrome mode
       --no-mouse            Disable mouse support
       --no-meters           Hide header meters
       --readonly            Disable kill/priority operations
       --install             Install to PATH (requires admin)
       --update              Check for and install updates
+      --gpu-debug           Print GPU/NPU adapter diagnostics and exit
+      --cpu-debug           Print CPU / processor-group diagnostics and exit
   -f, --force               Force install/update
   -h, --help                Show help
   -V, --version             Show version
@@ -206,8 +212,8 @@ htop -p 1234,5678,9012
 | `PgUp` / `PgDn` | Page up / down |
 | `Home` / `g` | Jump to first process |
 | `End` / `G` | Jump to last process |
-| `Tab` | Cycle focus: Header → Process List → Footer |
-| `1` / `2` | Switch to Main / I/O tab |
+| `Tab` / `Shift+Tab` | Switch screen tabs |
+| `1` / `2` | PID prefix search |
 
 ### Main Controls (Function Keys)
 
@@ -219,8 +225,8 @@ htop -p 1234,5678,9012
 | `F4` / `\` | Filter processes |
 | `F5` / `t` | Toggle tree view |
 | `F6` / `<` `>` | Change sort column |
-| `F7` / `]` | Decrease priority (nice+) |
-| `F8` / `[` | Increase priority (nice-) |
+| `F7` / `]` | Open priority dialog |
+| `F8` / `[` | Open priority dialog |
 | `F9` | Kill process |
 | `F10` / `q` | Quit |
 
@@ -285,7 +291,7 @@ htop-win saves settings to `%APPDATA%\htop-win\config\config.json`. Configure vi
   "highlight_large_numbers": true,
   "cpu_meter_mode": "Bar",
   "memory_meter_mode": "Bar",
-  "visible_columns": ["PID", "USER", "PRI", "CPU%", "MEM%", "TIME+", "Command"],
+  "visible_columns": ["PID", "USER", "PRI", "CLASS", "THR", "VIRT", "RES", "SHR", "S", "CPU%", "MEM%", "TIME+", "Command"],
   "mouse_enabled": true,
   "confirm_kill": true
 }
@@ -321,7 +327,7 @@ Access via Setup (`F2`) → Color Scheme:
 | `VIRT` | Virtual memory | 8 |
 | `RES` | Resident (physical) memory | 8 |
 | `SHR` | Shared memory | 8 |
-| `S` | Status (R=Running, S=Sleeping) | 3 |
+| `S` | Status if known; `?` when Windows native process query does not expose htop-style state | 3 |
 | `CPU%` | CPU usage percentage | 6 |
 | `MEM%` | Memory usage percentage | 6 |
 | `GPU%` | GPU utilization % (max across all GPU engines) | 6 |
@@ -335,7 +341,7 @@ Access via Setup (`F2`) → Color Scheme:
 | `ARCH` | Architecture (x86/x64/ARM64) | 5 |
 | `ECO` | Efficiency Mode status | 4 |
 
-> GPU% / GPU-MEM and NPU% / NPU-MEM are automatically added to the default column set the first time htop-win detects the relevant hardware.
+> New default configs include GPU% / GPU-MEM and NPU% / NPU-MEM when relevant hardware is detected. Existing custom column layouts are preserved; enable these columns from Setup if you want to add them later.
 
 ### I/O Tab
 
@@ -343,7 +349,7 @@ Access via Setup (`F2`) → Color Scheme:
 |--------|-------------|
 | `PID` | Process ID |
 | `USER` | Process owner |
-| `IO_RATE` | Combined read + write rate (bytes/refresh) |
+| `IO_RATE` | Combined read + write rate (bytes/sec) |
 | `IO_R/s` | Read rate |
 | `IO_W/s` | Write rate |
 | `IO_RD` | Cumulative bytes read |

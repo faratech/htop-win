@@ -34,26 +34,33 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Main layout: header, tab bar, process list, footer
     // Header is hidden if app.show_header is false
+    let tab_bar_height = if app.screen_tabs.len() > 1 { 1 } else { 0 };
     let header_height = if app.show_header {
-        header::calculate_header_height(app)
+        header::calculate_header_height(app).min(size.height.saturating_sub(tab_bar_height + 2 + 1))
     } else {
         0
     };
-    let tab_bar_height = if app.screen_tabs.len() > 1 { 1 } else { 0 };
+    let remaining = size.height.saturating_sub(header_height + tab_bar_height);
+    let footer_height = remaining.min(2);
+    let process_height = remaining.saturating_sub(footer_height);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(header_height),
             Constraint::Length(tab_bar_height),
-            Constraint::Min(5),
-            Constraint::Length(2),
+            Constraint::Length(process_height),
+            Constraint::Length(footer_height),
         ])
         .split(size);
 
     // Update UI bounds for mouse/keyboard navigation
     app.ui_bounds.header_y_start = 0;
-    app.ui_bounds.header_y_end = if app.show_header { chunks[0].y + chunks[0].height } else { 0 };
+    app.ui_bounds.header_y_end = if app.show_header {
+        chunks[0].y + chunks[0].height
+    } else {
+        0
+    };
     app.ui_bounds.tab_bar_y = chunks[1].y;
     app.ui_bounds.tab_bar_visible = tab_bar_height > 0;
     app.ui_bounds.column_header_y = chunks[2].y;
@@ -105,10 +112,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Draw error message if present (within expiry window)
-    if let Some((ref error, time)) = app.last_error
-        && time.elapsed() < std::time::Duration::from_secs(5) {
-            dialogs::draw_error(frame, error);
-        }
+    if let Some((error, time)) = app.last_error.as_ref()
+        && time.elapsed() < std::time::Duration::from_secs(5)
+    {
+        let error = error.clone();
+        dialogs::draw_error(frame, app, &error);
+    }
 }
 
 /// Draw the screen tab bar (like htop's [Main] [I/O] tabs)
@@ -139,16 +148,17 @@ fn draw_tab_bar(frame: &mut Frame, app: &mut App, area: Rect) {
             // Inactive tab: dim
             spans.push(Span::styled(
                 label,
-                Style::default()
-                    .fg(theme.text_dim)
-                    .bg(theme.background),
+                Style::default().fg(theme.text_dim).bg(theme.background),
             ));
         }
 
         // Register click region for this tab
         app.ui_bounds.add_region(UIRegion::new(
             UIElement::ScreenTab(i),
-            x_pos, area.y, label_width, 1,
+            x_pos,
+            area.y,
+            label_width,
+            1,
         ));
 
         x_pos += label_width + 1; // +1 for space separator

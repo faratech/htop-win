@@ -124,7 +124,10 @@ impl WindowsPriorityClass {
 
     /// Convert from index
     pub fn from_index(index: usize) -> Self {
-        Self::all().get(index).copied().unwrap_or(WindowsPriorityClass::Normal)
+        Self::all()
+            .get(index)
+            .copied()
+            .unwrap_or(WindowsPriorityClass::Normal)
     }
 
     /// Convert from Windows base priority value (0-31)
@@ -158,7 +161,13 @@ pub struct UIRegion {
 
 impl UIRegion {
     pub fn new(element: UIElement, x: u16, y: u16, width: u16, height: u16) -> Self {
-        Self { element, x, y, width, height }
+        Self {
+            element,
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     /// Check if a point is within this region
@@ -219,10 +228,8 @@ impl UIBounds {
 
     /// Add a function key region
     pub fn add_function_key(&mut self, key: u8, x: u16, y: u16, width: u16) {
-        self.function_keys.push(UIRegion::new(
-            UIElement::FunctionKey(key),
-            x, y, width, 1,
-        ));
+        self.function_keys
+            .push(UIRegion::new(UIElement::FunctionKey(key), x, y, width, 1));
     }
 
     /// Find which element is at the given coordinates
@@ -249,13 +256,17 @@ impl UIBounds {
         // Tab bar area is handled by registered regions (checked above)
 
         if y == self.column_header_y
-            && let Some(col) = self.column_at_x(x) {
-                return Some(UIElement::ColumnHeader(col));
-            }
+            && let Some(col) = self.column_at_x(x)
+        {
+            return Some(UIElement::ColumnHeader(col));
+        }
 
         if let Some(row_index) = self.process_row_index(y) {
             // Note: PID needs to be filled in by caller who has process data
-            return Some(UIElement::ProcessRow { index: row_index, pid: 0 });
+            return Some(UIElement::ProcessRow {
+                index: row_index,
+                pid: 0,
+            });
         }
 
         if y >= self.footer_y_start {
@@ -317,22 +328,22 @@ pub enum SortColumn {
     StartTime,
     Command,
     // Windows-specific sort columns
-    Elevated,    // Running as admin
-    Arch,        // Process architecture (x86/x64/ARM)
-    Efficiency,  // Efficiency mode (EcoQoS)
+    Elevated,   // Running as admin
+    Arch,       // Process architecture (x86/x64/ARM)
+    Efficiency, // Efficiency mode (EcoQoS)
     // I/O columns
     HandleCount, // Number of open handles
-    IoRate,      // Combined I/O rate (read + write per refresh)
-    IoReadRate,  // I/O read bytes per refresh
-    IoWriteRate, // I/O write bytes per refresh
+    IoRate,      // Combined I/O rate (read + write bytes/sec)
+    IoReadRate,  // I/O read bytes/sec
+    IoWriteRate, // I/O write bytes/sec
     IoRead,      // Cumulative I/O read bytes
     IoWrite,     // Cumulative I/O write bytes
     // GPU columns (Task Manager parity; only meaningful on GPU machines)
-    Gpu,         // GPU utilization percent (max across all GPU engine nodes)
-    GpuMem,      // GPU committed memory across all GPU adapters
+    Gpu,    // GPU utilization percent (max across all GPU engine nodes)
+    GpuMem, // GPU committed memory across all GPU adapters
     // NPU columns (Task Manager parity; only meaningful on NPU machines)
-    Npu,         // NPU utilization percent
-    NpuMem,      // NPU dedicated + shared memory
+    Npu,    // NPU utilization percent
+    NpuMem, // NPU dedicated + shared memory
 }
 
 impl SortColumn {
@@ -510,7 +521,10 @@ impl ScreenTab {
             name: "I/O".to_string(),
             columns: vec![
                 "PID", "USER", "IO_RATE", "IO_R/s", "IO_W/s", "HNDL", "Command",
-            ].into_iter().map(String::from).collect(),
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
             sort_column: SortColumn::IoRate,
             sort_ascending: false,
         }
@@ -519,38 +533,85 @@ impl ScreenTab {
 
 /// Dialog/view state - encapsulates per-dialog state into enum variants
 /// Replaces the previous flat ViewMode enum + scattered dialog fields
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub enum DialogState {
     /// Normal process list view (no dialog open)
     #[default]
     None,
-    Help { scroll: usize },
-    Search { buffer: String, cursor: usize },
-    Filter { buffer: String, cursor: usize },
-    SortSelect { index: usize },
-    Kill { pid: u32, name: String, command: String },
-    SignalSelect { index: usize, pid: u32, name: String, command: String },
-    Priority { class_index: usize, pid: u32, name: String },
-    Setup { selected: usize },
-    ProcessInfo { target: Box<ProcessInfo>, scroll: usize },
-    UserSelect { index: usize, users: Vec<String> },
-    Environment { scroll: usize, pid: u32 },
-    ColorScheme { index: usize },
+    Help {
+        scroll: usize,
+    },
+    Search {
+        buffer: String,
+        cursor: usize,
+    },
+    Filter {
+        buffer: String,
+        cursor: usize,
+    },
+    SortSelect {
+        index: usize,
+    },
+    Kill {
+        pid: u32,
+        name: String,
+        command: String,
+    },
+    SignalSelect {
+        index: usize,
+        pid: u32,
+        name: String,
+        command: String,
+    },
+    Priority {
+        class_index: usize,
+        pid: u32,
+        name: String,
+    },
+    Setup {
+        selected: usize,
+    },
+    ProcessInfo {
+        target: Box<ProcessInfo>,
+        scroll: usize,
+    },
+    UserSelect {
+        index: usize,
+        users: Vec<String>,
+    },
+    Environment {
+        scroll: usize,
+        pid: u32,
+    },
+    ColorScheme {
+        index: usize,
+    },
     /// GPU adapter selector for the meter (index 0 = Auto, then `names`).
-    GpuSelect { index: usize, names: Vec<String> },
-    CommandWrap { scroll: usize, pid: u32 },
-    ColumnConfig { index: usize },
-    Affinity { mask: u64, selected: usize, pid: u32 },
+    GpuSelect {
+        index: usize,
+        names: Vec<String>,
+    },
+    CommandWrap {
+        scroll: usize,
+        pid: u32,
+    },
+    ColumnConfig {
+        index: usize,
+    },
+    Affinity {
+        mask: u64,
+        selected: usize,
+        pid: u32,
+    },
 }
-
 
 impl DialogState {
     /// Get mutable reference to input buffer and cursor (Search/Filter dialogs)
     pub fn input_buffer_mut(&mut self) -> Option<(&mut String, &mut usize)> {
         match self {
-            DialogState::Search { buffer, cursor }
-            | DialogState::Filter { buffer, cursor } => Some((buffer, cursor)),
+            DialogState::Search { buffer, cursor } | DialogState::Filter { buffer, cursor } => {
+                Some((buffer, cursor))
+            }
             _ => None,
         }
     }
@@ -558,8 +619,9 @@ impl DialogState {
     /// Get input buffer contents (Search/Filter dialogs)
     pub fn input_buffer(&self) -> Option<(&str, usize)> {
         match self {
-            DialogState::Search { buffer, cursor }
-            | DialogState::Filter { buffer, cursor } => Some((buffer, *cursor)),
+            DialogState::Search { buffer, cursor } | DialogState::Filter { buffer, cursor } => {
+                Some((buffer, *cursor))
+            }
             _ => None,
         }
     }
@@ -681,15 +743,64 @@ pub struct App {
     pub focus_index: usize,
 }
 
+fn clamp_char_boundary(buffer: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(buffer.len());
+    if buffer.is_char_boundary(cursor) {
+        cursor
+    } else {
+        prev_char_boundary(buffer, cursor)
+    }
+}
+
+fn prev_char_boundary(buffer: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(buffer.len());
+    buffer
+        .char_indices()
+        .map(|(idx, _)| idx)
+        .take_while(|idx| *idx < cursor)
+        .last()
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(buffer: &str, cursor: usize) -> usize {
+    let cursor = clamp_char_boundary(buffer, cursor);
+    buffer[cursor..]
+        .chars()
+        .next()
+        .map(|ch| cursor + ch.len_utf8())
+        .unwrap_or(buffer.len())
+}
+
 impl App {
+    fn readonly_blocked(&mut self, action: &str) -> bool {
+        if self.config.readonly {
+            self.last_error = Some((format!("Readonly mode: cannot {action}"), Instant::now()));
+            true
+        } else {
+            false
+        }
+    }
+
     pub fn new(config: Config) -> Self {
         let theme = config.theme();
         let tree_view = config.tree_view_default;
-        let visible_columns = Self::compute_visible_columns(&config);
-        let screen_tabs = config.screen_tabs.clone().unwrap_or_else(|| vec![
-            ScreenTab::default_main(&config),
-            ScreenTab::default_io(),
-        ]);
+        let screen_tabs = config
+            .screen_tabs
+            .clone()
+            .unwrap_or_else(|| vec![ScreenTab::default_main(&config), ScreenTab::default_io()]);
+        let cached_visible_columns: Vec<SortColumn> = screen_tabs
+            .first()
+            .map(|tab| {
+                tab.columns
+                    .iter()
+                    .filter_map(|name| SortColumn::from_name(name))
+                    .collect()
+            })
+            .unwrap_or_else(|| Self::compute_visible_columns(&config));
+        let (sort_column, sort_ascending) = screen_tabs
+            .first()
+            .map(|tab| (tab.sort_column, tab.sort_ascending))
+            .unwrap_or((SortColumn::Cpu, false));
         Self {
             config,
             theme,
@@ -699,8 +810,8 @@ impl App {
             displayed_processes: Vec::new(),
             selected_index: 0,
             scroll_offset: 0,
-            sort_column: SortColumn::Cpu,
-            sort_ascending: false,
+            sort_column,
+            sort_ascending,
             tree_view,
             search_string: String::new(),
             search_string_lower: String::new(),
@@ -726,7 +837,7 @@ impl App {
             mem_history: VecDeque::new(),
             swap_history: VecDeque::new(),
             npu_history: VecDeque::new(),
-            cached_visible_columns: visible_columns,
+            cached_visible_columns,
             needs_process_update: false,
             ui_bounds: UIBounds::default(),
             dialog_area: None,
@@ -749,7 +860,8 @@ impl App {
     /// Compute visible columns based on config (used for caching)
     /// Respects the order defined in config.visible_columns
     fn compute_visible_columns(config: &Config) -> Vec<SortColumn> {
-        config.visible_columns
+        config
+            .visible_columns
             .iter()
             .filter_map(|name| SortColumn::from_name(name))
             .collect()
@@ -809,12 +921,13 @@ impl App {
     pub fn move_column_up_in_active_tab(&mut self, column: &str) -> bool {
         if let Some(tab) = self.screen_tabs.get_mut(self.active_tab)
             && let Some(pos) = tab.columns.iter().position(|c| c == column)
-                && pos > 0 {
-                    tab.columns.swap(pos, pos - 1);
-                    self.sync_config_from_active_tab();
-                    self.update_visible_columns_cache();
-                    return true;
-                }
+            && pos > 0
+        {
+            tab.columns.swap(pos, pos - 1);
+            self.sync_config_from_active_tab();
+            self.update_visible_columns_cache();
+            return true;
+        }
         false
     }
 
@@ -822,18 +935,22 @@ impl App {
     pub fn move_column_down_in_active_tab(&mut self, column: &str) -> bool {
         if let Some(tab) = self.screen_tabs.get_mut(self.active_tab)
             && let Some(pos) = tab.columns.iter().position(|c| c == column)
-                && pos < tab.columns.len() - 1 {
-                    tab.columns.swap(pos, pos + 1);
-                    self.sync_config_from_active_tab();
-                    self.update_visible_columns_cache();
-                    return true;
-                }
+            && pos < tab.columns.len() - 1
+        {
+            tab.columns.swap(pos, pos + 1);
+            self.sync_config_from_active_tab();
+            self.update_visible_columns_cache();
+            return true;
+        }
         false
     }
 
-    /// Sync config.visible_columns from the active tab (for backward compat with config file)
+    /// Sync config.visible_columns from the Main tab for backward compatibility.
+    /// Per-tab state is persisted in config.screen_tabs; visible_columns is kept
+    /// as the legacy Main-tab layout so saving from the I/O tab cannot corrupt
+    /// older consumers or the next no-tabs fallback.
     fn sync_config_from_active_tab(&mut self) {
-        if let Some(tab) = self.screen_tabs.get(self.active_tab) {
+        if let Some(tab) = self.screen_tabs.first() {
             self.config.visible_columns = tab.columns.clone();
         }
     }
@@ -928,13 +1045,10 @@ impl App {
         if let Some(tab) = self.screen_tabs.get(self.active_tab) {
             self.sort_column = tab.sort_column;
             self.sort_ascending = tab.sort_ascending;
-            // Sync config.visible_columns so column config dialog shows the right columns
-            self.config.visible_columns = tab.columns.clone();
         }
-        self.cached_visible_columns = self.config.visible_columns
-            .iter()
-            .filter_map(|name| SortColumn::from_name(name))
-            .collect();
+        self.sync_config_from_active_tab();
+        self.update_visible_columns_cache();
+        self.needs_process_update = true;
     }
 
     /// Navigate left within the current focus region
@@ -1012,7 +1126,7 @@ impl App {
             2 => self.dialog = DialogState::Setup { selected: 0 },
             3 => self.start_search(),
             4 => self.start_filter(),
-            5 => self.tree_view = !self.tree_view,
+            5 => self.toggle_tree_view(),
             6 => self.dialog = DialogState::SortSelect { index: 0 },
             7 => self.enter_priority_mode(),
             8 => self.enter_priority_mode(),
@@ -1023,6 +1137,9 @@ impl App {
 
     /// Enter kill mode and capture the target process
     pub fn enter_kill_mode(&mut self) {
+        if self.readonly_blocked("kill processes") {
+            return;
+        }
         if let Some(proc) = self.selected_process() {
             let (pid, name, command) = (proc.pid, proc.name.clone(), proc.command.clone());
 
@@ -1041,6 +1158,9 @@ impl App {
 
     /// Enter priority mode and capture the target process
     pub fn enter_priority_mode(&mut self) {
+        if self.readonly_blocked("change process priority") {
+            return;
+        }
         if let Some(proc) = self.selected_process() {
             let class_index = WindowsPriorityClass::from_base_priority(proc.priority).index();
             self.dialog = DialogState::Priority {
@@ -1065,7 +1185,10 @@ impl App {
                     proc_copy.command = exe_path;
                 }
             }
-            self.dialog = DialogState::ProcessInfo { target: Box::new(proc_copy), scroll: 0 };
+            self.dialog = DialogState::ProcessInfo {
+                target: Box::new(proc_copy),
+                scroll: 0,
+            };
         }
     }
 
@@ -1083,7 +1206,8 @@ impl App {
         // Use native Windows APIs for all system metrics
         self.system_metrics.refresh();
         // Update processes in-place to avoid re-allocating strings
-        self.system_metrics.update_processes_native(&mut self.processes);
+        self.system_metrics
+            .update_processes_native(&mut self.processes);
         self.update_displayed_processes();
 
         // Update history for graph mode
@@ -1125,27 +1249,37 @@ impl App {
         if self.mem_history.len() >= MAX_HISTORY {
             self.mem_history.pop_front(); // O(1) instead of O(n)
         }
-        self.mem_history.push_back(self.system_metrics.memory.used_percent);
+        self.mem_history
+            .push_back(self.system_metrics.memory.used_percent);
 
         // Add current swap usage to history
         if self.swap_history.len() >= MAX_HISTORY {
             self.swap_history.pop_front();
         }
-        self.swap_history.push_back(self.system_metrics.memory.swap_percent);
+        self.swap_history
+            .push_back(self.system_metrics.memory.swap_percent);
 
         // Add current GPU usage to history (only meaningful on GPU machines)
         if self.gpu_history.len() >= MAX_HISTORY {
             self.gpu_history.pop_front();
         }
-        self.gpu_history
-            .push_back(self.system_metrics.gpu.as_ref().map_or(0.0, |g| g.utilization));
+        self.gpu_history.push_back(
+            self.system_metrics
+                .gpu
+                .as_ref()
+                .map_or(0.0, |g| g.utilization),
+        );
 
         // Add current NPU usage to history (only meaningful on NPU machines)
         if self.npu_history.len() >= MAX_HISTORY {
             self.npu_history.pop_front();
         }
-        self.npu_history
-            .push_back(self.system_metrics.npu.as_ref().map_or(0.0, |n| n.utilization));
+        self.npu_history.push_back(
+            self.system_metrics
+                .npu
+                .as_ref()
+                .map_or(0.0, |n| n.utilization),
+        );
     }
 
     /// Keep the per-process GPU/NPU collection gates in sync with what's
@@ -1201,48 +1335,52 @@ impl App {
         }
 
         let mut processes: Vec<ProcessInfo> = Vec::with_capacity(process_count);
-        processes.extend(self.processes
-            .iter()
-            .filter(|p| {
-                // Kernel/System threads filter
-                // On Windows, "kernel threads" are SYSTEM user processes
-                let is_kernel = p.user_lower == "system"
-                    || p.user_lower.starts_with("nt authority")
-                    || p.pid == 0
-                    || p.pid == 4;
+        processes.extend(
+            self.processes
+                .iter()
+                .filter(|p| {
+                    // Kernel/System threads filter
+                    // On Windows, "kernel threads" are SYSTEM user processes
+                    let is_kernel = p.user_lower == "system"
+                        || p.user_lower.starts_with("nt authority")
+                        || p.pid == 0
+                        || p.pid == 4;
 
-                if !show_kernel && is_kernel {
-                    return false;
-                }
-
-                // User threads filter
-                // On Windows, "user threads" are non-system processes
-                if !show_user && !is_kernel {
-                    return false;
-                }
-
-                // PID filter (from CLI -p option)
-                if let Some(ref pids) = self.pid_filter
-                    && !pids.contains(&p.pid) {
+                    if !show_kernel && is_kernel {
                         return false;
                     }
-                // User filter
-                if let Some(ref user) = self.user_filter
-                    && &p.user != user {
+
+                    // User threads filter
+                    // On Windows, "user threads" are non-system processes
+                    if !show_user && !is_kernel {
                         return false;
                     }
-                // Text filter - use pre-computed lowercase strings
-                if has_filter
-                    && !(p.name_lower.contains(&self.filter_string_lower)
-                        || p.command_lower.contains(&self.filter_string_lower)
-                        || filter_as_pid.is_some_and(|n| p.pid == n)
-                        || p.user_lower.contains(&self.filter_string_lower))
+
+                    // PID filter (from CLI -p option)
+                    if let Some(ref pids) = self.pid_filter
+                        && !pids.contains(&p.pid)
                     {
                         return false;
                     }
-                true
-            })
-            .cloned());
+                    // User filter
+                    if let Some(ref user) = self.user_filter
+                        && &p.user != user
+                    {
+                        return false;
+                    }
+                    // Text filter - use pre-computed lowercase strings
+                    if has_filter
+                        && !(p.name_lower.contains(&self.filter_string_lower)
+                            || p.command_lower.contains(&self.filter_string_lower)
+                            || filter_as_pid.is_some_and(|n| p.pid == n)
+                            || p.user_lower.contains(&self.filter_string_lower))
+                    {
+                        return false;
+                    }
+                    true
+                })
+                .cloned(),
+        );
 
         // Set matches_search flag on each process (for render-time highlighting)
         if has_search {
@@ -1266,6 +1404,22 @@ impl App {
 
         self.displayed_processes = processes;
 
+        // Clamp selection and scroll immediately after replacing the list, before
+        // enrichment uses scroll_offset to choose the visible slice.
+        if self.selected_index >= self.displayed_processes.len() {
+            self.selected_index = self.displayed_processes.len().saturating_sub(1);
+        }
+        if self.displayed_processes.is_empty() {
+            self.scroll_offset = 0;
+        } else {
+            let max_scroll = self
+                .displayed_processes
+                .len()
+                .saturating_sub(self.visible_height.max(1));
+            self.scroll_offset = self.scroll_offset.min(max_scroll);
+            self.ensure_visible();
+        }
+
         // Enrich visible processes with additional data from Windows APIs
         // Use a buffer zone to handle scrolling smoothly
         const BUFFER_SIZE: usize = 10;
@@ -1283,10 +1437,14 @@ impl App {
 
         // Handle follow mode - find and select the followed PID
         if let Some(follow_pid) = self.follow_pid
-            && let Some(idx) = self.displayed_processes.iter().position(|p| p.pid == follow_pid) {
-                self.selected_index = idx;
-                self.ensure_visible();
-            }
+            && let Some(idx) = self
+                .displayed_processes
+                .iter()
+                .position(|p| p.pid == follow_pid)
+        {
+            self.selected_index = idx;
+            self.ensure_visible();
+        }
 
         // Ensure selection is valid
         if self.selected_index >= self.displayed_processes.len() {
@@ -1305,16 +1463,32 @@ impl App {
             // Specialize common sort columns for best performance (avoid match in hot loop)
             SortColumn::Cpu => {
                 if ascending {
-                    processes.sort_unstable_by(|a, b| a.cpu_percent.partial_cmp(&b.cpu_percent).unwrap_or(Ordering::Equal));
+                    processes.sort_unstable_by(|a, b| {
+                        a.cpu_percent
+                            .partial_cmp(&b.cpu_percent)
+                            .unwrap_or(Ordering::Equal)
+                    });
                 } else {
-                    processes.sort_unstable_by(|a, b| b.cpu_percent.partial_cmp(&a.cpu_percent).unwrap_or(Ordering::Equal));
+                    processes.sort_unstable_by(|a, b| {
+                        b.cpu_percent
+                            .partial_cmp(&a.cpu_percent)
+                            .unwrap_or(Ordering::Equal)
+                    });
                 }
             }
             SortColumn::Mem => {
                 if ascending {
-                    processes.sort_unstable_by(|a, b| a.mem_percent.partial_cmp(&b.mem_percent).unwrap_or(Ordering::Equal));
+                    processes.sort_unstable_by(|a, b| {
+                        a.mem_percent
+                            .partial_cmp(&b.mem_percent)
+                            .unwrap_or(Ordering::Equal)
+                    });
                 } else {
-                    processes.sort_unstable_by(|a, b| b.mem_percent.partial_cmp(&a.mem_percent).unwrap_or(Ordering::Equal));
+                    processes.sort_unstable_by(|a, b| {
+                        b.mem_percent
+                            .partial_cmp(&a.mem_percent)
+                            .unwrap_or(Ordering::Equal)
+                    });
                 }
             }
             SortColumn::Pid => {
@@ -1356,17 +1530,28 @@ impl App {
                         SortColumn::Arch => a.arch.as_str().cmp(b.arch.as_str()),
                         SortColumn::Efficiency => a.efficiency_mode.cmp(&b.efficiency_mode),
                         SortColumn::HandleCount => a.handle_count.cmp(&b.handle_count),
-                        SortColumn::IoRate => (a.io_read_rate + a.io_write_rate).cmp(&(b.io_read_rate + b.io_write_rate)),
+                        SortColumn::IoRate => (a.io_read_rate + a.io_write_rate)
+                            .cmp(&(b.io_read_rate + b.io_write_rate)),
                         SortColumn::IoReadRate => a.io_read_rate.cmp(&b.io_read_rate),
                         SortColumn::IoWriteRate => a.io_write_rate.cmp(&b.io_write_rate),
                         SortColumn::IoRead => a.io_read_bytes.cmp(&b.io_read_bytes),
                         SortColumn::IoWrite => a.io_write_bytes.cmp(&b.io_write_bytes),
-                        SortColumn::Gpu => a.gpu_percent.partial_cmp(&b.gpu_percent).unwrap_or(Ordering::Equal),
+                        SortColumn::Gpu => a
+                            .gpu_percent
+                            .partial_cmp(&b.gpu_percent)
+                            .unwrap_or(Ordering::Equal),
                         SortColumn::GpuMem => a.gpu_memory.cmp(&b.gpu_memory),
-                        SortColumn::Npu => a.npu_percent.partial_cmp(&b.npu_percent).unwrap_or(Ordering::Equal),
+                        SortColumn::Npu => a
+                            .npu_percent
+                            .partial_cmp(&b.npu_percent)
+                            .unwrap_or(Ordering::Equal),
                         SortColumn::NpuMem => a.npu_memory.cmp(&b.npu_memory),
                         // Already handled above
-                        SortColumn::Cpu | SortColumn::Mem | SortColumn::Pid | SortColumn::Res | SortColumn::Time => Ordering::Equal,
+                        SortColumn::Cpu
+                        | SortColumn::Mem
+                        | SortColumn::Pid
+                        | SortColumn::Res
+                        | SortColumn::Time => Ordering::Equal,
                     };
                     if ascending { ord } else { ord.reverse() }
                 };
@@ -1383,7 +1568,8 @@ impl App {
 
         // Build parent-child relationships
         let process_count = processes.len();
-        let mut children_map: HashMap<u32, Vec<ProcessInfo>> = HashMap::with_capacity(process_count / 4);
+        let mut children_map: HashMap<u32, Vec<ProcessInfo>> =
+            HashMap::with_capacity(process_count / 4);
         let mut root_processes: Vec<ProcessInfo> = Vec::with_capacity(process_count / 8);
 
         // Group by parent - a process is a root if:
@@ -1402,8 +1588,7 @@ impl App {
             }
         }
 
-        // Sort roots by PID
-        root_processes.sort_by_key(|p| p.pid);
+        // Preserve the active sort order established before tree construction.
 
         // Build tree recursively
         let mut result = Vec::with_capacity(process_count);
@@ -1464,28 +1649,33 @@ impl App {
         result.push(process);
 
         // Only add children if not collapsed - take ownership to avoid cloning
-        if !is_collapsed
-            && let Some(mut sorted_children) = children_map.remove(&pid) {
-                sorted_children.sort_by_key(|p| p.pid);
-                let child_count = sorted_children.len();
+        if !is_collapsed && let Some(sorted_children) = children_map.remove(&pid) {
+            let child_count = sorted_children.len();
 
-                // Calculate the prefix for children
-                // Use push_str instead of format! to reduce allocations
-                let child_parent_prefix = if depth > 0 {
-                    let connector = if is_last { "   " } else { "│  " };
-                    let mut prefix = String::with_capacity(parent_prefix.len() + 3);
-                    prefix.push_str(parent_prefix);
-                    prefix.push_str(connector);
-                    prefix
-                } else {
-                    String::new()
-                };
+            // Calculate the prefix for children
+            // Use push_str instead of format! to reduce allocations
+            let child_parent_prefix = if depth > 0 {
+                let connector = if is_last { "   " } else { "│  " };
+                let mut prefix = String::with_capacity(parent_prefix.len() + 3);
+                prefix.push_str(parent_prefix);
+                prefix.push_str(connector);
+                prefix
+            } else {
+                String::new()
+            };
 
-                for (idx, child) in sorted_children.into_iter().enumerate() {
-                    let child_is_last = idx == child_count - 1;
-                    self.add_tree_node(result, child, children_map, depth + 1, child_is_last, &child_parent_prefix);
-                }
+            for (idx, child) in sorted_children.into_iter().enumerate() {
+                let child_is_last = idx == child_count - 1;
+                self.add_tree_node(
+                    result,
+                    child,
+                    children_map,
+                    depth + 1,
+                    child_is_last,
+                    &child_parent_prefix,
+                );
             }
+        }
     }
 
     /// Collapse tree branch at selected process
@@ -1547,8 +1737,8 @@ impl App {
     /// Page down
     pub fn page_down(&mut self) {
         let page_size = self.visible_height.saturating_sub(1);
-        self.selected_index = (self.selected_index + page_size)
-            .min(self.displayed_processes.len().saturating_sub(1));
+        self.selected_index =
+            (self.selected_index + page_size).min(self.displayed_processes.len().saturating_sub(1));
         self.ensure_visible();
     }
 
@@ -1595,7 +1785,8 @@ impl App {
         if let Some(proc) = self.selected_process() {
             let name = proc.name.clone();
             // Find all visible processes with the same name and tag them
-            let pids_to_tag: Vec<u32> = self.displayed_processes
+            let pids_to_tag: Vec<u32> = self
+                .displayed_processes
                 .iter()
                 .filter(|p| p.name == name)
                 .map(|p| p.pid)
@@ -1609,7 +1800,8 @@ impl App {
     /// Toggle tag on all visible/filtered processes
     pub fn tag_all_visible(&mut self) {
         // If all visible are already tagged, untag them
-        let all_tagged = self.displayed_processes
+        let all_tagged = self
+            .displayed_processes
             .iter()
             .all(|p| self.tagged_pids.contains(&p.pid));
 
@@ -1678,10 +1870,11 @@ impl App {
             && let Some(idx) = self.displayed_processes.iter().position(|p| {
                 p.name_lower.contains(&self.search_string_lower)
                     || p.command_lower.contains(&self.search_string_lower)
-            }) {
-                self.selected_index = idx;
-                self.ensure_visible();
-            }
+            })
+        {
+            self.selected_index = idx;
+            self.ensure_visible();
+        }
         // Update matches_search flags for highlighting
         self.needs_process_update = true;
     }
@@ -1709,8 +1902,9 @@ impl App {
     /// Kill the captured target process (used by kill confirmation dialog)
     pub fn kill_target_process(&mut self, signal: u32) {
         let (pid, name) = match &self.dialog {
-            DialogState::Kill { pid, name, .. }
-            | DialogState::SignalSelect { pid, name, .. } => (*pid, name.clone()),
+            DialogState::Kill { pid, name, .. } | DialogState::SignalSelect { pid, name, .. } => {
+                (*pid, name.clone())
+            }
             _ => return,
         };
         self.kill_process_by(pid, &name, signal);
@@ -1718,21 +1912,28 @@ impl App {
 
     /// Kill a process by PID (direct, no dialog needed)
     fn kill_process_by(&mut self, pid: u32, name: &str, signal: u32) {
+        if self.readonly_blocked("kill processes") {
+            return;
+        }
         match crate::system::kill_process(pid, signal) {
             Ok(_) => {
-                self.status_message = Some((
-                    format!("Killed {} (PID {})", name, pid),
-                    Instant::now(),
-                ));
+                self.status_message =
+                    Some((format!("Killed {} (PID {})", name, pid), Instant::now()));
             }
             Err(e) => {
-                self.last_error = Some((format!("Failed to kill {} ({}): {}", name, pid, e), Instant::now()));
+                self.last_error = Some((
+                    format!("Failed to kill {} ({}): {}", name, pid, e),
+                    Instant::now(),
+                ));
             }
         }
     }
 
     /// Kill all tagged processes
     pub fn kill_tagged(&mut self, signal: u32) {
+        if self.readonly_blocked("kill processes") {
+            return;
+        }
         let pids: Vec<u32> = self.tagged_pids.iter().copied().collect();
         let total = pids.len();
         let mut killed = 0;
@@ -1743,14 +1944,21 @@ impl App {
                 Ok(_) => killed += 1,
                 Err(e) => {
                     failed += 1;
-                    self.last_error = Some((format!("Failed to kill process {}: {}", pid, e), Instant::now()));
+                    self.last_error = Some((
+                        format!("Failed to kill process {}: {}", pid, e),
+                        Instant::now(),
+                    ));
                 }
             }
         }
 
         if failed == 0 {
             self.status_message = Some((
-                format!("Killed {} process{}", killed, if killed == 1 { "" } else { "es" }),
+                format!(
+                    "Killed {} process{}",
+                    killed,
+                    if killed == 1 { "" } else { "es" }
+                ),
                 Instant::now(),
             ));
         } else {
@@ -1765,17 +1973,26 @@ impl App {
 
     /// Set priority class for selected process
     pub fn set_priority_selected(&mut self, priority_class: WindowsPriorityClass) {
+        if self.readonly_blocked("change process priority") {
+            return;
+        }
         let pid = match &self.dialog {
             DialogState::Priority { pid, .. } => *pid,
             _ => return,
         };
         if let Err(e) = crate::system::set_priority_class(pid, priority_class) {
-            self.last_error = Some((format!("Failed to set priority for {}: {}", pid, e), Instant::now()));
+            self.last_error = Some((
+                format!("Failed to set priority for {}: {}", pid, e),
+                Instant::now(),
+            ));
         }
     }
 
     /// Toggle efficiency mode for selected process
     pub fn toggle_efficiency_mode(&mut self) {
+        if self.readonly_blocked("change process efficiency mode") {
+            return;
+        }
         let (pid, name) = match &self.dialog {
             DialogState::Priority { pid, name, .. } => (*pid, name.clone()),
             _ => return,
@@ -1784,7 +2001,8 @@ impl App {
         // a background re-sort can move a different process under selected_index
         // while the Priority dialog is open, which would otherwise flip the wrong
         // direction or silently no-op.
-        let current = self.process_by_pid(pid)
+        let current = self
+            .process_by_pid(pid)
             .map(|p| p.efficiency_mode)
             .unwrap_or(false);
         let new_state = !current;
@@ -1809,7 +2027,10 @@ impl App {
                 }
             }
             Err(e) => {
-                self.last_error = Some((format!("Failed to set efficiency mode: {}", e), Instant::now()));
+                self.last_error = Some((
+                    format!("Failed to set efficiency mode: {}", e),
+                    Instant::now(),
+                ));
             }
         }
     }
@@ -1822,42 +2043,51 @@ impl App {
     /// Add character to input buffer
     pub fn input_char(&mut self, c: char) {
         if let Some((buffer, cursor)) = self.dialog.input_buffer_mut() {
+            *cursor = clamp_char_boundary(buffer, *cursor);
             buffer.insert(*cursor, c);
-            *cursor += 1;
+            *cursor += c.len_utf8();
         }
     }
 
     /// Delete character before cursor
     pub fn input_backspace(&mut self) {
         if let Some((buffer, cursor)) = self.dialog.input_buffer_mut()
-            && *cursor > 0 {
-                *cursor -= 1;
-                buffer.remove(*cursor);
-            }
+            && *cursor > 0
+        {
+            *cursor = clamp_char_boundary(buffer, *cursor);
+            let prev = prev_char_boundary(buffer, *cursor);
+            buffer.drain(prev..*cursor);
+            *cursor = prev;
+        }
     }
 
     /// Delete character at cursor
     pub fn input_delete(&mut self) {
         if let Some((buffer, cursor)) = self.dialog.input_buffer_mut()
-            && *cursor < buffer.len() {
-                buffer.remove(*cursor);
-            }
+            && *cursor < buffer.len()
+        {
+            *cursor = clamp_char_boundary(buffer, *cursor);
+            let next = next_char_boundary(buffer, *cursor);
+            buffer.drain(*cursor..next);
+        }
     }
 
     /// Move cursor left
     pub fn input_left(&mut self) {
-        if let Some((_, cursor)) = self.dialog.input_buffer_mut()
-            && *cursor > 0 {
-                *cursor -= 1;
-            }
+        if let Some((buffer, cursor)) = self.dialog.input_buffer_mut()
+            && *cursor > 0
+        {
+            *cursor = prev_char_boundary(buffer, *cursor);
+        }
     }
 
     /// Move cursor right
     pub fn input_right(&mut self) {
         if let Some((buffer, cursor)) = self.dialog.input_buffer_mut()
-            && *cursor < buffer.len() {
-                *cursor += 1;
-            }
+            && *cursor < buffer.len()
+        {
+            *cursor = next_char_boundary(buffer, *cursor);
+        }
     }
 
     /// Start search mode
@@ -1885,30 +2115,48 @@ impl App {
         if let Some(pid) = pid {
             self.tagged_pids.insert(pid);
             // Find and tag all descendants
-            self.tag_descendants(pid);
+            let mut visited = HashSet::new();
+            visited.insert(pid);
+            self.tag_descendants(pid, &mut visited, 0);
         }
     }
 
     /// Recursively tag all descendants of a process
-    fn tag_descendants(&mut self, parent_pid: u32) {
-        let children: Vec<u32> = self.processes
+    fn tag_descendants(&mut self, parent_pid: u32, visited: &mut HashSet<u32>, depth: usize) {
+        if depth > self.processes.len() {
+            return;
+        }
+        let children: Vec<u32> = self
+            .processes
             .iter()
-            .filter(|p| p.parent_pid == parent_pid)
+            .filter(|p| p.parent_pid == parent_pid && p.pid != parent_pid)
             .map(|p| p.pid)
             .collect();
 
         for child_pid in children {
+            if !visited.insert(child_pid) {
+                continue;
+            }
             self.tagged_pids.insert(child_pid);
-            self.tag_descendants(child_pid);
+            self.tag_descendants(child_pid, visited, depth + 1);
         }
     }
 
     /// Collect all descendant PIDs of a process (recursive)
-    fn collect_descendants(&self, parent_pid: u32, result: &mut Vec<u32>) {
+    fn collect_descendants(
+        &self,
+        parent_pid: u32,
+        result: &mut Vec<u32>,
+        visited: &mut HashSet<u32>,
+        depth: usize,
+    ) {
+        if depth > self.processes.len() {
+            return;
+        }
         for proc in &self.processes {
-            if proc.parent_pid == parent_pid {
+            if proc.parent_pid == parent_pid && proc.pid != parent_pid && visited.insert(proc.pid) {
                 result.push(proc.pid);
-                self.collect_descendants(proc.pid, result);
+                self.collect_descendants(proc.pid, result, visited, depth + 1);
             }
         }
     }
@@ -1917,7 +2165,9 @@ impl App {
     pub fn toggle_tag_branch(&mut self, pid: u32) {
         // Collect the process and all its descendants
         let mut branch_pids = vec![pid];
-        self.collect_descendants(pid, &mut branch_pids);
+        let mut visited = HashSet::new();
+        visited.insert(pid);
+        self.collect_descendants(pid, &mut branch_pids, &mut visited, 0);
 
         // Check if all are already tagged
         let all_tagged = branch_pids.iter().all(|p| self.tagged_pids.contains(p));
@@ -1937,7 +2187,8 @@ impl App {
 
     /// Enter user select mode
     pub fn enter_user_select_mode(&mut self) {
-        let mut users: Vec<String> = self.processes
+        let mut users: Vec<String> = self
+            .processes
             .iter()
             .map(|p| p.user.clone())
             .collect::<std::collections::HashSet<_>>()
@@ -1946,7 +2197,11 @@ impl App {
         users.sort();
 
         let index = if let Some(ref filter) = self.user_filter {
-            users.iter().position(|u| u == filter).map(|i| i + 1).unwrap_or(0)
+            users
+                .iter()
+                .position(|u| u == filter)
+                .map(|i| i + 1)
+                .unwrap_or(0)
         } else {
             0
         };
@@ -1966,30 +2221,57 @@ impl App {
     /// Enter environment view mode
     pub fn enter_environment_mode(&mut self) {
         if let Some(proc) = self.selected_process() {
-            self.dialog = DialogState::Environment { scroll: 0, pid: proc.pid };
+            self.dialog = DialogState::Environment {
+                scroll: 0,
+                pid: proc.pid,
+            };
         }
     }
 
     /// Enter command wrap view mode
     pub fn enter_command_wrap_mode(&mut self) {
         if let Some(proc) = self.selected_process() {
-            self.dialog = DialogState::CommandWrap { scroll: 0, pid: proc.pid };
+            self.dialog = DialogState::CommandWrap {
+                scroll: 0,
+                pid: proc.pid,
+            };
         }
     }
 
     /// Enter CPU affinity mode
     pub fn enter_affinity_mode(&mut self) {
+        if self.readonly_blocked("change CPU affinity") {
+            return;
+        }
         if let Some(proc) = self.selected_process() {
             let cpu_count = self.system_metrics.cpu.core_usage.len();
-            let all_cpus = if cpu_count >= 64 { u64::MAX } else { (1u64 << cpu_count) - 1 };
+            if cpu_count > 64 {
+                self.last_error = Some((
+                    "CPU affinity editing is not supported on systems with more than 64 logical CPUs".to_string(),
+                    Instant::now(),
+                ));
+                return;
+            }
+            let all_cpus = if cpu_count >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << cpu_count) - 1
+            };
             let pid = proc.pid;
             let mask = crate::system::get_process_affinity(pid).unwrap_or(all_cpus);
-            self.dialog = DialogState::Affinity { mask, selected: 0, pid };
+            self.dialog = DialogState::Affinity {
+                mask,
+                selected: 0,
+                pid,
+            };
         }
     }
 
     /// Apply CPU affinity to the process captured when the dialog was opened.
     pub fn apply_affinity(&mut self) {
+        if self.readonly_blocked("change CPU affinity") {
+            return;
+        }
         let (mask, pid) = match &self.dialog {
             DialogState::Affinity { mask, pid, .. } => (*mask, *pid),
             _ => return,
@@ -2014,9 +2296,10 @@ impl App {
         // Clear buffer if too much time has passed (1 second timeout)
         // or if buffer exceeds max PID length (u32 max is 10 digits)
         if let Some(last_time) = self.pid_search_time
-            && now.duration_since(last_time) > Duration::from_secs(1) {
-                self.pid_search_buffer.clear();
-            }
+            && now.duration_since(last_time) > Duration::from_secs(1)
+        {
+            self.pid_search_buffer.clear();
+        }
         if self.pid_search_buffer.len() >= 10 {
             self.pid_search_buffer.clear();
         }
@@ -2112,10 +2395,17 @@ mod tests {
     use super::*;
 
     fn assert_canonical_order(columns: &[String]) {
-        let ranks: Vec<usize> = columns.iter().map(|c| SortColumn::display_rank(c)).collect();
+        let ranks: Vec<usize> = columns
+            .iter()
+            .map(|c| SortColumn::display_rank(c))
+            .collect();
         let mut sorted = ranks.clone();
         sorted.sort_unstable();
-        assert_eq!(ranks, sorted, "columns not in canonical display order: {:?}", columns);
+        assert_eq!(
+            ranks, sorted,
+            "columns not in canonical display order: {:?}",
+            columns
+        );
     }
 
     #[test]
@@ -2126,7 +2416,10 @@ mod tests {
 
     #[test]
     fn display_order_groups_usage_and_keeps_command_last() {
-        assert_eq!(SortColumn::display_rank("Command"), SortColumn::all().len() - 1);
+        assert_eq!(
+            SortColumn::display_rank("Command"),
+            SortColumn::all().len() - 1
+        );
         // Usage block: CPU% MEM% GPU% GPU-MEM NPU% NPU-MEM, in that order
         let usage = ["CPU%", "MEM%", "GPU%", "GPU-MEM", "NPU%", "NPU-MEM"];
         let base = SortColumn::display_rank("CPU%");
@@ -2164,9 +2457,15 @@ mod tests {
         let mem_pos = defaults.iter().position(|c| c == "MEM%").unwrap();
         assert_eq!(canonical_insert_index(&defaults, "GPU%"), mem_pos + 1);
         // Command (canonically last) still appends at the very end
-        let no_command: Vec<String> =
-            defaults.iter().filter(|c| *c != "Command").cloned().collect();
-        assert_eq!(canonical_insert_index(&no_command, "Command"), no_command.len());
+        let no_command: Vec<String> = defaults
+            .iter()
+            .filter(|c| *c != "Command")
+            .cloned()
+            .collect();
+        assert_eq!(
+            canonical_insert_index(&no_command, "Command"),
+            no_command.len()
+        );
         // PPID slots in directly after PID
         assert_eq!(canonical_insert_index(&defaults, "PPID"), 1);
     }

@@ -39,6 +39,7 @@ pub struct ProcessCacheEntry {
     // I/O tracking (for rate delta calculation)
     pub prev_io_read: u64,
     pub prev_io_write: u64,
+    pub io_updated: Instant,
 
     // User info (never changes for a PID)
     pub user: Option<String>,
@@ -62,6 +63,7 @@ impl Default for ProcessCacheEntry {
             cpu_time_updated: Instant::now(),
             prev_io_read: 0,
             prev_io_write: 0,
+            io_updated: Instant::now(),
             user: None,
             is_elevated: None,
             arch: None,
@@ -72,7 +74,7 @@ impl Default for ProcessCacheEntry {
     }
 }
 
-/// Exe status cache entry (keyed by path+start_time, not PID)
+/// Exe status cache entry (keyed by path+process create FILETIME, not PID)
 #[derive(Clone)]
 pub struct ExeStatusEntry {
     pub updated: bool,
@@ -87,7 +89,7 @@ pub static CACHE: LazyLock<ProcessCache> = LazyLock::new(ProcessCache::new);
 pub struct ProcessCache {
     /// Per-PID cache entries
     entries: RwLock<HashMap<u32, ProcessCacheEntry>>,
-    /// Exe status cache (keyed by path+start_time)
+    /// Exe status cache (keyed by path+process create FILETIME)
     exe_status: RwLock<HashMap<(String, u64), ExeStatusEntry>>,
     /// Cleanup counter for periodic maintenance
     cleanup_counter: AtomicU32,
@@ -128,8 +130,17 @@ impl ProcessCache {
                 }
                 // First appearance (new PID or PID reuse): rate = 0, not a delta
                 let is_first = entry.create_time == 0 || entry.create_time != create_time;
-                let read_rate = if is_first { 0 } else { io_read.saturating_sub(entry.prev_io_read) };
-                let write_rate = if is_first { 0 } else { io_write.saturating_sub(entry.prev_io_write) };
+                let elapsed = now.duration_since(entry.io_updated).as_secs_f64();
+                let read_rate = if is_first || elapsed <= 0.0 {
+                    0
+                } else {
+                    (io_read.saturating_sub(entry.prev_io_read) as f64 / elapsed) as u64
+                };
+                let write_rate = if is_first || elapsed <= 0.0 {
+                    0
+                } else {
+                    (io_write.saturating_sub(entry.prev_io_write) as f64 / elapsed) as u64
+                };
                 io_rates.insert(pid, (read_rate, write_rate));
 
                 entry.create_time = create_time;
@@ -138,6 +149,7 @@ impl ProcessCache {
                 entry.cpu_time_updated = now;
                 entry.prev_io_read = io_read;
                 entry.prev_io_write = io_write;
+                entry.io_updated = now;
             }
         }
         io_rates
@@ -164,9 +176,10 @@ impl ProcessCache {
 
     /// Check exe status with caching
     /// Returns (exe_updated, exe_deleted)
-    pub fn check_exe_status(&self, exe_path: &str, start_time: u64) -> (bool, bool) {
+    pub fn check_exe_status(&self, exe_path: &str, start_time_100ns: u64) -> (bool, bool) {
         use std::fs;
         use std::time::UNIX_EPOCH;
+        const UNIX_EPOCH_FILETIME_100NS: u64 = 116444736000000000;
 
         if exe_path.is_empty() {
             return (false, false);
@@ -177,14 +190,15 @@ impl ProcessCache {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let cache_key = (exe_path.to_string(), start_time);
+        let cache_key = (exe_path.to_string(), start_time_100ns);
 
         // Check cache first
         if let Ok(cache) = self.exe_status.read()
             && let Some(entry) = cache.get(&cache_key)
-                && now.saturating_sub(entry.checked_at) < config::EXE_STATUS_TTL_SECS {
-                    return (entry.updated, entry.deleted);
-                }
+            && now.saturating_sub(entry.checked_at) < config::EXE_STATUS_TTL_SECS
+        {
+            return (entry.updated, entry.deleted);
+        }
 
         // Cache miss or stale - do filesystem check
         let result = match fs::metadata(exe_path) {
@@ -193,11 +207,17 @@ impl ProcessCache {
                     .modified()
                     .ok()
                     .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-                    .map(|mtime_unix| mtime_unix.as_secs() > start_time)
+                    .map(|mtime_unix| {
+                        let mtime_100ns = UNIX_EPOCH_FILETIME_100NS
+                            .saturating_add(mtime_unix.as_secs().saturating_mul(10_000_000))
+                            .saturating_add((mtime_unix.subsec_nanos() / 100) as u64);
+                        mtime_100ns > start_time_100ns
+                    })
                     .unwrap_or(false);
                 (exe_updated, false)
             }
-            Err(_) => (false, true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, true),
+            Err(_) => (false, false),
         };
 
         // Update cache (with size limit)
@@ -205,11 +225,14 @@ impl ProcessCache {
             if cache.len() > config::EXE_CACHE_MAX_SIZE {
                 cache.clear();
             }
-            cache.insert(cache_key, ExeStatusEntry {
-                updated: result.0,
-                deleted: result.1,
-                checked_at: now,
-            });
+            cache.insert(
+                cache_key,
+                ExeStatusEntry {
+                    updated: result.0,
+                    deleted: result.1,
+                    checked_at: now,
+                },
+            );
         }
 
         result
@@ -236,7 +259,9 @@ impl ProcessCache {
 
     /// Check if cleanup should run (every CLEANUP_INTERVAL refreshes)
     pub fn should_cleanup(&self) -> bool {
-        self.cleanup_counter.fetch_add(1, Ordering::Relaxed).is_multiple_of(config::CLEANUP_INTERVAL)
+        self.cleanup_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(config::CLEANUP_INTERVAL)
     }
 
     /// Remove entries for PIDs that no longer exist
@@ -246,8 +271,8 @@ impl ProcessCache {
             cache.retain(|pid, _| current_pids.contains(pid));
         }
 
-        // Exe status cache uses size-based cleanup (in check_exe_status)
-        // No PID-based cleanup needed since keys are (path, start_time)
+        // Exe status cache uses size-based cleanup (in check_exe_status).
+        // No PID-based cleanup needed since keys are (path, create FILETIME).
     }
 
     // ========== Batch Update Methods ==========
@@ -285,8 +310,10 @@ mod tests {
         assert_eq!(rates[&100], (0, 0)); // First appearance → zero rate
 
         // Second tick: delta-based rate
+        std::thread::sleep(std::time::Duration::from_millis(10));
         let rates = cache.update_times_batch(&[(100, 700, 800, 9999, 1500, 2800)]);
-        assert_eq!(rates[&100], (500, 800)); // 1500-1000, 2800-2000
+        assert!(rates[&100].0 > 0); // bytes/sec from 1500-1000 over elapsed time
+        assert!(rates[&100].1 > 0); // bytes/sec from 2800-2000 over elapsed time
 
         // PID reuse (different create_time): rate resets to 0
         let rates = cache.update_times_batch(&[(100, 10, 20, 5555, 300, 400)]);
@@ -323,10 +350,7 @@ mod tests {
     #[test]
     fn test_with_read() {
         let cache = ProcessCache::new();
-        cache.update_times_batch(&[
-            (1, 100, 200, 1, 0, 0),
-            (2, 300, 400, 2, 0, 0),
-        ]);
+        cache.update_times_batch(&[(1, 100, 200, 1, 0, 0), (2, 300, 400, 2, 0, 0)]);
         cache.set_user(1, "user1".to_string());
 
         cache.with_read(|c| {

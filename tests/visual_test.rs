@@ -1,383 +1,156 @@
-//! Visual regression testing for htop-win
+//! Deterministic visual smoke test for the htop-win TUI.
 //!
-//! This module provides tools to capture terminal output and compare
-//! against htop reference screenshots.
+//! The test renders the real app UI into the in-memory terminal buffer and
+//! compares it with raw snapshot lines. It intentionally avoids live system data
+//! so failures reflect rendering changes, not the machine running the test.
 
-use std::fs;
-use std::path::Path;
+use std::time::Duration;
 
-/// ANSI color codes used by htop
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum HtopColor {
-    Black,
-    Red,
-    Green,
-    Yellow,
-    Blue,
-    Magenta,
-    Cyan,
-    White,
-    BrightBlack,
-    BrightRed,
-    BrightGreen,
-    BrightYellow,
-    BrightBlue,
-    BrightMagenta,
-    BrightCyan,
-    BrightWhite,
-}
+use htop_win::app::{App, ScreenTab, SortColumn};
+use htop_win::config::Config;
+use htop_win::system::{CpuInfo, MemoryInfo, ProcessArch, ProcessInfo, SystemMetrics};
+use htop_win::terminal::{Buffer, Frame, Rect};
 
-/// A single cell in the terminal
-#[derive(Debug, Clone)]
-pub struct Cell {
-    pub char: char,
-    pub fg: HtopColor,
-    pub bg: HtopColor,
-    pub bold: bool,
-}
-
-impl Default for Cell {
-    fn default() -> Self {
-        Self {
-            char: ' ',
-            fg: HtopColor::White,
-            bg: HtopColor::Black,
-            bold: false,
-        }
+fn fixture_process(pid: u32, user: &str, name: &str, cpu: f32, mem: f32) -> ProcessInfo {
+    ProcessInfo {
+        pid,
+        parent_pid: 4,
+        name: name.to_string(),
+        exe_path: format!(r"C:\Program Files\{name}\{name}.exe"),
+        command: format!(r"C:\Program Files\{name}\{name}.exe --fixture"),
+        user: user.to_string(),
+        status: if cpu > 20.0 { 'R' } else { 'S' },
+        cpu_percent: cpu,
+        mem_percent: mem,
+        virtual_mem: 256 * 1024 * 1024,
+        resident_mem: 64 * 1024 * 1024,
+        shared_mem: 16 * 1024 * 1024,
+        priority: 20,
+        cpu_time: Duration::from_secs(75),
+        tree_depth: 0,
+        tree_prefix: String::new(),
+        has_children: false,
+        is_collapsed: false,
+        thread_count: 8,
+        start_time: 1_700_000_000,
+        create_time_100ns: 133_444_736_000_000_000 + pid as u64,
+        handle_count: 128,
+        io_read_bytes: 1024,
+        io_write_bytes: 2048,
+        io_read_rate: 512,
+        io_write_rate: 256,
+        gpu_percent: 0.0,
+        gpu_memory: 0,
+        npu_percent: 0.0,
+        npu_memory: 0,
+        name_lower: name.to_lowercase(),
+        command_lower: name.to_lowercase(),
+        user_lower: user.to_lowercase(),
+        matches_search: false,
+        efficiency_mode: false,
+        is_elevated: false,
+        arch: ProcessArch::Native,
+        exe_updated: false,
+        exe_deleted: false,
     }
 }
 
-/// A captured terminal screen
-#[derive(Debug, Clone)]
-pub struct Screen {
-    pub width: usize,
-    pub height: usize,
-    pub cells: Vec<Vec<Cell>>,
+fn fixture_app() -> App {
+    let mut config = Config::default();
+    config.visible_columns = vec![
+        "PID".to_string(),
+        "USER".to_string(),
+        "CPU%".to_string(),
+        "MEM%".to_string(),
+        "TIME+".to_string(),
+        "Command".to_string(),
+    ];
+    config.highlight_large_numbers = false;
+
+    let mut app = App::new(config.clone());
+    app.show_header = false;
+    app.screen_tabs = vec![ScreenTab {
+        name: "Main".to_string(),
+        columns: config.visible_columns.clone(),
+        sort_column: SortColumn::Pid,
+        sort_ascending: true,
+    }];
+    app.active_tab = 0;
+    app.sort_column = SortColumn::Pid;
+    app.sort_ascending = true;
+    app.update_visible_columns_cache();
+
+    let mut metrics = SystemMetrics::default();
+    metrics.cpu = CpuInfo {
+        core_usage: vec![12.5, 25.0],
+        core_breakdown: Vec::new(),
+    };
+    metrics.memory = MemoryInfo {
+        total: 8 * 1024 * 1024 * 1024,
+        used: 3 * 1024 * 1024 * 1024,
+        shared: 512 * 1024 * 1024,
+        buffers: 0,
+        cached: 1024 * 1024 * 1024,
+        used_percent: 37.5,
+        swap_total: 2 * 1024 * 1024 * 1024,
+        swap_used: 0,
+        swap_percent: 0.0,
+    };
+    metrics.tasks_total = 3;
+    metrics.threads_total = 24;
+    app.system_metrics = metrics;
+
+    app.processes = vec![
+        fixture_process(100, "SYSTEM", "SystemIdle", 0.0, 0.1),
+        fixture_process(200, "alice", "Shell", 12.5, 1.5),
+        fixture_process(300, "builder", "RustCompiler", 42.0, 4.0),
+    ];
+    app.update_displayed_processes();
+    app
 }
 
-impl Screen {
-    pub fn new(width: usize, height: usize) -> Self {
-        let cells = vec![vec![Cell::default(); width]; height];
-        Self { width, height, cells }
-    }
+fn render_fixture_text() -> String {
+    let mut app = fixture_app();
+    let area = Rect::new(0, 0, 120, 10);
+    let mut buffer = Buffer::empty(area);
+    let mut frame = Frame::new(&mut buffer);
 
-    /// Convert to plain text (no colors)
-    pub fn to_text(&self) -> String {
-        self.cells
-            .iter()
-            .map(|row| row.iter().map(|c| c.char).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
+    htop_win::ui::draw(&mut frame, &mut app);
 
-    /// Compare two screens and return a diff report
-    pub fn diff(&self, other: &Screen) -> ScreenDiff {
-        let mut diff = ScreenDiff::new();
-
-        if self.width != other.width || self.height != other.height {
-            diff.size_mismatch = Some((
-                (self.width, self.height),
-                (other.width, other.height),
-            ));
-            return diff;
-        }
-
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let a = &self.cells[y][x];
-                let b = &other.cells[y][x];
-
-                if a.char != b.char {
-                    diff.char_diffs.push(CharDiff {
-                        x,
-                        y,
-                        expected: a.char,
-                        actual: b.char,
-                    });
-                }
-
-                if a.fg != b.fg || a.bg != b.bg {
-                    diff.color_diffs.push(ColorDiff {
-                        x,
-                        y,
-                        expected_fg: a.fg,
-                        expected_bg: a.bg,
-                        actual_fg: b.fg,
-                        actual_bg: b.bg,
-                    });
-                }
-            }
-        }
-
-        diff
-    }
-}
-
-/// Difference between two screens
-#[derive(Debug)]
-pub struct ScreenDiff {
-    pub size_mismatch: Option<((usize, usize), (usize, usize))>,
-    pub char_diffs: Vec<CharDiff>,
-    pub color_diffs: Vec<ColorDiff>,
-}
-
-impl Default for ScreenDiff {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ScreenDiff {
-    pub fn new() -> Self {
-        Self {
-            size_mismatch: None,
-            char_diffs: Vec::new(),
-            color_diffs: Vec::new(),
-        }
-    }
-
-    pub fn is_identical(&self) -> bool {
-        self.size_mismatch.is_none()
-            && self.char_diffs.is_empty()
-            && self.color_diffs.is_empty()
-    }
-
-    /// Calculate similarity percentage (characters only)
-    pub fn similarity(&self, total_cells: usize) -> f64 {
-        if self.size_mismatch.is_some() {
-            return 0.0;
-        }
-        let diff_count = self.char_diffs.len();
-        ((total_cells - diff_count) as f64 / total_cells as f64) * 100.0
-    }
-}
-
-#[derive(Debug)]
-pub struct CharDiff {
-    pub x: usize,
-    pub y: usize,
-    pub expected: char,
-    pub actual: char,
-}
-
-#[derive(Debug)]
-pub struct ColorDiff {
-    pub x: usize,
-    pub y: usize,
-    pub expected_fg: HtopColor,
-    pub expected_bg: HtopColor,
-    pub actual_fg: HtopColor,
-    pub actual_bg: HtopColor,
-}
-
-/// htop reference patterns for validation
-pub struct HtopPatterns;
-
-impl HtopPatterns {
-    /// Validate CPU bar format
-    pub fn validate_cpu_bar(line: &str) -> Result<(), String> {
-        // Pattern: "  N[||||...    XX.X%]" where N is CPU number
-        if !line.contains('[') || !line.contains(']') {
-            return Err("CPU bar must contain [ and ]".to_string());
-        }
-
-        if !line.contains('%') {
-            return Err("CPU bar must show percentage".to_string());
-        }
-
-        // Check for valid bar characters
-        let bar_content: String = line
-            .chars()
-            .skip_while(|c| *c != '[')
-            .skip(1)
-            .take_while(|c| *c != ']')
-            .filter(|c| *c != '|' && *c != ' ' && !c.is_numeric() && *c != '.' && *c != '%')
-            .collect();
-
-        if !bar_content.is_empty() {
-            return Err(format!("Invalid characters in bar: {}", bar_content));
-        }
-
-        Ok(())
-    }
-
-    /// Validate memory bar format
-    pub fn validate_memory_bar(line: &str) -> Result<(), String> {
-        if !line.starts_with("Mem[") && !line.starts_with("Swp[") {
-            return Err("Memory bar must start with 'Mem[' or 'Swp['".to_string());
-        }
-
-        if !line.contains('/') {
-            return Err("Memory bar must show used/total format".to_string());
-        }
-
-        Ok(())
-    }
-
-    /// Validate process list header
-    pub fn validate_header(line: &str) -> Result<(), String> {
-        let required_columns = ["PID", "CPU", "MEM", "Command"];
-
-        for col in required_columns {
-            if !line.contains(col) {
-                return Err(format!("Header missing column: {}", col));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Validate function key bar
-    pub fn validate_footer(line: &str) -> Result<(), String> {
-        // Should contain F1-F10 labels
-        let required = ["F1", "F10"];
-
-        for key in required {
-            if !line.contains(key) {
-                return Err(format!("Footer missing: {}", key));
-            }
-        }
-
-        Ok(())
-    }
-}
-
-/// Test runner for visual tests
-pub struct VisualTestRunner {
-    snapshots_dir: String,
-}
-
-impl VisualTestRunner {
-    pub fn new(snapshots_dir: &str) -> Self {
-        Self {
-            snapshots_dir: snapshots_dir.to_string(),
-        }
-    }
-
-    /// Save a snapshot
-    pub fn save_snapshot(&self, name: &str, content: &str) -> std::io::Result<()> {
-        let path = Path::new(&self.snapshots_dir).join(format!("{}.txt", name));
-        fs::create_dir_all(&self.snapshots_dir)?;
-        fs::write(path, content)
-    }
-
-    /// Load a snapshot
-    pub fn load_snapshot(&self, name: &str) -> std::io::Result<String> {
-        let path = Path::new(&self.snapshots_dir).join(format!("{}.txt", name));
-        fs::read_to_string(path)
-    }
-
-    /// Compare against snapshot
-    pub fn compare_snapshot(&self, name: &str, actual: &str) -> Result<(), String> {
-        match self.load_snapshot(name) {
-            Ok(expected) => {
-                if expected == actual {
-                    Ok(())
-                } else {
-                    // Generate diff
-                    let expected_lines: Vec<&str> = expected.lines().collect();
-                    let actual_lines: Vec<&str> = actual.lines().collect();
-
-                    let mut diff_report = String::new();
-                    let max_lines = expected_lines.len().max(actual_lines.len());
-
-                    for i in 0..max_lines {
-                        let exp = expected_lines.get(i).unwrap_or(&"<missing>");
-                        let act = actual_lines.get(i).unwrap_or(&"<missing>");
-
-                        if exp != act {
-                            diff_report.push_str(&format!(
-                                "Line {}: expected '{}', got '{}'\n",
-                                i + 1,
-                                exp,
-                                act
-                            ));
-                        }
-                    }
-
-                    Err(diff_report)
+    (0..area.height)
+        .map(|y| {
+            let mut line = String::new();
+            for x in 0..area.width {
+                if let Some(cell) = buffer.get(x, y) {
+                    line.push_str(&cell.symbol);
                 }
             }
-            Err(e) => Err(format!("Failed to load snapshot '{}': {}", name, e)),
-        }
-    }
+            line.trim_end().to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn normalize_cells(line: &str) -> String {
+    line.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 
-    #[test]
-    fn test_cpu_bar_validation() {
-        assert!(HtopPatterns::validate_cpu_bar("  0[||||||||            25.0%]").is_ok());
-        assert!(HtopPatterns::validate_cpu_bar("  1[||||||||||||||||||||100.0%]").is_ok());
-        assert!(HtopPatterns::validate_cpu_bar("  2[                      0.0%]").is_ok());
+#[test]
+fn visual_snapshot_renders_real_app() {
+    let actual = render_fixture_text();
+    let snapshot = include_str!("snapshots/htop_reference.txt");
+    let actual_lines = actual.lines().map(normalize_cells).collect::<Vec<_>>();
 
-        // Invalid patterns
-        assert!(HtopPatterns::validate_cpu_bar("invalid").is_err());
-        assert!(HtopPatterns::validate_cpu_bar("no brackets").is_err());
-    }
+    assert!(
+        !snapshot.contains("LINE 01:"),
+        "visual snapshot must be raw rendered text, not annotated prose"
+    );
 
-    #[test]
-    fn test_memory_bar_validation() {
-        assert!(HtopPatterns::validate_memory_bar("Mem[||||||||   1.5G/8.0G]").is_ok());
-        assert!(HtopPatterns::validate_memory_bar("Swp[         0K/2.0G]").is_ok());
-
-        assert!(HtopPatterns::validate_memory_bar("Memory: 50%").is_err());
-    }
-
-    #[test]
-    fn test_header_validation() {
-        assert!(HtopPatterns::validate_header(
-            "  PID USER      PRI  NI  VIRT   RES   SHR S CPU% MEM%   TIME+  Command"
-        )
-        .is_ok());
-
-        assert!(HtopPatterns::validate_header("Invalid header").is_err());
-    }
-
-    #[test]
-    fn test_footer_validation() {
-        assert!(HtopPatterns::validate_footer(
-            "F1Help F2Setup F3Search F4Filter F5Tree F6SortBy F7Nice- F8Nice+ F9Kill F10Quit"
-        )
-        .is_ok());
-
-        assert!(HtopPatterns::validate_footer("Press Q to quit").is_err());
-    }
-
-    #[test]
-    fn test_screen_diff() {
-        let mut screen1 = Screen::new(10, 2);
-        screen1.cells[0][0].char = 'A';
-        screen1.cells[0][1].char = 'B';
-
-        let mut screen2 = Screen::new(10, 2);
-        screen2.cells[0][0].char = 'A';
-        screen2.cells[0][1].char = 'X'; // Different!
-
-        let diff = screen1.diff(&screen2);
-        assert!(!diff.is_identical());
-        assert_eq!(diff.char_diffs.len(), 1);
-        assert_eq!(diff.char_diffs[0].x, 1);
-        assert_eq!(diff.char_diffs[0].y, 0);
-        assert_eq!(diff.char_diffs[0].expected, 'B');
-        assert_eq!(diff.char_diffs[0].actual, 'X');
-    }
-
-    #[test]
-    fn test_similarity_calculation() {
-        let screen1 = Screen::new(10, 10);
-        let mut screen2 = Screen::new(10, 10);
-
-        // Make 10 cells different (10% difference)
-        for i in 0..10 {
-            screen2.cells[0][i].char = 'X';
-        }
-
-        let diff = screen1.diff(&screen2);
-        let similarity = diff.similarity(100);
-
-        assert!((similarity - 90.0).abs() < 0.1, "Should be ~90% similar");
+    for expected in snapshot.lines().filter(|line| !line.trim().is_empty()) {
+        let expected = normalize_cells(expected);
+        assert!(
+            actual_lines.iter().any(|line| line.contains(&expected)),
+            "rendered UI did not contain snapshot line `{expected}`\n\nactual:\n{actual}"
+        );
     }
 }

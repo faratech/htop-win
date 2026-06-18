@@ -120,13 +120,12 @@ pub struct Config {
     // Confirmation dialogs
     /// Show confirmation dialog before killing processes
     pub confirm_kill: bool,
-
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            refresh_rate_ms: 1500,  // htop default: 15 tenths of a second
+            refresh_rate_ms: 1500, // htop default: 15 tenths of a second
             tree_view_default: false,
             color_scheme: ColorScheme::Default,
 
@@ -137,7 +136,7 @@ impl Default for Config {
             highlight_large_numbers: true,
             highlight_new_processes: true,
             highlight_duration_ms: 3000,
-            highlight_basename: false,  // htop default: highlightBaseName = false
+            highlight_basename: false, // htop default: highlightBaseName = false
 
             show_cpu_meters: true,
             show_memory_meter: true,
@@ -180,26 +179,38 @@ impl Default for Config {
 
             mouse_enabled: true,
             readonly: false,
-            confirm_kill: true,  // Show confirmation dialogs by default
+            confirm_kill: true, // Show confirmation dialogs by default
         }
     }
 }
 
 impl Config {
     /// Get the config file path
+    #[cfg(windows)]
     pub fn config_path() -> Option<PathBuf> {
         // Use Windows API directly instead of `directories` crate
+        use windows::Win32::UI::Shell::{
+            FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+        };
         use windows::core::PWSTR;
-        use windows::Win32::UI::Shell::{FOLDERID_RoamingAppData, SHGetKnownFolderPath, KF_FLAG_DEFAULT};
 
         unsafe {
-            let path: PWSTR = SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, None).ok()?;
+            let path: PWSTR =
+                SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, None).ok()?;
             let len = (0..).take_while(|&i| *path.0.add(i) != 0).count();
             let slice = std::slice::from_raw_parts(path.0, len);
             let appdata = PathBuf::from(String::from_utf16_lossy(slice));
             windows::Win32::System::Com::CoTaskMemFree(Some(path.0 as *const _));
             Some(appdata.join("htop-win").join("config").join("config.json"))
         }
+    }
+
+    #[cfg(not(windows))]
+    pub fn config_path() -> Option<PathBuf> {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+            .map(|base| base.join("htop-win").join("config.json"))
     }
 
     /// Load configuration from file, or return defaults
@@ -260,7 +271,7 @@ impl Config {
         };
 
         // Parse visible_columns array
-        let visible_columns = v
+        let mut visible_columns = v
             .get("visible_columns")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -269,6 +280,48 @@ impl Config {
                     .collect()
             })
             .unwrap_or_else(|| defaults.visible_columns.clone());
+        visible_columns.retain(|c| crate::app::SortColumn::from_name(c).is_some());
+        if visible_columns.is_empty() {
+            visible_columns = defaults.visible_columns.clone();
+        }
+
+        let screen_tabs = v
+            .get("screen_tabs")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| {
+                let tabs: Vec<crate::app::ScreenTab> = arr
+                    .iter()
+                    .filter_map(|tab_val| {
+                        let name = tab_val.get("name")?.as_str()?.to_string();
+                        let columns: Vec<String> = tab_val
+                            .get("columns")?
+                            .as_array()?
+                            .iter()
+                            .filter_map(|c| c.as_str().map(String::from))
+                            .filter(|c| crate::app::SortColumn::from_name(c).is_some())
+                            .collect();
+                        if name.is_empty() || columns.is_empty() {
+                            return None;
+                        }
+                        let sort_key = tab_val
+                            .get("sort_key")
+                            .and_then(|v| v.as_str())
+                            .and_then(crate::app::SortColumn::from_name)
+                            .unwrap_or(crate::app::SortColumn::Cpu);
+                        let sort_ascending = tab_val
+                            .get("sort_ascending")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        Some(crate::app::ScreenTab {
+                            name,
+                            columns,
+                            sort_column: sort_key,
+                            sort_ascending,
+                        })
+                    })
+                    .collect();
+                if tabs.is_empty() { None } else { Some(tabs) }
+            });
 
         Self {
             refresh_rate_ms: get_u64("refresh_rate_ms", defaults.refresh_rate_ms).max(100),
@@ -330,30 +383,7 @@ impl Config {
 
             visible_columns,
 
-            // Parse screen_tabs array
-            screen_tabs: v.get("screen_tabs").and_then(|v| v.as_array()).map(|arr| {
-                arr.iter().filter_map(|tab_val| {
-                    let name = tab_val.get("name")?.as_str()?.to_string();
-                    let columns: Vec<String> = tab_val.get("columns")?
-                        .as_array()?
-                        .iter()
-                        .filter_map(|c| c.as_str().map(String::from))
-                        .collect();
-                    let sort_key = tab_val.get("sort_key")
-                        .and_then(|v| v.as_str())
-                        .and_then(crate::app::SortColumn::from_name)
-                        .unwrap_or(crate::app::SortColumn::Cpu);
-                    let sort_ascending = tab_val.get("sort_ascending")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    Some(crate::app::ScreenTab {
-                        name,
-                        columns,
-                        sort_column: sort_key,
-                        sort_ascending,
-                    })
-                }).collect()
-            }),
+            screen_tabs,
 
             mouse_enabled: get_bool("mouse_enabled", defaults.mouse_enabled),
             readonly: get_bool("readonly", defaults.readonly),
@@ -441,10 +471,7 @@ impl Config {
         );
         map.insert("show_disk_io".to_string(), Value::Bool(self.show_disk_io));
         map.insert("show_clock".to_string(), Value::Bool(self.show_clock));
-        map.insert(
-            "show_hostname".to_string(),
-            Value::Bool(self.show_hostname),
-        );
+        map.insert("show_hostname".to_string(), Value::Bool(self.show_hostname));
         map.insert("show_battery".to_string(), Value::Bool(self.show_battery));
         map.insert(
             "show_gpu_meter".to_string(),
@@ -488,23 +515,35 @@ impl Config {
 
         // Serialize screen_tabs if present
         if let Some(ref tabs) = self.screen_tabs {
-            let tabs_json: Vec<Value> = tabs.iter().map(|tab| {
-                let mut tab_map = HashMap::new();
-                tab_map.insert("name".to_string(), Value::String(tab.name.clone()));
-                tab_map.insert("columns".to_string(), Value::Array(
-                    tab.columns.iter().map(|c| Value::String(c.clone())).collect(),
-                ));
-                tab_map.insert("sort_key".to_string(), Value::String(tab.sort_column.name().to_string()));
-                tab_map.insert("sort_ascending".to_string(), Value::Bool(tab.sort_ascending));
-                Value::Object(tab_map)
-            }).collect();
+            let tabs_json: Vec<Value> = tabs
+                .iter()
+                .map(|tab| {
+                    let mut tab_map = HashMap::new();
+                    tab_map.insert("name".to_string(), Value::String(tab.name.clone()));
+                    tab_map.insert(
+                        "columns".to_string(),
+                        Value::Array(
+                            tab.columns
+                                .iter()
+                                .map(|c| Value::String(c.clone()))
+                                .collect(),
+                        ),
+                    );
+                    tab_map.insert(
+                        "sort_key".to_string(),
+                        Value::String(tab.sort_column.name().to_string()),
+                    );
+                    tab_map.insert(
+                        "sort_ascending".to_string(),
+                        Value::Bool(tab.sort_ascending),
+                    );
+                    Value::Object(tab_map)
+                })
+                .collect();
             map.insert("screen_tabs".to_string(), Value::Array(tabs_json));
         }
 
-        map.insert(
-            "mouse_enabled".to_string(),
-            Value::Bool(self.mouse_enabled),
-        );
+        map.insert("mouse_enabled".to_string(), Value::Bool(self.mouse_enabled));
         map.insert("readonly".to_string(), Value::Bool(self.readonly));
         map.insert("confirm_kill".to_string(), Value::Bool(self.confirm_kill));
 

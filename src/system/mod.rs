@@ -1,20 +1,79 @@
 mod cpu;
+#[cfg(windows)]
 mod d3dkmt;
-mod memory;
-mod native;
+#[cfg(not(windows))]
+mod d3dkmt {
+    use std::collections::HashMap;
+
+    #[derive(Clone, Default)]
+    pub struct AdapterMetrics {
+        pub name: String,
+        pub utilization: f32,
+        pub mem_used: u64,
+        pub mem_total: u64,
+        pub dedicated_used: u64,
+        pub dedicated_total: u64,
+        pub shared_used: u64,
+    }
+
+    impl AdapterMetrics {
+        pub fn meter_memory(&self) -> (u64, u64) {
+            (self.mem_used, self.mem_total)
+        }
+    }
+
+    pub type NpuInfo = AdapterMetrics;
+    pub type GpuInfo = AdapterMetrics;
+
+    #[derive(Clone, Default)]
+    pub struct AdapterSnapshot {
+        pub gpu: Option<GpuInfo>,
+        pub npu: Option<NpuInfo>,
+    }
+
+    #[derive(Clone, Copy, Default)]
+    pub struct ProcAdapterStats {
+        pub gpu_percent: f32,
+        pub gpu_memory: u64,
+        pub npu_percent: f32,
+        pub npu_memory: u64,
+    }
+
+    pub fn set_gpu_process_stats_enabled(_enabled: bool) {}
+    pub fn set_npu_process_stats_enabled(_enabled: bool) {}
+    pub fn set_gpu_selection(_name: Option<String>) {}
+    pub fn gpu_names() -> Vec<String> {
+        Vec::new()
+    }
+    pub fn process_stats_enabled() -> bool {
+        false
+    }
+    pub fn refresh() -> AdapterSnapshot {
+        AdapterSnapshot::default()
+    }
+    pub fn process_stats(_processes: &[(u32, u64)]) -> HashMap<u32, ProcAdapterStats> {
+        HashMap::new()
+    }
+    pub fn debug_dump() -> String {
+        "D3DKMT adapter metrics are only available on Windows".to_string()
+    }
+}
 pub mod cache;
+mod memory;
+#[cfg(windows)]
+mod native;
 mod process;
 
-pub use cpu::{debug_dump as cpu_debug_dump, CpuInfo};
+pub use cpu::{CpuInfo, debug_dump as cpu_debug_dump};
 pub use d3dkmt::{
-    debug_dump as gpu_debug_dump, gpu_names, set_gpu_process_stats_enabled, set_gpu_selection,
-    set_npu_process_stats_enabled, GpuInfo, NpuInfo,
+    GpuInfo, NpuInfo, debug_dump as gpu_debug_dump, gpu_names, set_gpu_process_stats_enabled,
+    set_gpu_selection, set_npu_process_stats_enabled,
 };
-pub use memory::{format_bytes, MemoryInfo};
+pub use memory::{MemoryInfo, format_bytes};
 pub use process::{
-    enable_debug_privilege, enrich_processes, get_process_affinity, get_process_exe_path,
-    get_process_io_counters, kill_process, set_efficiency_mode, set_priority_class,
-    set_process_affinity, ProcessInfo,
+    ProcessArch, ProcessInfo, enable_debug_privilege, enrich_processes, get_process_affinity,
+    get_process_exe_path, get_process_io_counters, kill_process, set_efficiency_mode,
+    set_priority_class, set_process_affinity,
 };
 
 /// System metrics
@@ -48,6 +107,7 @@ pub struct SystemMetrics {
     // Previous values for rate calculation
     prev_net_rx: u64,
     prev_net_tx: u64,
+    prev_net_sample: std::time::Instant,
     prev_disk_read: u64,
     prev_disk_write: u64,
     // Native process enumeration state
@@ -80,6 +140,7 @@ impl Default for SystemMetrics {
             npu: None,
             prev_net_rx: 0,
             prev_net_tx: 0,
+            prev_net_sample: std::time::Instant::now(),
             prev_disk_read: 0,
             prev_disk_write: 0,
             prev_total_cpu_time: 0,
@@ -89,14 +150,21 @@ impl Default for SystemMetrics {
 }
 
 /// Get system uptime in seconds using native Windows API
+#[cfg(windows)]
 fn get_uptime() -> u64 {
     use windows::Win32::System::SystemInformation::GetTickCount64;
     unsafe { GetTickCount64() / 1000 }
 }
 
+#[cfg(not(windows))]
+fn get_uptime() -> u64 {
+    0
+}
+
 /// Get hostname using native Windows API
+#[cfg(windows)]
 fn get_hostname() -> String {
-    use windows::Win32::System::SystemInformation::{GetComputerNameExW, ComputerNameDnsHostname};
+    use windows::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
     use windows::core::PWSTR;
 
     let mut size: u32 = 0;
@@ -115,12 +183,21 @@ fn get_hostname() -> String {
             ComputerNameDnsHostname,
             Some(PWSTR(buffer.as_mut_ptr())),
             &mut size,
-        ).is_ok() {
+        )
+        .is_ok()
+        {
             String::from_utf16_lossy(&buffer[..size as usize])
         } else {
             "unknown".to_string()
         }
     }
+}
+
+#[cfg(not(windows))]
+fn get_hostname() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string())
 }
 
 /// Network interface statistics
@@ -129,10 +206,22 @@ struct NetworkStats {
     tx_bytes: u64,
 }
 
+#[inline]
+fn bytes_per_second(delta: u64, elapsed_secs: f64) -> u64 {
+    if elapsed_secs <= 0.0 {
+        0
+    } else {
+        (delta as f64 / elapsed_secs) as u64
+    }
+}
+
 /// Get network I/O stats using native Windows IP Helper API
+#[cfg(windows)]
 fn get_network_stats() -> NetworkStats {
     use windows::Win32::Foundation::WIN32_ERROR;
-    use windows::Win32::NetworkManagement::IpHelper::{GetIfTable2, FreeMibTable, MIB_IF_TABLE2, IF_TYPE_SOFTWARE_LOOPBACK};
+    use windows::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIfTable2, IF_TYPE_SOFTWARE_LOOPBACK, MIB_IF_TABLE2,
+    };
     use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 
     let mut total_rx: u64 = 0;
@@ -162,6 +251,14 @@ fn get_network_stats() -> NetworkStats {
     }
 }
 
+#[cfg(not(windows))]
+fn get_network_stats() -> NetworkStats {
+    NetworkStats {
+        rx_bytes: 0,
+        tx_bytes: 0,
+    }
+}
+
 impl SystemMetrics {
     /// Refresh system metrics (CPU, memory, uptime, hostname, battery, network)
     /// Does NOT refresh processes - use get_processes_native() for that
@@ -183,8 +280,13 @@ impl SystemMetrics {
         // Update network I/O using native API
         {
             let net_stats = get_network_stats();
-            self.net_rx_rate = net_stats.rx_bytes.saturating_sub(self.prev_net_rx);
-            self.net_tx_rate = net_stats.tx_bytes.saturating_sub(self.prev_net_tx);
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(self.prev_net_sample).as_secs_f64();
+            self.net_rx_rate =
+                bytes_per_second(net_stats.rx_bytes.saturating_sub(self.prev_net_rx), elapsed);
+            self.net_tx_rate =
+                bytes_per_second(net_stats.tx_bytes.saturating_sub(self.prev_net_tx), elapsed);
+            self.prev_net_sample = now;
             self.prev_net_rx = net_stats.rx_bytes;
             self.prev_net_tx = net_stats.tx_bytes;
             self.net_rx_bytes = net_stats.rx_bytes;
@@ -202,6 +304,7 @@ impl SystemMetrics {
 
     fn update_battery(&mut self) {
         // Use Windows API for battery status
+        #[cfg(windows)]
         {
             use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
             let mut status = SYSTEM_POWER_STATUS::default();
@@ -217,14 +320,20 @@ impl SystemMetrics {
                 }
             }
         }
+        #[cfg(not(windows))]
+        {
+            self.battery_percent = None;
+            self.battery_charging = false;
+        }
     }
 
     /// Update existing processes using native NtQuerySystemInformation
     /// Reuse existing ProcessInfo structs to avoid memory allocation for strings
+    #[cfg(windows)]
     pub fn update_processes_native(&mut self, processes: &mut Vec<ProcessInfo>) {
-        use std::collections::{HashMap, HashSet};
-        use self::native::{with_process_list, calculate_process_rates, filetime_to_unix};
         use self::cache::CACHE;
+        use self::native::{calculate_process_rates, with_process_list};
+        use std::collections::{HashMap, HashSet};
 
         // Periodically clean up stale PIDs from caches
         if CACHE.should_cleanup() {
@@ -237,6 +346,7 @@ impl SystemMetrics {
         let _ = with_process_list(|proc_list| {
             // Update time tracking for CPU delta calculation
             let now = std::time::Instant::now();
+            let disk_elapsed = now.duration_since(self.last_native_refresh).as_secs_f64();
             self.last_native_refresh = now;
 
             // First pass: Calculate totals and CPU percentages
@@ -265,12 +375,18 @@ impl SystemMetrics {
             self.tasks_total = tasks_total;
             // Windows doesn't expose per-process running/sleeping state like Linux.
             // Exclude System Idle Process (PID 0) from task count; don't fabricate sleep counts.
-            self.tasks_running = self.tasks_total.saturating_sub(1);
+            self.tasks_running = 0;
             self.tasks_sleeping = 0;
             self.threads_total = threads_total;
 
-            self.disk_read_rate = total_disk_read.saturating_sub(self.prev_disk_read);
-            self.disk_write_rate = total_disk_write.saturating_sub(self.prev_disk_write);
+            self.disk_read_rate = bytes_per_second(
+                total_disk_read.saturating_sub(self.prev_disk_read),
+                disk_elapsed,
+            );
+            self.disk_write_rate = bytes_per_second(
+                total_disk_write.saturating_sub(self.prev_disk_write),
+                disk_elapsed,
+            );
             self.prev_disk_read = total_disk_read;
             self.prev_disk_write = total_disk_write;
             self.disk_read_bytes = total_disk_read;
@@ -294,7 +410,10 @@ impl SystemMetrics {
             // the all-PIDs vector on the common path where stats are disabled;
             // still call process_stats(&[]) so its gate-change bookkeeping runs.
             let adapter_stats = if d3dkmt::process_stats_enabled() {
-                let pids: Vec<u32> = proc_list.iter().map(|p| p.pid()).collect();
+                let pids: Vec<(u32, u64)> = proc_list
+                    .iter()
+                    .map(|p| (p.pid(), p.create_time()))
+                    .collect();
                 d3dkmt::process_stats(&pids)
             } else {
                 d3dkmt::process_stats(&[])
@@ -305,14 +424,15 @@ impl SystemMetrics {
                 let pid = raw_proc.pid();
                 seen_pids.insert(pid);
                 let cpu_pct = rates.cpu_percentages.get(&pid).copied().unwrap_or(0.0);
-                let (io_read_rate, io_write_rate) = rates.io_rates.get(&pid).copied().unwrap_or((0, 0));
+                let (io_read_rate, io_write_rate) =
+                    rates.io_rates.get(&pid).copied().unwrap_or((0, 0));
                 let proc_adapter = adapter_stats.get(&pid).copied().unwrap_or_default();
 
                 if let Some(&idx) = existing_map.get(&pid) {
-                    let native_start = filetime_to_unix(raw_proc.create_time());
+                    let native_start = raw_proc.create_time();
                     let existing_proc = &mut processes[idx];
 
-                    if (native_start as i64 - existing_proc.start_time as i64).abs() <= 1 {
+                    if native_start == existing_proc.create_time_100ns {
                         // Update existing process (reuses string allocations)
                         existing_proc.update_from_raw(&raw_proc, cpu_pct, total_mem);
                     } else {
@@ -345,5 +465,18 @@ impl SystemMetrics {
                 processes.append(&mut new_processes);
             }
         });
+    }
+
+    #[cfg(not(windows))]
+    pub fn update_processes_native(&mut self, processes: &mut Vec<ProcessInfo>) {
+        processes.clear();
+        self.tasks_total = 0;
+        self.tasks_running = 0;
+        self.tasks_sleeping = 0;
+        self.threads_total = 0;
+        self.disk_read_bytes = 0;
+        self.disk_write_bytes = 0;
+        self.disk_read_rate = 0;
+        self.disk_write_rate = 0;
     }
 }

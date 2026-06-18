@@ -1,39 +1,36 @@
+#[cfg(windows)]
 use std::collections::HashMap;
 use std::time::Duration;
 
+#[cfg(windows)]
 use super::native::{SystemProcess, filetime_to_unix};
 
 #[cfg(windows)]
-use windows::core::PWSTR;
-#[cfg(windows)]
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, SetLastError, WIN32_ERROR};
 #[cfg(windows)]
 use windows::Win32::Security::{
-    AdjustTokenPrivileges, GetTokenInformation, LookupAccountSidW, LookupPrivilegeValueW,
-    TokenElevation, TokenUser, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, SID_NAME_USE,
-    TOKEN_ADJUST_PRIVILEGES, TOKEN_ELEVATION, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
-};
-#[cfg(windows)]
-use windows::Win32::System::ProcessStatus::{
-    K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
-};
-#[cfg(windows)]
-use windows::Win32::System::Threading::IO_COUNTERS;
-#[cfg(windows)]
-use windows::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessInformation, GetProcessIoCounters,
-    IsWow64Process2, OpenProcess, OpenProcessToken, ProcessMachineTypeInfo, ProcessPowerThrottling,
-    QueryFullProcessImageNameW, SetPriorityClass, TerminateProcess,
-    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, HIGH_PRIORITY_CLASS,
-    IDLE_PRIORITY_CLASS, NORMAL_PRIORITY_CLASS, PROCESS_MACHINE_INFORMATION, PROCESS_NAME_WIN32,
-    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
-    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
-    PROCESS_TERMINATE, REALTIME_PRIORITY_CLASS,
+    AdjustTokenPrivileges, GetTokenInformation, LUID_AND_ATTRIBUTES, LookupAccountSidW,
+    LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED, SID_NAME_USE, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_ELEVATION, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser,
 };
 #[cfg(windows)]
 use windows::Win32::System::SystemInformation::{
     IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386,
 };
+#[cfg(windows)]
+use windows::Win32::System::Threading::IO_COUNTERS;
+#[cfg(windows)]
+use windows::Win32::System::Threading::{
+    ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess,
+    GetProcessInformation, GetProcessIoCounters, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS,
+    IsWow64Process2, NORMAL_PRIORITY_CLASS, OpenProcess, OpenProcessToken,
+    PROCESS_MACHINE_INFORMATION, PROCESS_NAME_WIN32, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+    PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_SET_INFORMATION, PROCESS_TERMINATE, ProcessMachineTypeInfo, ProcessPowerThrottling,
+    QueryFullProcessImageNameW, REALTIME_PRIORITY_CLASS, SetPriorityClass, TerminateProcess,
+};
+#[cfg(windows)]
+use windows::core::PWSTR;
 
 /// Enable SeDebugPrivilege to access process information for service accounts
 /// This allows reading tokens for NETWORK SERVICE, LOCAL SERVICE, etc.
@@ -47,7 +44,9 @@ pub fn enable_debug_privilege() -> bool {
             GetCurrentProcess(),
             TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
             &mut token,
-        ).is_err() {
+        )
+        .is_err()
+        {
             return false;
         }
 
@@ -66,7 +65,9 @@ pub fn enable_debug_privilege() -> bool {
             }],
         };
 
-        let result = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None).is_ok();
+        SetLastError(WIN32_ERROR(0));
+        let result = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None).is_ok()
+            && GetLastError().0 != 1300; // ERROR_NOT_ALL_ASSIGNED
         let _ = CloseHandle(token);
         result
     }
@@ -82,23 +83,26 @@ pub fn enable_debug_privilege() -> bool {
 /// Delegates to unified cache module.
 #[cfg(windows)]
 #[inline]
-fn check_exe_status(exe_path: &str, start_time: u64) -> (bool, bool) {
-    super::cache::CACHE.check_exe_status(exe_path, start_time)
+fn check_exe_status(exe_path: &str, start_time_100ns: u64) -> (bool, bool) {
+    super::cache::CACHE.check_exe_status(exe_path, start_time_100ns)
 }
 
 #[cfg(not(windows))]
-fn check_exe_status(_exe_path: &str, _start_time: u64) -> (bool, bool) {
+fn check_exe_status(_exe_path: &str, _start_time_100ns: u64) -> (bool, bool) {
     (false, false)
 }
-
 
 // Common usernames as UTF-16 for fast comparison (avoids UTF-16 to UTF-8 conversion)
 #[cfg(windows)]
 const SYSTEM_UTF16: [u16; 6] = [0x53, 0x59, 0x53, 0x54, 0x45, 0x4D]; // "SYSTEM"
 #[cfg(windows)]
-const LOCAL_SERVICE_UTF16: [u16; 13] = [0x4C, 0x4F, 0x43, 0x41, 0x4C, 0x20, 0x53, 0x45, 0x52, 0x56, 0x49, 0x43, 0x45]; // "LOCAL SERVICE"
+const LOCAL_SERVICE_UTF16: [u16; 13] = [
+    0x4C, 0x4F, 0x43, 0x41, 0x4C, 0x20, 0x53, 0x45, 0x52, 0x56, 0x49, 0x43, 0x45,
+]; // "LOCAL SERVICE"
 #[cfg(windows)]
-const NETWORK_SERVICE_UTF16: [u16; 15] = [0x4E, 0x45, 0x54, 0x57, 0x4F, 0x52, 0x4B, 0x20, 0x53, 0x45, 0x52, 0x56, 0x49, 0x43, 0x45]; // "NETWORK SERVICE"
+const NETWORK_SERVICE_UTF16: [u16; 15] = [
+    0x4E, 0x45, 0x54, 0x57, 0x4F, 0x52, 0x4B, 0x20, 0x53, 0x45, 0x52, 0x56, 0x49, 0x43, 0x45,
+]; // "NETWORK SERVICE"
 
 // Pre-allocated static strings for common usernames
 #[cfg(windows)]
@@ -126,7 +130,6 @@ fn intern_username_utf16(name: &[u16]) -> String {
     String::from_utf16_lossy(name)
 }
 
-
 /// Clean up caches by removing entries for PIDs that no longer exist
 /// Delegates to unified cache module
 #[cfg(windows)]
@@ -138,10 +141,10 @@ pub fn cleanup_stale_caches(current_pids: &std::collections::HashSet<u32>) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ProcessArch {
     #[default]
-    Native,   // Native architecture (matches OS)
-    X86,      // 32-bit x86 (WoW64 on x64/ARM64)
-    X64,      // x64 running on ARM64 via emulation
-    ARM64,    // Native ARM64
+    Native, // Native architecture (matches OS)
+    X86,   // 32-bit x86 (WoW64 on x64/ARM64)
+    X64,   // x64 running on ARM64 via emulation
+    ARM64, // Native ARM64
 }
 
 impl ProcessArch {
@@ -175,32 +178,29 @@ pub(crate) fn open_process_query(pid: u32) -> Option<HANDLE> {
     }
 }
 
-/// Query shared memory (WorkingSetSize - PrivateUsage) from a process handle
-#[cfg(windows)]
-#[inline]
-fn query_shared_mem(handle: HANDLE) -> u64 {
-    unsafe {
-        let mut mem = PROCESS_MEMORY_COUNTERS_EX::default();
-        mem.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        if K32GetProcessMemoryInfo(handle, &mut mem as *mut _ as *mut PROCESS_MEMORY_COUNTERS, mem.cb).as_bool() {
-            (mem.WorkingSetSize as u64).saturating_sub(mem.PrivateUsage as u64)
-        } else {
-            0
-        }
-    }
-}
-
 /// Query the full executable path from a process handle
 #[cfg(windows)]
 #[inline]
 fn query_exe_path(handle: HANDLE) -> String {
     unsafe {
-        let mut buffer = [0u16; 1024];
-        let mut size = buffer.len() as u32;
-        if QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut size).is_ok() {
-            String::from_utf16_lossy(&buffer[..size as usize])
-        } else {
-            String::new()
+        let mut capacity = 1024usize;
+        loop {
+            let mut buffer = vec![0u16; capacity];
+            let mut size = buffer.len() as u32;
+            if QueryFullProcessImageNameW(
+                handle,
+                PROCESS_NAME_WIN32,
+                PWSTR(buffer.as_mut_ptr()),
+                &mut size,
+            )
+            .is_ok()
+            {
+                return String::from_utf16_lossy(&buffer[..size as usize]);
+            }
+            if capacity >= 32768 {
+                return String::new();
+            }
+            capacity *= 2;
         }
     }
 }
@@ -218,7 +218,8 @@ fn get_user_from_token(token_handle: HANDLE, pid: u32) -> Option<String> {
         }
 
         // Allocate buffer and get token info
-        let mut token_info: Vec<u8> = vec![0; token_info_len as usize];
+        let mut token_info: Vec<usize> =
+            vec![0; (token_info_len as usize).div_ceil(std::mem::size_of::<usize>())];
         if GetTokenInformation(
             token_handle,
             TokenUser,
@@ -275,7 +276,9 @@ pub fn get_process_io_counters(pid: u32) -> (u64, u64) {
         let mut io = IO_COUNTERS::default();
         let result = if GetProcessIoCounters(handle, &mut io).is_ok() {
             (io.ReadTransferCount, io.WriteTransferCount)
-        } else { (0, 0) };
+        } else {
+            (0, 0)
+        };
         let _ = CloseHandle(handle);
         result
     }
@@ -294,7 +297,9 @@ pub fn get_process_exe_path(pid: u32) -> String {
         None => return String::new(),
     };
     let result = query_exe_path(handle);
-    unsafe { let _ = CloseHandle(handle); }
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
     result
 }
 
@@ -314,6 +319,14 @@ struct EnrichedProcessData {
     /// cache's TTL timestamp must NOT be bumped — otherwise it never expires and the
     /// indicator freezes at its first-seen value for any continuously-visible process.
     efficiency_fresh: bool,
+    /// True only when architecture was actually queried or is a known synthetic
+    /// system-process value.
+    arch_fresh: bool,
+    /// True only when a non-empty executable path was actually queried or is a
+    /// known synthetic system-process value.
+    exe_path_fresh: bool,
+    /// True only when TokenElevation returned an authoritative elevation result.
+    elevation_fresh: bool,
     is_elevated: bool,
     arch: ProcessArch,
     user: Option<String>,
@@ -335,13 +348,12 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
     // of cloning the entire cache map (`snapshot()`) every refresh. The lock is
     // released before the per-process syscalls below — those must NOT run while
     // holding it, or they would stall the collector thread's cache write lock.
-    let cache_snapshot: HashMap<u32, super::cache::ProcessCacheEntry> =
-        CACHE.with_read(|cache| {
-            processes
-                .iter()
-                .filter_map(|p| cache.get(&p.pid).map(|e| (p.pid, e.clone())))
-                .collect()
-        });
+    let cache_snapshot: HashMap<u32, super::cache::ProcessCacheEntry> = CACHE.with_read(|cache| {
+        processes
+            .iter()
+            .filter_map(|p| cache.get(&p.pid).map(|e| (p.pid, e.clone())))
+            .collect()
+    });
     let now = std::time::Instant::now();
 
     // Query data sequentially - parallel overhead exceeds benefit for this workload
@@ -355,7 +367,10 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                     shared_mem: 0,
                     efficiency_mode: false,
                     efficiency_fresh: false,
-                    is_elevated: pid == 4,  // System process is elevated
+                    arch_fresh: true,
+                    exe_path_fresh: true,
+                    elevation_fresh: true,
+                    is_elevated: pid == 4, // System process is elevated
                     arch: ProcessArch::Native,
                     user: Some(SYSTEM_STR.to_string()),
                     exe_path: String::new(),
@@ -365,13 +380,12 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             // Get cached entry from unified snapshot
             let cached_entry = cache_snapshot.get(&pid);
 
-            // Check what we have cached
-            let cached_static = cached_entry.and_then(|e| {
-                match (&e.is_elevated, &e.arch, &e.exe_path) {
-                    (Some(elev), Some(arch), Some(path)) => Some((*elev, *arch, path.clone())),
-                    _ => None,
-                }
-            });
+            // Check each cached fact independently. A failed query for one field
+            // must not cause unrelated cached facts to be ignored or overwritten
+            // with fabricated defaults.
+            let cached_elevation = cached_entry.and_then(|e| e.is_elevated);
+            let cached_arch = cached_entry.and_then(|e| e.arch);
+            let cached_exe_path = cached_entry.and_then(|e| e.exe_path.clone());
             let cached_user = cached_entry.and_then(|e| e.user.clone());
 
             // Check if efficiency cache is still valid (within TTL)
@@ -386,13 +400,19 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             };
 
             // Determine what we need to query
-            let need_static = cached_static.is_none();
+            let need_arch = cached_arch.is_none();
+            let need_elevation = cached_elevation.is_none();
             let need_user = cached_user.is_none();
             let need_efficiency = !efficiency_valid;
-            let need_exe_path = fetch_exe_path && cached_static.as_ref().map(|(_, _, p)| p.is_empty()).unwrap_or(true);
+            let need_exe_path = fetch_exe_path
+                && cached_exe_path
+                    .as_ref()
+                    .map(|p| p.is_empty())
+                    .unwrap_or(true);
 
             // Skip OpenProcess entirely if we have all cached data and don't need times
-            let need_handle = need_static || need_user || need_efficiency || need_exe_path;
+            let need_handle =
+                need_arch || need_elevation || need_user || need_efficiency || need_exe_path;
 
             let handle = if need_handle {
                 open_process_query(pid)
@@ -402,8 +422,6 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
 
             // If we couldn't get a handle but need one, use cached data if available
             if need_handle && handle.is_none() {
-                let (is_elevated, arch, exe_path) = cached_static
-                    .unwrap_or((false, ProcessArch::Native, String::new()));
                 let user = cached_user;
                 let efficiency_mode = cached_efficiency_mode.unwrap_or(false);
 
@@ -412,34 +430,31 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                     shared_mem: 0,
                     efficiency_mode,
                     efficiency_fresh: false, // served from cache (no handle)
-                    is_elevated,
-                    arch,
+                    arch_fresh: false,
+                    exe_path_fresh: false,
+                    elevation_fresh: false,
+                    is_elevated: cached_elevation.unwrap_or(false),
+                    arch: cached_arch.unwrap_or(ProcessArch::Native),
                     user,
-                    exe_path,
+                    exe_path: cached_exe_path.unwrap_or_default(),
                 };
             }
 
-            // Query shared memory (not available from NtQuerySystemInformation)
-            // Note: cpu_time and start_time are already provided by NtQuerySystemInformation in from_native,
-            // so we don't query them here to avoid inconsistency between visible and non-visible processes.
-            let shared_mem = if let Some(h) = handle {
-                query_shared_mem(h)
-            } else {
-                0
-            };
+            // Shared memory comes from the native private working-set field.
+            // PROCESS_MEMORY_COUNTERS_EX::PrivateUsage is private commit, not
+            // private resident working set, so handle-based fallback would be
+            // semantically wrong.
+            let shared_mem = p.shared_mem;
 
-            // Use cached exe_path or query if needed
+            // Use cached exe_path or query if needed.
+            let mut exe_path_fresh = false;
             let exe_path = if fetch_exe_path {
-                if let Some((_, _, ref path)) = cached_static {
-                    if !path.is_empty() {
-                        path.clone()
-                    } else if let Some(h) = handle {
-                        query_exe_path(h)
-                    } else {
-                        String::new()
-                    }
+                if let Some(path) = cached_exe_path.as_ref().filter(|p| !p.is_empty()) {
+                    path.clone()
                 } else if let Some(h) = handle {
-                    query_exe_path(h)
+                    let path = query_exe_path(h);
+                    exe_path_fresh = !path.is_empty();
+                    path
                 } else {
                     String::new()
                 }
@@ -457,100 +472,99 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                         ..Default::default()
                     };
                     let result = GetProcessInformation(
-                        h, ProcessPowerThrottling,
+                        h,
+                        ProcessPowerThrottling,
                         &mut throttle_state as *mut _ as *mut _,
                         std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
                     );
                     result.is_ok()
-                        && (throttle_state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
-                        && (throttle_state.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED) != 0
+                        && (throttle_state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED)
+                            != 0
+                        && (throttle_state.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED)
+                            != 0
                 }
             } else {
                 false
             };
 
-            // Use cached elevation/arch if available, otherwise query
-            // Consolidate token operations - open once for both elevation and user
-            let (is_elevated, arch, user) = if let Some((elevated, arch, _)) = cached_static.as_ref() {
-                // Use cached elevation/arch, still need to check user cache
-                let user = cached_user.clone();
-                (*elevated, *arch, user)
+            // Use cached architecture if available, otherwise query it. Query
+            // failures return Native for the visible row but are not cached.
+            let (arch, arch_fresh) = if let Some(arch) = cached_arch {
+                (arch, false)
             } else if let Some(h) = handle {
-                // Query architecture first (doesn't need token)
-                let arch = unsafe {
+                unsafe {
                     let mut process_machine = IMAGE_FILE_MACHINE::default();
                     let mut native_machine = IMAGE_FILE_MACHINE::default();
                     if IsWow64Process2(h, &mut process_machine, Some(&mut native_machine)).is_ok() {
-                        // native_machine tells us the host OS architecture
-                        // process_machine tells us what the process is running as
-                        //
-                        // IMPORTANT: IsWow64Process2 only detects WOW64 (32-bit) emulation.
-                        // x64 processes running under emulation on ARM64 return process_machine=0,
-                        // same as native processes! We must use GetProcessInformation to distinguish.
-                        //
-                        // On ARM64 host:
-                        //   - ARM64 native: process_machine=0, GetProcessInformation→ARM64
-                        //   - x64 emulated: process_machine=0, GetProcessInformation→AMD64 → show [x64]
-                        //   - x86 WoW64: process_machine=I386 → show [x86]
-                        //
-                        // On x64 host:
-                        //   - x64 native process: process_machine=0 → Native (don't show)
-                        //   - x86 WoW64: process_machine=I386 → show [x86]
-
                         if process_machine == IMAGE_FILE_MACHINE_I386 {
-                            ProcessArch::X86
+                            (ProcessArch::X86, true)
                         } else if process_machine == IMAGE_FILE_MACHINE_AMD64 {
-                            ProcessArch::X64
+                            (ProcessArch::X64, true)
                         } else if process_machine == IMAGE_FILE_MACHINE_ARM64 {
-                            ProcessArch::ARM64
+                            (ProcessArch::ARM64, true)
                         } else if process_machine.0 == 0 {
-                            // Not a WOW64 process - could be native OR x64 emulated on ARM64
-                            // Use GetProcessInformation to get actual machine type
                             if native_machine == IMAGE_FILE_MACHINE_ARM64 {
-                                // On ARM64 host, need to distinguish native ARM64 from emulated x64
                                 let mut machine_info = PROCESS_MACHINE_INFORMATION::default();
                                 if GetProcessInformation(
                                     h,
                                     ProcessMachineTypeInfo,
                                     &mut machine_info as *mut _ as *mut _,
                                     std::mem::size_of::<PROCESS_MACHINE_INFORMATION>() as u32,
-                                ).is_ok() {
+                                )
+                                .is_ok()
+                                {
                                     if machine_info.ProcessMachine == IMAGE_FILE_MACHINE_AMD64 {
-                                        ProcessArch::X64
+                                        (ProcessArch::X64, true)
                                     } else {
-                                        ProcessArch::Native
+                                        (ProcessArch::Native, true)
                                     }
                                 } else {
-                                    ProcessArch::Native
+                                    (ProcessArch::Native, false)
                                 }
                             } else {
-                                // On x64 host, process_machine=0 means native x64
-                                ProcessArch::Native
+                                (ProcessArch::Native, true)
                             }
                         } else {
-                            ProcessArch::Native
+                            (ProcessArch::Native, true)
                         }
                     } else {
-                        ProcessArch::Native
+                        (ProcessArch::Native, false)
                     }
-                };
+                }
+            } else {
+                (ProcessArch::Native, false)
+            };
 
-                // Open token ONCE for both elevation and user queries
-                let (elevated, user) = unsafe {
+            // Open token once for both elevation and user queries. Elevation is
+            // cached only when TokenElevation itself succeeds.
+            let (is_elevated, user, elevation_fresh) = if cached_elevation.is_some()
+                && cached_user.is_some()
+            {
+                (
+                    cached_elevation.unwrap_or(false),
+                    cached_user.clone(),
+                    false,
+                )
+            } else if let Some(h) = handle {
+                unsafe {
                     let mut token_handle = HANDLE::default();
                     if OpenProcessToken(h, TOKEN_QUERY, &mut token_handle).is_ok() {
-                        // Query elevation
-                        let mut elevation = TOKEN_ELEVATION::default();
-                        let mut return_length: u32 = 0;
-                        let elev = GetTokenInformation(
-                            token_handle,
-                            TokenElevation,
-                            Some(&mut elevation as *mut _ as *mut _),
-                            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                            &mut return_length,
-                        ).is_ok() && elevation.TokenIsElevated != 0;
+                        let (elevated, elevation_fresh) = if let Some(elevated) = cached_elevation {
+                            (elevated, false)
+                        } else {
+                            let mut elevation = TOKEN_ELEVATION::default();
+                            let mut return_length: u32 = 0;
+                            let elev_result = GetTokenInformation(
+                                token_handle,
+                                TokenElevation,
+                                Some(&mut elevation as *mut _ as *mut _),
+                                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+                                &mut return_length,
+                            )
+                            .is_ok();
+                            (elev_result && elevation.TokenIsElevated != 0, elev_result)
+                        };
 
-                        // Query user from same token (if not cached)
                         let user = if cached_user.is_some() {
                             cached_user.clone()
                         } else {
@@ -558,19 +572,27 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                         };
 
                         let _ = CloseHandle(token_handle);
-                        (elev, user)
+                        (elevated, user, elevation_fresh)
                     } else {
-                        (false, cached_user.clone())
+                        (
+                            cached_elevation.unwrap_or(false),
+                            cached_user.clone(),
+                            false,
+                        )
                     }
-                };
-
-                (elevated, arch, user)
+                }
             } else {
-                (false, ProcessArch::Native, cached_user.clone())
+                (
+                    cached_elevation.unwrap_or(false),
+                    cached_user.clone(),
+                    false,
+                )
             };
 
             if let Some(h) = handle {
-                unsafe { let _ = CloseHandle(h); }
+                unsafe {
+                    let _ = CloseHandle(h);
+                }
             }
 
             EnrichedProcessData {
@@ -579,6 +601,9 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                 efficiency_mode,
                 // Fresh only when we actually opened a handle and queried it.
                 efficiency_fresh: need_efficiency && handle.is_some(),
+                arch_fresh,
+                exe_path_fresh,
+                elevation_fresh,
                 is_elevated,
                 arch,
                 user,
@@ -590,19 +615,23 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
     // Build lookup map once (used for both the cache update and the struct update
     // below). Previously the cache-update closure did a linear `find` per PID,
     // which was O(n^2) over the visible slice.
-    let data_map: HashMap<u32, &EnrichedProcessData> = enriched_data
-        .iter()
-        .map(|d| (d.pid, d))
-        .collect();
+    let data_map: HashMap<u32, &EnrichedProcessData> =
+        enriched_data.iter().map(|d| (d.pid, d)).collect();
 
     // Update unified cache with newly queried data (single lock acquisition)
     {
         let pids: Vec<u32> = enriched_data.iter().map(|d| d.pid).collect();
         CACHE.update_batch(&pids, |pid, entry| {
             if let Some(data) = data_map.get(&pid) {
-                entry.is_elevated = Some(data.is_elevated);
-                entry.arch = Some(data.arch);
-                entry.exe_path = Some(data.exe_path.clone());
+                if data.arch_fresh {
+                    entry.arch = Some(data.arch);
+                }
+                if data.exe_path_fresh {
+                    entry.exe_path = Some(data.exe_path.clone());
+                }
+                if data.elevation_fresh {
+                    entry.is_elevated = Some(data.is_elevated);
+                }
                 // Only refresh the efficiency TTL when it was actually re-queried;
                 // bumping it on cache-served values would keep the 30s TTL from ever
                 // expiring, freezing the indicator for continuously-visible rows.
@@ -622,7 +651,10 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
     // This caused a bug where rows appeared to "stop updating" when sorting changed which processes were visible.
     for proc in processes.iter_mut() {
         if let Some(data) = data_map.get(&proc.pid) {
-            // Only update shared_mem if we got valid data (not available from NtQuerySystemInformation)
+            // Only update shared_mem if we got valid data. The raw process pass
+            // already computes this from private working set; this fallback is
+            // for entries that still have zero because the kernel value was not
+            // available.
             if data.shared_mem != 0 {
                 proc.shared_mem = data.shared_mem;
             }
@@ -630,10 +662,11 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             proc.is_elevated = data.is_elevated;
             proc.arch = data.arch;
             if let Some(ref user) = data.user
-                && *user != proc.user {
-                    proc.user = user.clone();
-                    proc.user_lower = user.to_lowercase();
-                }
+                && *user != proc.user
+            {
+                proc.user = user.clone();
+                proc.user_lower = user.to_lowercase();
+            }
             // Update exe_path and command if we got a valid path
             if !data.exe_path.is_empty() && data.exe_path != proc.exe_path {
                 proc.exe_path = data.exe_path.clone();
@@ -701,19 +734,20 @@ pub struct ProcessInfo {
     pub tree_depth: usize,
     pub tree_prefix: String, // Tree display prefix (├─, └─, │, etc.)
     // New fields for extended features
-    pub has_children: bool,  // Has child processes (for tree view)
-    pub is_collapsed: bool,  // Is collapsed in tree view
-    pub thread_count: u32,   // Number of threads
-    pub start_time: u64,     // Process start time (Unix timestamp)
-    pub handle_count: u32,   // Number of handles (Windows)
-    pub io_read_bytes: u64,  // I/O bytes read (cumulative)
-    pub io_write_bytes: u64, // I/O bytes written (cumulative)
-    pub io_read_rate: u64,   // I/O read bytes since last refresh
-    pub io_write_rate: u64,  // I/O write bytes since last refresh
-    pub gpu_percent: f32,    // GPU utilization (max across all GPU engine nodes)
-    pub gpu_memory: u64,     // GPU committed bytes across all GPU adapters
-    pub npu_percent: f32,    // NPU utilization (max across NPU engine nodes)
-    pub npu_memory: u64,     // NPU dedicated + shared committed bytes
+    pub has_children: bool,     // Has child processes (for tree view)
+    pub is_collapsed: bool,     // Is collapsed in tree view
+    pub thread_count: u32,      // Number of threads
+    pub start_time: u64,        // Process start time (Unix timestamp)
+    pub create_time_100ns: u64, // Raw Windows FILETIME process creation timestamp
+    pub handle_count: u32,      // Number of handles (Windows)
+    pub io_read_bytes: u64,     // I/O bytes read (cumulative)
+    pub io_write_bytes: u64,    // I/O bytes written (cumulative)
+    pub io_read_rate: u64,      // I/O read bytes per second
+    pub io_write_rate: u64,     // I/O write bytes per second
+    pub gpu_percent: f32,       // GPU utilization (max across all GPU engine nodes)
+    pub gpu_memory: u64,        // GPU committed bytes across all GPU adapters
+    pub npu_percent: f32,       // NPU utilization (max across NPU engine nodes)
+    pub npu_memory: u64,        // NPU dedicated + shared committed bytes
     // Pre-computed lowercase strings for efficient filtering (avoid per-filter allocations)
     pub name_lower: String,
     pub command_lower: String,
@@ -749,12 +783,8 @@ impl ProcessInfo {
     }
 
     /// Update existing ProcessInfo from raw SystemProcess (avoids reallocation)
-    pub fn update_from_raw(
-        &mut self,
-        proc: &SystemProcess,
-        cpu_percent: f32,
-        total_mem: u64,
-    ) {
+    #[cfg(windows)]
+    pub fn update_from_raw(&mut self, proc: &SystemProcess, cpu_percent: f32, total_mem: u64) {
         self.cpu_percent = cpu_percent;
         self.mem_percent = if total_mem > 0 {
             (proc.working_set() as f64 / total_mem as f64 * 100.0) as f32
@@ -764,13 +794,15 @@ impl ProcessInfo {
 
         self.virtual_mem = proc.virtual_size();
         self.resident_mem = proc.working_set();
-        self.shared_mem = proc.working_set().saturating_sub(proc.private_bytes());
+        self.shared_mem = proc
+            .working_set()
+            .saturating_sub(proc.private_working_set());
         self.priority = proc.base_priority();
         self.thread_count = proc.thread_count();
         self.handle_count = proc.handle_count();
         self.io_read_bytes = proc.read_bytes();
         self.io_write_bytes = proc.write_bytes();
-        
+
         self.parent_pid = proc.parent_pid();
 
         let total_100ns = proc.kernel_time() + proc.user_time();
@@ -779,19 +811,19 @@ impl ProcessInfo {
             ((total_100ns % 10_000_000) * 100) as u32,
         );
 
-        let (exe_updated, exe_deleted) = check_exe_status(&self.exe_path, self.start_time);
+        self.create_time_100ns = proc.create_time();
+        self.start_time = filetime_to_unix(self.create_time_100ns);
+
+        let (exe_updated, exe_deleted) = check_exe_status(&self.exe_path, self.create_time_100ns);
         self.exe_updated = exe_updated;
         self.exe_deleted = exe_deleted;
     }
 
     /// Create ProcessInfo from raw SystemProcess
-    pub fn from_raw(
-        proc: &SystemProcess,
-        cpu_percent: f32,
-        total_mem: u64,
-    ) -> Self {
+    #[cfg(windows)]
+    pub fn from_raw(proc: &SystemProcess, cpu_percent: f32, total_mem: u64) -> Self {
         use super::cache::{CACHE, config};
-        
+
         let pid = proc.pid();
         let now = std::time::Instant::now();
 
@@ -803,22 +835,22 @@ impl ProcessInfo {
             CACHE.with_read(|cache| {
                 let cached_entry = cache.get(&pid);
 
-                // Get cached static info
-                let (is_elevated, arch, cached_exe_path) = cached_entry
-                    .and_then(|e| {
-                        match (&e.is_elevated, &e.arch, &e.exe_path) {
-                            (Some(elev), Some(arch), Some(path)) => Some((*elev, *arch, path.clone())),
-                            _ => None,
-                        }
-                    })
-                    .unwrap_or((false, ProcessArch::Native, String::new()));
+                let is_elevated = cached_entry.and_then(|e| e.is_elevated).unwrap_or(false);
+                let arch = cached_entry
+                    .and_then(|e| e.arch)
+                    .unwrap_or(ProcessArch::Native);
+                let cached_exe_path = cached_entry
+                    .and_then(|e| e.exe_path.clone())
+                    .unwrap_or_default();
 
                 let efficiency_mode = cached_entry
                     .and_then(|e| {
-                        if let (Some(mode), Some(updated)) = (e.efficiency_mode, e.efficiency_updated)
-                            && now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS {
-                                return Some(mode);
-                            }
+                        if let (Some(mode), Some(updated)) =
+                            (e.efficiency_mode, e.efficiency_updated)
+                            && now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS
+                        {
+                            return Some(mode);
+                        }
                         None
                     })
                     .unwrap_or(false);
@@ -848,11 +880,12 @@ impl ProcessInfo {
             ((total_100ns % 10_000_000) * 100) as u32,
         );
 
-        let start_time = filetime_to_unix(proc.create_time());
+        let create_time_100ns = proc.create_time();
+        let start_time = filetime_to_unix(create_time_100ns);
 
         // Parse name only here (allocation)
         let name = proc.name();
-        
+
         let (exe_path, command, command_lower) = if !cached_exe_path.is_empty() {
             let lower = cached_exe_path.to_lowercase();
             (cached_exe_path.clone(), cached_exe_path, lower)
@@ -860,7 +893,7 @@ impl ProcessInfo {
             (String::new(), name.clone(), name.to_lowercase())
         };
 
-        let (exe_updated, exe_deleted) = check_exe_status(&exe_path, start_time);
+        let (exe_updated, exe_deleted) = check_exe_status(&exe_path, create_time_100ns);
 
         let name_lower = name.to_lowercase();
         let user_lower = user.to_lowercase();
@@ -872,12 +905,14 @@ impl ProcessInfo {
             exe_path,
             command,
             user,
-            status: 'R',
+            status: '?',
             cpu_percent,
             mem_percent,
             virtual_mem: proc.virtual_size(),
             resident_mem: proc.working_set(),
-            shared_mem: proc.working_set().saturating_sub(proc.private_bytes()),
+            shared_mem: proc
+                .working_set()
+                .saturating_sub(proc.private_working_set()),
             priority: proc.base_priority(),
             cpu_time,
             tree_depth: 0,
@@ -886,6 +921,7 @@ impl ProcessInfo {
             is_collapsed: false,
             thread_count: proc.thread_count(),
             start_time,
+            create_time_100ns,
             handle_count: proc.handle_count(),
             io_read_bytes: proc.read_bytes(),
             io_write_bytes: proc.write_bytes(),
@@ -947,7 +983,10 @@ pub fn kill_process(pid: u32, signal: u32) -> Result<(), String> {
 
 /// Set process priority class directly
 #[cfg(windows)]
-pub fn set_priority_class(pid: u32, priority: crate::app::WindowsPriorityClass) -> Result<(), String> {
+pub fn set_priority_class(
+    pid: u32,
+    priority: crate::app::WindowsPriorityClass,
+) -> Result<(), String> {
     use crate::app::WindowsPriorityClass;
 
     unsafe {
@@ -977,7 +1016,10 @@ pub fn set_priority_class(pid: u32, priority: crate::app::WindowsPriorityClass) 
 }
 
 #[cfg(not(windows))]
-pub fn set_priority_class(pid: u32, priority: crate::app::WindowsPriorityClass) -> Result<(), String> {
+pub fn set_priority_class(
+    pid: u32,
+    priority: crate::app::WindowsPriorityClass,
+) -> Result<(), String> {
     use crate::app::WindowsPriorityClass;
     use std::process::Command;
 
@@ -1003,9 +1045,9 @@ pub fn set_priority_class(pid: u32, priority: crate::app::WindowsPriorityClass) 
 pub fn set_efficiency_mode(pid: u32, enabled: bool) -> Result<(), String> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
-        OpenProcess, SetProcessInformation, ProcessPowerThrottling,
-        PROCESS_POWER_THROTTLING_STATE, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_SET_INFORMATION,
+        OpenProcess, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+        PROCESS_SET_INFORMATION, ProcessPowerThrottling, SetProcessInformation,
     };
 
     unsafe {
@@ -1087,7 +1129,7 @@ pub fn get_process_affinity(_pid: u32) -> Result<u64, String> {
 pub fn set_process_affinity(pid: u32, mask: u64) -> Result<(), String> {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{
-        OpenProcess, SetProcessAffinityMask, PROCESS_SET_INFORMATION,
+        OpenProcess, PROCESS_SET_INFORMATION, SetProcessAffinityMask,
     };
 
     unsafe {

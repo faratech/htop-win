@@ -1,4 +1,6 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 
 use crate::app::{App, DialogState, SortColumn};
 
@@ -7,12 +9,30 @@ use crate::app::{App, DialogState, SortColumn};
 /// (ui::dialogs::render_scrollable_dialog), so End just saturates to MAX.
 fn handle_scroll_keys(scroll: &mut usize, key: KeyCode) -> bool {
     match key {
-        KeyCode::Up | KeyCode::Char('k') => { *scroll = scroll.saturating_sub(1); true }
-        KeyCode::Down | KeyCode::Char('j') => { *scroll = scroll.saturating_add(1); true }
-        KeyCode::PageUp => { *scroll = scroll.saturating_sub(10); true }
-        KeyCode::PageDown => { *scroll = scroll.saturating_add(10); true }
-        KeyCode::Home => { *scroll = 0; true }
-        KeyCode::End => { *scroll = usize::MAX; true }
+        KeyCode::Up | KeyCode::Char('k') => {
+            *scroll = scroll.saturating_sub(1);
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            *scroll = scroll.saturating_add(1);
+            true
+        }
+        KeyCode::PageUp => {
+            *scroll = scroll.saturating_sub(10);
+            true
+        }
+        KeyCode::PageDown => {
+            *scroll = scroll.saturating_add(10);
+            true
+        }
+        KeyCode::Home => {
+            *scroll = 0;
+            true
+        }
+        KeyCode::End => {
+            *scroll = usize::MAX;
+            true
+        }
         _ => false,
     }
 }
@@ -27,12 +47,30 @@ fn handle_list_nav(selected: &mut usize, len: usize, key: KeyCode) -> bool {
     }
     let last = len - 1;
     match key {
-        KeyCode::Up | KeyCode::Char('k') => { *selected = selected.saturating_sub(1); true }
-        KeyCode::Down | KeyCode::Char('j') => { *selected = (*selected + 1).min(last); true }
-        KeyCode::PageUp => { *selected = selected.saturating_sub(10); true }
-        KeyCode::PageDown => { *selected = (*selected + 10).min(last); true }
-        KeyCode::Home => { *selected = 0; true }
-        KeyCode::End => { *selected = last; true }
+        KeyCode::Up | KeyCode::Char('k') => {
+            *selected = selected.saturating_sub(1);
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            *selected = (*selected + 1).min(last);
+            true
+        }
+        KeyCode::PageUp => {
+            *selected = selected.saturating_sub(10);
+            true
+        }
+        KeyCode::PageDown => {
+            *selected = (*selected + 10).min(last);
+            true
+        }
+        KeyCode::Home => {
+            *selected = 0;
+            true
+        }
+        KeyCode::End => {
+            *selected = last;
+            true
+        }
         _ => false,
     }
 }
@@ -77,9 +115,10 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
 
     // Check for max iterations exit
     if let Some(max) = app.max_iterations
-        && app.iteration_count >= max {
-            return true;
-        }
+        && app.iteration_count >= max
+    {
+        return true;
+    }
 
     match key.code {
         // Quit
@@ -245,7 +284,11 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
             app.toggle_tree_view();
         }
         // Sort column menu (F6, >, ., <, ,)
-        KeyCode::F(6) | KeyCode::Char('>') | KeyCode::Char('.') | KeyCode::Char('<') | KeyCode::Char(',') => {
+        KeyCode::F(6)
+        | KeyCode::Char('>')
+        | KeyCode::Char('.')
+        | KeyCode::Char('<')
+        | KeyCode::Char(',') => {
             let columns = SortColumn::all();
             let index = columns
                 .iter()
@@ -282,9 +325,9 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
         }
 
         // Sort shortcuts
-        KeyCode::Char('N') => app.set_sort_column(SortColumn::Pid),  // Sort by PID
-        KeyCode::Char('P') => app.set_sort_column(SortColumn::Cpu),  // Sort by CPU
-        KeyCode::Char('M') => app.set_sort_column(SortColumn::Mem),  // Sort by Memory
+        KeyCode::Char('N') => app.set_sort_column(SortColumn::Pid), // Sort by PID
+        KeyCode::Char('P') => app.set_sort_column(SortColumn::Cpu), // Sort by CPU
+        KeyCode::Char('M') => app.set_sort_column(SortColumn::Mem), // Sort by Memory
         KeyCode::Char('T') => app.set_sort_column(SortColumn::Time), // Sort by Time
 
         // Reverse sort
@@ -342,6 +385,10 @@ fn handle_search_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Delete => {
             app.input_delete();
+            if let Some((buf, _)) = app.dialog.input_buffer() {
+                app.search_string = buf.to_string();
+            }
+            app.apply_search();
         }
         KeyCode::Left => {
             app.input_left();
@@ -382,6 +429,11 @@ fn handle_filter_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Delete => {
             app.input_delete();
+            if let Some((buf, _)) = app.dialog.input_buffer() {
+                app.filter_string = buf.to_string();
+                app.filter_string_lower = app.filter_string.to_lowercase();
+            }
+            app.needs_process_update = true;
         }
         KeyCode::Left => {
             app.input_left();
@@ -411,9 +463,10 @@ fn handle_sort_select_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Enter => {
             if let DialogState::SortSelect { index } = app.dialog
-                && index < columns.len() {
-                    app.set_sort_column(columns[index]);
-                }
+                && index < columns.len()
+            {
+                app.set_sort_column(columns[index]);
+            }
             app.dialog = DialogState::None;
         }
         other => {
@@ -465,7 +518,12 @@ fn handle_kill_keys(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Tab => {
             // Switch to signal select dialog
             if let DialogState::Kill { pid, name, command } = std::mem::take(&mut app.dialog) {
-                app.dialog = DialogState::SignalSelect { index: 0, pid, name, command };
+                app.dialog = DialogState::SignalSelect {
+                    index: 0,
+                    pid,
+                    name,
+                    command,
+                };
             }
         }
         _ => {}
@@ -491,17 +549,25 @@ fn handle_priority_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         // Right = increase priority (higher index)
         KeyCode::Right => {
-            if let DialogState::Priority { ref mut class_index, .. } = app.dialog
-                && *class_index < max_index {
-                    *class_index += 1;
-                }
+            if let DialogState::Priority {
+                ref mut class_index,
+                ..
+            } = app.dialog
+                && *class_index < max_index
+            {
+                *class_index += 1;
+            }
         }
         // Left = decrease priority (lower index)
         KeyCode::Left => {
-            if let DialogState::Priority { ref mut class_index, .. } = app.dialog
-                && *class_index > 0 {
-                    *class_index -= 1;
-                }
+            if let DialogState::Priority {
+                ref mut class_index,
+                ..
+            } = app.dialog
+                && *class_index > 0
+            {
+                *class_index -= 1;
+            }
         }
         // E = toggle efficiency mode
         KeyCode::Char('e') | KeyCode::Char('E') => {
@@ -509,7 +575,11 @@ fn handle_priority_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         // Up/Down/j/k/PgUp/PgDn/Home/End select a priority class.
         other => {
-            if let DialogState::Priority { ref mut class_index, .. } = app.dialog {
+            if let DialogState::Priority {
+                ref mut class_index,
+                ..
+            } = app.dialog
+            {
                 handle_list_nav(class_index, max_index + 1, other);
             }
         }
@@ -585,10 +655,12 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                 5 => {
                     // Toggle show kernel threads
                     app.config.show_kernel_threads = !app.config.show_kernel_threads;
+                    app.needs_process_update = true;
                 }
                 6 => {
                     // Toggle show user threads
                     app.config.show_user_threads = !app.config.show_user_threads;
+                    app.needs_process_update = true;
                 }
                 7 => {
                     // Toggle show program path
@@ -615,7 +687,8 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                 12 => {
                     // Open color scheme selection
                     let schemes = ColorScheme::all();
-                    let index = schemes.iter()
+                    let index = schemes
+                        .iter()
                         .position(|s| *s == app.config.color_scheme)
                         .unwrap_or(0);
                     app.dialog = DialogState::ColorScheme { index };
@@ -681,9 +754,11 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                 2 => {
                     // Adjust Memory meter mode
                     if key.code == KeyCode::Right {
-                        app.config.memory_meter_mode = cycle_meter_mode(app.config.memory_meter_mode);
+                        app.config.memory_meter_mode =
+                            cycle_meter_mode(app.config.memory_meter_mode);
                     } else {
-                        app.config.memory_meter_mode = cycle_meter_mode_rev(app.config.memory_meter_mode);
+                        app.config.memory_meter_mode =
+                            cycle_meter_mode_rev(app.config.memory_meter_mode);
                     }
                 }
                 3 => {
@@ -735,7 +810,10 @@ fn handle_signal_select_keys(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => {
             // Go back to Kill dialog, moving target data
-            if let DialogState::SignalSelect { pid, name, command, .. } = std::mem::take(&mut app.dialog) {
+            if let DialogState::SignalSelect {
+                pid, name, command, ..
+            } = std::mem::take(&mut app.dialog)
+            {
                 app.dialog = DialogState::Kill { pid, name, command };
             }
         }
@@ -778,7 +856,11 @@ fn handle_user_select_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         other => {
             // List length is users + 1 for the "[All users]" row.
-            if let DialogState::UserSelect { ref mut index, ref users } = app.dialog {
+            if let DialogState::UserSelect {
+                ref mut index,
+                ref users,
+            } = app.dialog
+            {
                 handle_list_nav(index, users.len() + 1, other);
             }
         }
@@ -810,11 +892,12 @@ fn handle_color_scheme_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Enter => {
             if let DialogState::ColorScheme { index } = app.dialog
-                && let Some(scheme) = schemes.get(index) {
-                    app.config.color_scheme = *scheme;
-                    app.update_theme();
-                    app.save_config();
-                }
+                && let Some(scheme) = schemes.get(index)
+            {
+                app.config.color_scheme = *scheme;
+                app.update_theme();
+                app.save_config();
+            }
             app.dialog = DialogState::Setup { selected: 12 };
         }
         other => {
@@ -871,7 +954,9 @@ fn handle_command_wrap_keys(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
-    if !matches!(app.dialog, DialogState::ColumnConfig { .. }) { return false; }
+    if !matches!(app.dialog, DialogState::ColumnConfig { .. }) {
+        return false;
+    }
     let all_columns = SortColumn::all();
 
     match key.code {
@@ -882,46 +967,51 @@ fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 // Shift+Up: Move column up in order
                 if let DialogState::ColumnConfig { index } = app.dialog
-                    && let Some(col) = all_columns.get(index) {
-                        let col_name = col.name().to_string();
-                        if app.move_column_up_in_active_tab(&col_name) {
-                            app.save_config();
-                        }
+                    && let Some(col) = all_columns.get(index)
+                {
+                    let col_name = col.name().to_string();
+                    if app.move_column_up_in_active_tab(&col_name) {
+                        app.save_config();
                     }
+                }
             } else {
                 // Regular Up: Navigate
                 if let DialogState::ColumnConfig { ref mut index } = app.dialog
-                    && *index > 0 {
-                        *index -= 1;
-                    }
+                    && *index > 0
+                {
+                    *index -= 1;
+                }
             }
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
                 // Shift+Down: Move column down in order
                 if let DialogState::ColumnConfig { index } = app.dialog
-                    && let Some(col) = all_columns.get(index) {
-                        let col_name = col.name().to_string();
-                        if app.move_column_down_in_active_tab(&col_name) {
-                            app.save_config();
-                        }
+                    && let Some(col) = all_columns.get(index)
+                {
+                    let col_name = col.name().to_string();
+                    if app.move_column_down_in_active_tab(&col_name) {
+                        app.save_config();
                     }
+                }
             } else {
                 // Regular Down: Navigate
                 if let DialogState::ColumnConfig { ref mut index } = app.dialog
-                    && *index < all_columns.len() - 1 {
-                        *index += 1;
-                    }
+                    && *index < all_columns.len() - 1
+                {
+                    *index += 1;
+                }
             }
         }
         KeyCode::Char(' ') | KeyCode::Enter => {
             // Toggle column visibility in active tab
             if let DialogState::ColumnConfig { index } = app.dialog
-                && let Some(col) = all_columns.get(index) {
-                    let col_name = col.name().to_string();
-                    app.toggle_column_in_active_tab(&col_name);
-                    app.save_config();
-                }
+                && let Some(col) = all_columns.get(index)
+            {
+                let col_name = col.name().to_string();
+                app.toggle_column_in_active_tab(&col_name);
+                app.save_config();
+            }
         }
         // Home/End/PgUp/PgDn (Up/Down/j/k are handled above with Shift-reorder).
         // The two trailing footer rows aren't selectable, so the navigable
@@ -936,8 +1026,10 @@ fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
 }
 
 fn handle_affinity_keys(app: &mut App, key: KeyEvent) -> bool {
-    if !matches!(app.dialog, DialogState::Affinity { .. }) { return false; }
-    let cpu_count = app.system_metrics.cpu.core_usage.len();
+    if !matches!(app.dialog, DialogState::Affinity { .. }) {
+        return false;
+    }
+    let cpu_count = app.system_metrics.cpu.core_usage.len().min(64);
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
@@ -945,7 +1037,15 @@ fn handle_affinity_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Char(' ') => {
             // Toggle CPU in affinity mask
-            if let DialogState::Affinity { ref mut mask, ref selected, .. } = app.dialog {
+            if let DialogState::Affinity {
+                ref mut mask,
+                ref selected,
+                ..
+            } = app.dialog
+            {
+                if *selected >= 64 {
+                    return false;
+                }
                 let bit = 1u64 << *selected;
                 *mask ^= bit;
             }
@@ -958,7 +1058,11 @@ fn handle_affinity_keys(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char('a') => {
             // Select all CPUs (safe for 64+ CPU systems)
             if let DialogState::Affinity { ref mut mask, .. } = app.dialog {
-                *mask = if cpu_count >= 64 { u64::MAX } else { (1u64 << cpu_count) - 1 };
+                *mask = if cpu_count >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << cpu_count) - 1
+                };
             }
         }
         KeyCode::Char('n') => {
@@ -969,7 +1073,10 @@ fn handle_affinity_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         // Up/Down/j/k/PgUp/PgDn/Home/End move the CPU selection.
         other => {
-            if let DialogState::Affinity { ref mut selected, .. } = app.dialog {
+            if let DialogState::Affinity {
+                ref mut selected, ..
+            } = app.dialog
+            {
                 handle_list_nav(selected, cpu_count, other);
             }
         }
@@ -985,6 +1092,14 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
     let x = mouse.column;
     let y = mouse.row;
 
+    if let Some((_, time)) = app.last_error {
+        if time.elapsed() < std::time::Duration::from_secs(5) {
+            app.clear_error();
+            return;
+        }
+        app.clear_error();
+    }
+
     // Check if we're in a dialog/modal mode
     let is_in_dialog = !matches!(app.dialog, DialogState::None);
 
@@ -996,7 +1111,8 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
                 (app.last_click_pos, app.last_click_time)
             {
                 let same_position = last_pos == (x, y);
-                let within_threshold = now.duration_since(last_time).as_millis() < app.double_click_ms as u128;
+                let within_threshold =
+                    now.duration_since(last_time).as_millis() < app.double_click_ms as u128;
                 same_position && within_threshold
             } else {
                 false
@@ -1034,6 +1150,9 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
             handle_element_action(app, x, y, UIAction::RightClick);
         }
         MouseEventKind::Down(MouseButton::Middle) => {
+            if is_in_dialog {
+                return;
+            }
             handle_element_action(app, x, y, UIAction::MiddleClick);
         }
         MouseEventKind::ScrollUp => {
@@ -1073,14 +1192,16 @@ fn rect_contains(r: crate::terminal::Rect, x: u16, y: u16) -> bool {
 /// for dialogs without a selection. Excludes pinned header/footer rows.
 fn dialog_nav_len(app: &App) -> usize {
     match &app.dialog {
-        DialogState::SortSelect { .. } | DialogState::ColumnConfig { .. } => SortColumn::all().len(),
+        DialogState::SortSelect { .. } | DialogState::ColumnConfig { .. } => {
+            SortColumn::all().len()
+        }
         DialogState::Setup { .. } => 16,
         DialogState::Priority { .. } => crate::app::WindowsPriorityClass::all().len(),
         DialogState::UserSelect { users, .. } => users.len() + 1,
         DialogState::ColorScheme { .. } => crate::ui::colors::ColorScheme::all().len(),
         DialogState::GpuSelect { names, .. } => names.len() + 1, // +1 for Auto
         DialogState::SignalSelect { .. } => crate::ui::dialogs::signal_count(),
-        DialogState::Affinity { .. } => app.system_metrics.cpu.core_usage.len(),
+        DialogState::Affinity { .. } => app.system_metrics.cpu.core_usage.len().min(64),
         _ => 0,
     }
 }
@@ -1110,7 +1231,11 @@ fn scroll_dialog_content(app: &mut App, up: bool) -> bool {
         | DialogState::CommandWrap { scroll, .. }
         | DialogState::ProcessInfo { scroll, .. } => {
             // Clamped to content length at render time.
-            *scroll = if up { scroll.saturating_sub(3) } else { scroll.saturating_add(3) };
+            *scroll = if up {
+                scroll.saturating_sub(3)
+            } else {
+                scroll.saturating_add(3)
+            };
             true
         }
         _ => false,
@@ -1121,41 +1246,22 @@ fn scroll_dialog_content(app: &mut App, up: bool) -> bool {
 fn move_dialog_selection(app: &mut App, down: bool) {
     let last = dialog_nav_len(app).saturating_sub(1);
     if let Some(sel) = dialog_selection_mut(&mut app.dialog) {
-        *sel = if down { (*sel + 3).min(last) } else { sel.saturating_sub(3) };
+        *sel = if down {
+            (*sel + 3).min(last)
+        } else {
+            sel.saturating_sub(3)
+        };
     }
 }
 
-/// Unified left-click handling for any open dialog. Confirmation dialogs keep
-/// their click-to-confirm behavior; otherwise a click outside the dialog closes
-/// it, a click on the border is ignored, and a click on a selectable list row
-/// selects it (a double-click also activates it, as if Enter were pressed).
+/// Unified left-click handling for any open dialog. Confirmation dialogs require
+/// an explicit double-click inside the dialog body; otherwise a click outside
+/// the dialog closes it, a click on the border is ignored, and a click on a
+/// selectable list row selects it (a double-click also activates it, as if Enter
+/// were pressed).
 fn handle_dialog_click(app: &mut App, x: u16, y: u16, double: bool) {
-    // Confirmation-style dialogs: a click anywhere confirms (legacy behavior).
-    match app.dialog {
-        DialogState::Kill { .. } => {
-            if !app.tagged_pids.is_empty() {
-                app.kill_tagged(15);
-            } else {
-                app.kill_target_process(15);
-            }
-            app.dialog = DialogState::None;
-            return;
-        }
-        DialogState::SignalSelect { index, .. } => {
-            let signal = crate::ui::dialogs::get_signal_by_index(index);
-            if !app.tagged_pids.is_empty() {
-                app.kill_tagged(signal);
-            } else {
-                app.kill_target_process(signal);
-            }
-            app.dialog = DialogState::None;
-            return;
-        }
-        _ => {}
-    }
-
-    // A click outside the dialog closes it; without cached geometry, fail safe
-    // by closing rather than guessing.
+    // Hit-test dialog geometry before any modal action. Destructive dialogs must
+    // not treat outside/blank clicks as confirmation.
     let Some(area) = app.dialog_area else {
         app.dialog = DialogState::None;
         return;
@@ -1166,9 +1272,30 @@ fn handle_dialog_click(app: &mut App, x: u16, y: u16, double: bool) {
     }
 
     // Inside the border but on it (or on a content/scrollable dialog): do nothing.
-    let Some(inner) = app.dialog_inner else { return; };
+    let Some(inner) = app.dialog_inner else {
+        return;
+    };
     if !rect_contains(inner, x, y) {
         return;
+    }
+
+    // Confirmation-style dialogs: only a double-click on the explicit
+    // confirmation row confirms.
+    // Keyboard Enter/Y remains the normal single-action confirmation path.
+    match app.dialog {
+        DialogState::Kill { .. } => {
+            if !double || !kill_confirmation_row(app, inner).is_some_and(|row| row == y) {
+                return;
+            }
+            if !app.tagged_pids.is_empty() {
+                app.kill_tagged(15);
+            } else {
+                app.kill_target_process(15);
+            }
+            app.dialog = DialogState::None;
+            return;
+        }
+        _ => {}
     }
 
     // Map the clicked row to a selectable item. Header rows (above) and footer
@@ -1192,6 +1319,18 @@ fn handle_dialog_click(app: &mut App, x: u16, y: u16, double: bool) {
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
         let _ = handle_key_event(app, enter);
     }
+}
+
+fn kill_confirmation_row(app: &App, inner: crate::terminal::Rect) -> Option<u16> {
+    let tagged_count = app.tagged_pids.len();
+    let confirm_index = if tagged_count > 0 {
+        let listed = if tagged_count > 8 { 9 } else { tagged_count };
+        3 + listed
+    } else {
+        6
+    };
+    let row = inner.y.saturating_add(confirm_index as u16);
+    (row < inner.y.saturating_add(inner.height)).then_some(row)
 }
 
 /// Set the active list dialog's selection to `nav_value` if it is within the

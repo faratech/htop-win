@@ -29,7 +29,7 @@ def run_benchmark(iterations: int = 20, extra_args: list = None) -> dict:
         print(f"Error: {exe_path} not found. Run 'cargo build --release' first.")
         sys.exit(1)
 
-    cmd = [str(exe_path), "--benchmark", str(iterations)]
+    cmd = [str(exe_path), "--benchmark-iterations", str(iterations)]
     if extra_args:
         cmd.extend(extra_args)
 
@@ -38,6 +38,8 @@ def run_benchmark(iterations: int = 20, extra_args: list = None) -> dict:
 
     # Combine stdout and stderr, strip ANSI codes
     output = strip_ansi(result.stdout + result.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(f"benchmark command failed with exit code {result.returncode}\n{output}")
 
     # Parse the benchmark results
     stats = {}
@@ -86,6 +88,10 @@ def run_benchmark(iterations: int = 20, extra_args: list = None) -> dict:
     if cpu_usage_match:
         stats['cpu_usage'] = float(cpu_usage_match.group(1))
 
+    required = ['iterations', 'processes', 'wall_time', 'cpu_time', 'cpu_usage']
+    missing = [key for key in required if key not in stats]
+    if missing:
+        raise RuntimeError(f"benchmark output missing required fields: {', '.join(missing)}\n{output}")
     return stats
 
 def print_stats(stats: dict, label: str = ""):
@@ -112,7 +118,8 @@ def print_stats(stats: dict, label: str = ""):
     print(f"\n  OVERALL")
     print(f"    Wall time:  {stats.get('wall_time', '?'):>12}")
     print(f"    CPU time:   {stats.get('cpu_time', '?'):>12}")
-    print(f"    CPU usage:  {stats.get('cpu_usage', '?'):>11.1f}%")
+    cpu_usage = stats.get('cpu_usage')
+    print(f"    CPU usage:  {cpu_usage:>11.1f}%" if cpu_usage is not None else "    CPU usage:             N/A")
     print()
 
 def compare_mode(iterations: int = 15):

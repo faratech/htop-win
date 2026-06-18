@@ -4,22 +4,17 @@ use std::fs;
 use std::path::PathBuf;
 
 #[cfg(windows)]
-use windows::core::{w, PCWSTR, PWSTR};
+use windows::Win32::Foundation::GetLastError;
 #[cfg(windows)]
 use windows::Win32::Networking::WinHttp::{
-    WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
-    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
-    WinHttpSendRequest,
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-    WINHTTP_FLAG_SECURE,
-    URL_COMPONENTS,
-    WINHTTP_INTERNET_SCHEME_HTTPS,
-    WINHTTP_OPEN_REQUEST_FLAGS,
-    WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
+    WINHTTP_INTERNET_SCHEME_HTTPS, WINHTTP_OPEN_REQUEST_FLAGS, WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen,
+    WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData,
+    WinHttpReceiveResponse, WinHttpSendRequest,
 };
 #[cfg(windows)]
-use windows::Win32::Foundation::GetLastError;
+use windows::core::{PCWSTR, PWSTR, w};
 
 /// Get the installation path for htop
 pub fn get_install_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -61,12 +56,18 @@ pub fn install_to_path(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     if target_path.exists() && !force {
         if let Some(installed_version) = get_installed_version() {
             if installed_version == current_version {
-                println!("htop {} is already installed and up to date.", current_version);
+                println!(
+                    "htop {} is already installed and up to date.",
+                    current_version
+                );
                 println!("Location: {}", target_path.display());
                 println!("\nUse --force to reinstall anyway.");
-                return Ok(())
+                return Ok(());
             } else {
-                println!("Updating htop from {} to {}...", installed_version, current_version);
+                println!(
+                    "Updating htop from {} to {}...",
+                    installed_version, current_version
+                );
             }
         } else {
             println!("Reinstalling htop {}...", current_version);
@@ -128,10 +129,78 @@ fn validate_pe_executable(body: &[u8]) -> Result<(), String> {
     }
     // The PE signature lives at the offset stored in e_lfanew (u32 LE at 0x3C)
     let e_lfanew = u32::from_le_bytes([body[0x3c], body[0x3d], body[0x3e], body[0x3f]]) as usize;
-    match body.get(e_lfanew..e_lfanew + 4) {
-        Some(sig) if sig == b"PE\0\0" => Ok(()),
+    match body.get(e_lfanew..e_lfanew + 6) {
+        Some(sig) if &sig[..4] == b"PE\0\0" => Ok(()),
         _ => Err("missing PE signature".into()),
     }
+}
+
+fn pe_machine(body: &[u8]) -> Result<u16, String> {
+    validate_pe_executable(body)?;
+    let e_lfanew = u32::from_le_bytes([body[0x3c], body[0x3d], body[0x3e], body[0x3f]]) as usize;
+    let machine = body
+        .get(e_lfanew + 4..e_lfanew + 6)
+        .ok_or_else(|| "missing PE machine field".to_string())?;
+    Ok(u16::from_le_bytes([machine[0], machine[1]]))
+}
+
+fn target_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    }
+}
+
+fn target_machine() -> u16 {
+    if cfg!(target_arch = "aarch64") {
+        0xAA64
+    } else {
+        0x8664
+    }
+}
+
+fn validate_target_pe_executable(body: &[u8]) -> Result<(), String> {
+    let machine = pe_machine(body)?;
+    if machine == target_machine() {
+        Ok(())
+    } else {
+        Err(format!(
+            "wrong architecture: PE machine {machine:#06x}, expected {}",
+            target_arch()
+        ))
+    }
+}
+
+fn update_meta_path() -> PathBuf {
+    std::env::temp_dir().join("htop-win-update.meta")
+}
+
+fn write_update_metadata(version: &str) {
+    let _ = fs::write(
+        update_meta_path(),
+        format!("version={version}\narch={}\n", target_arch()),
+    );
+}
+
+fn pending_metadata_matches(expected_version: &str) -> bool {
+    pending_metadata_version()
+        .as_deref()
+        .is_some_and(|version| version == expected_version)
+}
+
+fn pending_metadata_version() -> Option<String> {
+    let Ok(meta) = fs::read_to_string(update_meta_path()) else {
+        return None;
+    };
+    let version = meta
+        .lines()
+        .find_map(|line| line.strip_prefix("version="))
+        .map(str::to_string)?;
+    let arch_matches = meta
+        .lines()
+        .any(|line| line == format!("arch={}", target_arch()));
+    arch_matches.then_some(version)
 }
 
 /// Helper struct to automatically close WinHTTP handles
@@ -142,7 +211,9 @@ struct HandleGuard(*mut std::ffi::c_void);
 impl Drop for HandleGuard {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            unsafe { let _ = WinHttpCloseHandle(self.0); }
+            unsafe {
+                let _ = WinHttpCloseHandle(self.0);
+            }
         }
     }
 }
@@ -169,7 +240,7 @@ fn native_http_get(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         // 2. Crack URL
         let mut host_name = vec![0u16; 256];
         let mut url_path = vec![0u16; 2048];
-        
+
         let url_wide: Vec<u16> = url.encode_utf16().chain(Some(0)).collect();
         let mut components = URL_COMPONENTS {
             dwStructSize: std::mem::size_of::<URL_COMPONENTS>() as u32,
@@ -181,7 +252,7 @@ fn native_http_get(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         };
 
         if WinHttpCrackUrl(&url_wide, 0, &mut components).is_err() {
-             return Err(format!("WinHttpCrackUrl failed: {:?}", GetLastError()).into());
+            return Err(format!("WinHttpCrackUrl failed: {:?}", GetLastError()).into());
         }
 
         // 3. Connect
@@ -197,7 +268,11 @@ fn native_http_get(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let _connect_guard = HandleGuard(connect);
 
         // 4. Open Request
-        let flags = if components.nScheme == WINHTTP_INTERNET_SCHEME_HTTPS { WINHTTP_FLAG_SECURE } else { WINHTTP_OPEN_REQUEST_FLAGS(0) };
+        let flags = if components.nScheme == WINHTTP_INTERNET_SCHEME_HTTPS {
+            WINHTTP_FLAG_SECURE
+        } else {
+            WINHTTP_OPEN_REQUEST_FLAGS(0)
+        };
         let request = WinHttpOpenRequest(
             connect,
             w!("GET"),
@@ -213,14 +288,7 @@ fn native_http_get(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let _request_guard = HandleGuard(request);
 
         // 5. Send Request
-        if WinHttpSendRequest(
-            request,
-            None,
-            None,
-            0,
-            0,
-            0,
-        ).is_err() {
+        if WinHttpSendRequest(request, None, None, 0, 0, 0).is_err() {
             return Err(format!("WinHttpSendRequest failed: {:?}", GetLastError()).into());
         }
 
@@ -261,7 +329,9 @@ fn native_http_get(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
             // a mid-stream failure must NOT be reported as a complete download, or a
             // corrupt partial .exe could be installed over the working one.
             if WinHttpQueryDataAvailable(request, &mut bytes_read).is_err() {
-                return Err(format!("WinHttpQueryDataAvailable failed: {:?}", GetLastError()).into());
+                return Err(
+                    format!("WinHttpQueryDataAvailable failed: {:?}", GetLastError()).into(),
+                );
             }
             if bytes_read == 0 {
                 break;
@@ -275,7 +345,9 @@ fn native_http_get(url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
                 buffer.as_mut_ptr() as *mut c_void,
                 to_read,
                 &mut read_now,
-            ).is_err() {
+            )
+            .is_err()
+            {
                 return Err(format!("WinHttpReadData failed: {:?}", GetLastError()).into());
             }
 
@@ -302,25 +374,33 @@ const GITHUB_REPO: &str = "faratech/htop-win";
 /// Get the latest version info from GitHub
 /// Returns (version, download_url) or None if check fails
 pub fn get_latest_release() -> Result<(String, String), Box<dyn std::error::Error>> {
-    let url = format!("https://api.github.com/repos/{}/releases/latest", GITHUB_REPO);
+    let url = format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        GITHUB_REPO
+    );
 
     // Fetch JSON from GitHub API
     let body = native_http_get(&url)?;
-    let json_text = String::from_utf8(body)
-        .map_err(|_| "GitHub API returned invalid UTF-8")?;
+    let json_text = String::from_utf8(body).map_err(|_| "GitHub API returned invalid UTF-8")?;
 
     // Parse JSON manually to avoid complex deps
     // We look for "tag_name": "vX.Y.Z"
-    let version = json_text.split("\"tag_name\"")
+    let version = json_text
+        .split("\"tag_name\"")
         .nth(1)
         .and_then(|s| s.split(':').nth(1))
         .and_then(|s| s.split("\"").nth(1))
-        .ok_or_else(|| format!("Failed to parse tag_name from GitHub API response (body length: {} bytes)", json_text.len()))?
+        .ok_or_else(|| {
+            format!(
+                "Failed to parse tag_name from GitHub API response (body length: {} bytes)",
+                json_text.len()
+            )
+        })?
         .trim_start_matches('v')
         .to_string();
 
     // Detect architecture
-    let target_arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
+    let target_arch = target_arch();
     let target_suffix = format!("htop-win-{}.exe", target_arch);
 
     // Find asset URL
@@ -335,30 +415,21 @@ pub fn get_latest_release() -> Result<(String, String), Box<dyn std::error::Erro
             let rest = after_colon.1.trim();
             if rest.starts_with('"')
                 && let Some(url) = rest[1..].split('"').next()
-                    && url.ends_with(&target_suffix) {
-                        download_url = url.to_string();
-                        break;
-                    }
-        }
-    }
-
-    // Fallback: if specific arch not found, try any .exe
-    if download_url.is_empty() {
-        for part in json_text.split("\"browser_download_url\"") {
-            if let Some(after_colon) = part.split_once(':') {
-                let rest = after_colon.1.trim();
-                if rest.starts_with('"')
-                    && let Some(url) = rest[1..].split('"').next()
-                        && url.ends_with(".exe") {
-                            download_url = url.to_string();
-                            break;
-                        }
+                && url.ends_with(&target_suffix)
+            {
+                download_url = url.to_string();
+                break;
             }
         }
     }
 
     if version.is_empty() || download_url.is_empty() {
-        return Err(format!("Could not find download URL for this architecture (version={}, url_empty={})", version, download_url.is_empty()).into());
+        return Err(format!(
+            "Could not find download URL for this architecture (version={}, url_empty={})",
+            version,
+            download_url.is_empty()
+        )
+        .into());
     }
 
     Ok((version, download_url))
@@ -368,6 +439,7 @@ pub fn get_latest_release() -> Result<(String, String), Box<dyn std::error::Erro
 fn cleanup_temp_files() {
     let temp_dir = std::env::temp_dir();
     let _ = fs::remove_file(temp_dir.join("htop-win-update.exe"));
+    let _ = fs::remove_file(update_meta_path());
 }
 
 /// Update htop-win from GitHub releases
@@ -387,13 +459,16 @@ pub fn update_from_github(force: bool) -> Result<(), Box<dyn std::error::Error>>
     if !force && !is_newer_version(&latest_version, current_version) {
         println!("htop {} is already the latest version.", current_version);
         println!("\nUse --force to reinstall anyway.");
-        return Ok(())
+        return Ok(());
     }
 
     if force && !is_newer_version(&latest_version, current_version) {
         println!("Force reinstalling htop {} from GitHub...", latest_version);
     } else {
-        println!("New version available: {} -> {}", current_version, latest_version);
+        println!(
+            "New version available: {} -> {}",
+            current_version, latest_version
+        );
     }
     println!("Downloading from GitHub...");
 
@@ -402,9 +477,10 @@ pub fn update_from_github(force: bool) -> Result<(), Box<dyn std::error::Error>>
     let temp_file = temp_dir.join("htop-win-update.exe");
 
     let body = native_http_get(&download_url)?;
-    validate_pe_executable(&body)
+    validate_target_pe_executable(&body)
         .map_err(|e| format!("Downloaded update rejected: {}", e))?;
     fs::write(&temp_file, body)?;
+    write_update_metadata(&latest_version);
 
     println!("Download complete. Installing...");
 
@@ -472,33 +548,37 @@ pub fn check_and_download_update() -> UpdateStatus {
 
     // If update already downloaded and pending, report it without re-downloading
     if temp_file.exists()
-        && let Ok(pending) = fs::read(&temp_file) {
-            if validate_pe_executable(&pending).is_ok() {
-                // A non-empty pending update exists. Act only on a definitive answer
-                // from GitHub: report it if newer, delete it only if CONFIRMED stale.
-                // On a transient API failure, keep it — don't discard a valid,
-                // already-downloaded update just because the check momentarily failed.
-                match get_latest_release() {
-                    Ok((latest_version, _)) => {
-                        let current_version = env!("CARGO_PKG_VERSION");
-                        if is_newer_version(&latest_version, current_version) {
-                            return UpdateStatus::Downloaded {
-                                version: latest_version,
-                                path: temp_file,
-                            };
-                        }
-                        // Confirmed not newer than current -- the pending file is stale.
-                        let _ = fs::remove_file(&temp_file);
+        && let Ok(pending) = fs::read(&temp_file)
+    {
+        if validate_target_pe_executable(&pending).is_ok() {
+            // A non-empty pending update exists. Act only on a definitive answer
+            // from GitHub: report it if newer, delete it only if CONFIRMED stale.
+            // On a transient API failure, keep it — don't discard a valid,
+            // already-downloaded update just because the check momentarily failed.
+            match get_latest_release() {
+                Ok((latest_version, _)) => {
+                    let current_version = env!("CARGO_PKG_VERSION");
+                    if is_newer_version(&latest_version, current_version)
+                        && pending_metadata_matches(&latest_version)
+                    {
+                        return UpdateStatus::Downloaded {
+                            version: latest_version,
+                            path: temp_file,
+                        };
                     }
-                    Err(_) => {
-                        // Couldn't reach GitHub; preserve the pending update for retry.
-                        return UpdateStatus::None;
-                    }
+                    // Confirmed not newer than current -- the pending file is stale.
+                    let _ = fs::remove_file(&temp_file);
+                    let _ = fs::remove_file(update_meta_path());
                 }
-            } else {
-                let _ = fs::remove_file(&temp_file);
+                Err(_) => {
+                    // Couldn't reach GitHub; preserve the pending update for retry.
+                    return UpdateStatus::None;
+                }
             }
+        } else {
+            let _ = fs::remove_file(&temp_file);
         }
+    }
 
     let current_version = env!("CARGO_PKG_VERSION");
 
@@ -512,8 +592,9 @@ pub fn check_and_download_update() -> UpdateStatus {
     }
 
     match native_http_get(&download_url) {
-        Ok(body) if validate_pe_executable(&body).is_ok() => {
+        Ok(body) if validate_target_pe_executable(&body).is_ok() => {
             if fs::write(&temp_file, body).is_ok() {
+                write_update_metadata(&latest_version);
                 UpdateStatus::Downloaded {
                     version: latest_version,
                     path: temp_file,
@@ -521,7 +602,7 @@ pub fn check_and_download_update() -> UpdateStatus {
             } else {
                 UpdateStatus::None
             }
-        },
+        }
         _ => UpdateStatus::None,
     }
 }
@@ -564,11 +645,18 @@ pub fn apply_pending_update() -> bool {
     // Verify update file integrity before installing it over the working exe.
     // The pending file may have been written by an older htop-win without
     // download-time validation, so this gate must not rely on the downloader.
+    let pending_version = pending_metadata_version();
+    let current_version = env!("CARGO_PKG_VERSION");
     match fs::read(&update_file) {
-        Ok(body) if validate_pe_executable(&body).is_ok() => {}
+        Ok(body)
+            if validate_target_pe_executable(&body).is_ok()
+                && pending_version
+                    .as_deref()
+                    .is_some_and(|version| is_newer_version(version, current_version)) => {}
         Ok(_) => {
             // Not a plausible executable — discard rather than install
             let _ = fs::remove_file(&update_file);
+            let _ = fs::remove_file(update_meta_path());
             return false;
         }
         Err(_) => return false,
@@ -580,6 +668,7 @@ pub fn apply_pending_update() -> bool {
     if !install_path.exists() {
         if fs::copy(&update_file, &install_path).is_ok() {
             let _ = fs::remove_file(&update_file);
+            let _ = fs::remove_file(update_meta_path());
             eprintln!("Update installed successfully!");
             return true;
         }
@@ -601,7 +690,10 @@ pub fn apply_pending_update() -> bool {
         // Failed to copy, restore backup
         eprintln!("Update failed (copy error: {}), restoring backup", e);
         if let Err(e2) = fs::rename(&backup_path, &install_path) {
-            eprintln!("CRITICAL: Failed to restore backup: {}. Working executable is at: {:?}", e2, backup_path);
+            eprintln!(
+                "CRITICAL: Failed to restore backup: {}. Working executable is at: {:?}",
+                e2, backup_path
+            );
         }
         // Keep update file for retry
         return true; // Return true to skip re-download
@@ -609,7 +701,8 @@ pub fn apply_pending_update() -> bool {
 
     // Clean up update file ONLY on success
     let _ = fs::remove_file(&update_file);
-    
+    let _ = fs::remove_file(update_meta_path());
+
     // Try to remove backup, but ignore error if locked (it's the running executable)
     let _ = fs::remove_file(&backup_path);
 

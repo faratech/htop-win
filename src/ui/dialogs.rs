@@ -1,12 +1,12 @@
 use crate::terminal::{
-    Block, Borders, Clear, Color, Frame, Line, List, ListItem, Modifier, Paragraph, Rect,
-    Scrollbar, ScrollbarOrientation, ScrollbarState, Span, Style, Wrap,
+    Block, Borders, Clear, Frame, Line, List, ListItem, Modifier, Paragraph, Rect, Scrollbar,
+    ScrollbarOrientation, ScrollbarState, Span, Style, Wrap,
 };
 
 use crate::app::{App, DialogState, SortColumn};
 use crate::system::format_bytes;
-use crate::ui::{centered_rect, centered_rect_fixed};
 use crate::ui::colors::ColorScheme;
+use crate::ui::{centered_rect, centered_rect_fixed};
 
 use crate::ui::colors::Theme;
 
@@ -25,7 +25,11 @@ fn normal_style(theme: &Theme) -> Style {
 
 /// Get style based on selection state
 fn item_style(is_selected: bool, theme: &Theme) -> Style {
-    if is_selected { selected_style(theme) } else { normal_style(theme) }
+    if is_selected {
+        selected_style(theme)
+    } else {
+        normal_style(theme)
+    }
 }
 
 /// Word-wrap one logical line to `width` columns, preserving its leading
@@ -39,31 +43,42 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     }
 
     let indent: String = text.chars().take_while(|c| *c == ' ').collect();
-    let avail = width.saturating_sub(indent.len()).max(1);
+    let indent_width = indent.width();
+    let avail = width.saturating_sub(indent_width).max(1);
 
     let mut lines = Vec::new();
     let mut current = String::new();
     let mut current_width = 0usize;
 
-    for word in text.split_whitespace() {
+    let rest = &text[indent.len()..];
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut token_is_space = None;
+    for ch in rest.chars() {
+        let is_space = ch.is_whitespace();
+        if token_is_space.is_some_and(|was_space| was_space != is_space) {
+            tokens.push((token_is_space.unwrap(), std::mem::take(&mut token)));
+        }
+        token_is_space = Some(is_space);
+        token.push(ch);
+    }
+    if let Some(is_space) = token_is_space {
+        tokens.push((is_space, token));
+    }
+
+    for (_is_space, word) in tokens {
         let word_width = word.width();
-        if current_width > 0 {
-            if current_width + 1 + word_width <= avail {
-                current.push(' ');
-                current.push_str(word);
-                current_width += 1 + word_width;
-                continue;
-            }
+        if current_width > 0 && current_width + word_width > avail {
             lines.push(format!("{indent}{current}"));
             current.clear();
             current_width = 0;
         }
-        if word_width <= avail {
-            current.push_str(word);
-            current_width = word_width;
+        if current_width + word_width <= avail {
+            current.push_str(&word);
+            current_width += word_width;
         } else {
             for c in word.chars() {
-                let char_width = UnicodeWidthChar::width(c).unwrap_or(1);
+                let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
                 if current_width > 0 && current_width + char_width > avail {
                     lines.push(format!("{indent}{current}"));
                     current.clear();
@@ -99,11 +114,7 @@ fn render_scrollable_dialog(
     let visible_lines = area.height.saturating_sub(2) as usize; // Account for border
     *scroll = (*scroll).min(total_lines.saturating_sub(visible_lines));
 
-    let items: Vec<ListItem> = lines
-        .into_iter()
-        .skip(*scroll)
-        .map(ListItem::new)
-        .collect();
+    let items: Vec<ListItem> = lines.into_iter().skip(*scroll).map(ListItem::new).collect();
 
     let list = List::new(items).block(block).style(style);
 
@@ -121,7 +132,7 @@ fn render_scrollable_dialog(
             .viewport_content_length(visible_lines)
             .position(*scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .style(Style::default().fg(Color::DarkGray));
+            .style(Style::default().fg(style.fg.unwrap_or(crate::terminal::Color::Reset)));
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
 }
@@ -133,6 +144,7 @@ fn cache_dialog_geometry(app: &mut App, area: Rect) {
     app.dialog_inner = Some(area.inner(1));
     app.dialog_list_offset = 0;
     app.dialog_header_rows = 0;
+    app.dialog_scroll_rows = 0;
 }
 
 /// Render a selectable list dialog with a unified scroll model:
@@ -167,7 +179,9 @@ fn render_list_dialog(
     // Derive the offset that keeps `selected` visible. Anchored so the selection
     // sits at the bottom of the region once scrolled past the first page; this is
     // a pure function of selection + sizes, so no offset needs to be stored.
-    let sel_in_scroll = selected.saturating_sub(header_rows).min(scrollable_len.saturating_sub(1));
+    let sel_in_scroll = selected
+        .saturating_sub(header_rows)
+        .min(scrollable_len.saturating_sub(1));
     let max_offset = scrollable_len.saturating_sub(scroll_height);
     let offset = if scroll_height == 0 || sel_in_scroll < scroll_height {
         0
@@ -184,9 +198,8 @@ fn render_list_dialog(
         .into_iter()
         .enumerate()
         .filter_map(|(i, item)| {
-            let keep = i < header_rows
-                || i >= footer_start
-                || (i >= scroll_start && i < scroll_end);
+            let keep =
+                i < header_rows || i >= footer_start || (i >= scroll_start && i < scroll_end);
             keep.then_some(item)
         })
         .collect();
@@ -207,7 +220,7 @@ fn render_list_dialog(
             .viewport_content_length(scroll_height)
             .position(offset);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-            .style(Style::default().fg(Color::DarkGray));
+            .style(Style::default().fg(app.theme.text_dim));
         frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
     }
 
@@ -233,8 +246,11 @@ const SIGNALS: &[(u32, &str, &str)] = &[
 
 /// Draw help dialog
 pub fn draw_help(frame: &mut Frame, app: &mut App) {
-    let DialogState::Help { scroll } = &mut app.dialog else { return; };
+    let DialogState::Help { scroll } = &mut app.dialog else {
+        return;
+    };
     let area = centered_rect(80, 80, frame.area());
+    let theme = app.theme.clone();
 
     let help_text = vec![
         "",
@@ -261,8 +277,8 @@ pub fn draw_help(frame: &mut Frame, app: &mut App) {
         "    F4, \\              Filter processes (hide non-matching)",
         "    F5, t              Toggle tree view",
         "    F6, >, ., <, ,     Select sort column",
-        "    F7, ]              Decrease priority (higher priority)",
-        "    F8, [              Increase priority (lower priority)",
+        "    F7, ]              Open priority dialog",
+        "    F8, [              Open priority dialog",
         "    F9                 Kill selected/tagged process(es)",
         "    F10, q, Q          Quit",
         "",
@@ -363,13 +379,14 @@ pub fn draw_help(frame: &mut Frame, app: &mut App) {
     let block = Block::default()
         .title(" Help ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.border))
+        .style(Style::default().bg(theme.background));
 
     render_scrollable_dialog(
         frame,
         area,
         block,
-        Style::default().fg(Color::White),
+        Style::default().fg(theme.text).bg(theme.background),
         lines,
         scroll,
     );
@@ -383,21 +400,24 @@ pub fn draw_search(frame: &mut Frame, app: &mut App) {
         None => return,
     };
     let area = centered_rect_fixed(50, 3, frame.area());
+    let theme = app.theme.clone();
+    let (visible_buffer, cursor_width) =
+        input_window(&buffer, cursor, area.width.saturating_sub(3) as usize);
 
-    let input = Paragraph::new(format!("/{}", buffer))
+    let input = Paragraph::new(format!("/{}", visible_buffer))
         .block(
             Block::default()
                 .title(" Search ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
+                .border_style(Style::default().fg(theme.border)),
         )
-        .style(Style::default().fg(Color::White));
+        .style(Style::default().fg(theme.text).bg(theme.background));
 
     frame.render_widget(Clear, area);
     frame.render_widget(input, area);
 
-    // Set cursor position
-    frame.set_cursor_position((area.x + 1 + cursor as u16 + 1, area.y + 1));
+    let cursor_x = area.x + 2 + cursor_width.min(area.width.saturating_sub(3) as usize) as u16;
+    frame.set_cursor_position((cursor_x, area.y + 1));
     cache_dialog_geometry(app, area);
 }
 
@@ -408,27 +428,75 @@ pub fn draw_filter(frame: &mut Frame, app: &mut App) {
         None => return,
     };
     let area = centered_rect_fixed(50, 3, frame.area());
+    let theme = &app.theme;
+    let (visible_buffer, cursor_width) =
+        input_window(&buffer, cursor, area.width.saturating_sub(10) as usize);
 
-    let input = Paragraph::new(format!("Filter: {}", buffer))
+    let input = Paragraph::new(format!("Filter: {}", visible_buffer))
         .block(
             Block::default()
                 .title(" Filter ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Yellow)),
+                .border_style(Style::default().fg(theme.border)),
         )
-        .style(Style::default().fg(Color::White));
+        .style(Style::default().fg(theme.text).bg(theme.background));
 
     frame.render_widget(Clear, area);
     frame.render_widget(input, area);
 
-    // Set cursor position
-    frame.set_cursor_position((area.x + 9 + cursor as u16, area.y + 1));
+    let cursor_x = area.x + 9 + cursor_width.min(area.width.saturating_sub(10) as usize) as u16;
+    frame.set_cursor_position((cursor_x, area.y + 1));
     cache_dialog_geometry(app, area);
+}
+
+fn input_window(buffer: &str, cursor: usize, width: usize) -> (String, usize) {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+    if width == 0 {
+        return (String::new(), 0);
+    }
+
+    let cursor = cursor.min(buffer.len());
+    let cursor = if buffer.is_char_boundary(cursor) {
+        cursor
+    } else {
+        buffer
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .take_while(|idx| *idx < cursor)
+            .last()
+            .unwrap_or(0)
+    };
+    let mut start = 0;
+    if UnicodeWidthStr::width(&buffer[..cursor]) > width {
+        for (idx, _) in buffer[..cursor].char_indices() {
+            start = idx;
+            if UnicodeWidthStr::width(&buffer[start..cursor]) <= width {
+                break;
+            }
+        }
+    }
+
+    let mut visible = String::new();
+    let mut used_width = 0usize;
+    for ch in buffer[start..].chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if char_width > 0 && used_width + char_width > width {
+            break;
+        }
+        visible.push(ch);
+        used_width += char_width;
+    }
+
+    let cursor_width = UnicodeWidthStr::width(&buffer[start..cursor]);
+    (visible, cursor_width)
 }
 
 /// Draw sort selection dialog
 pub fn draw_sort_select(frame: &mut Frame, app: &mut App) {
-    let DialogState::SortSelect { index } = &app.dialog else { return; };
+    let DialogState::SortSelect { index } = &app.dialog else {
+        return;
+    };
     let index = *index;
     let theme = &app.theme;
     let columns = SortColumn::all();
@@ -444,16 +512,17 @@ pub fn draw_sort_select(frame: &mut Frame, app: &mut App) {
                 ""
             };
 
-            ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:<12}{}", col.name(), indicator), item_style(idx == index, theme)),
-            ]))
+            ListItem::new(Line::from(vec![Span::styled(
+                format!(" {:<12}{}", col.name(), indicator),
+                item_style(idx == index, theme),
+            )]))
         })
         .collect();
 
     let block = Block::default()
         .title(" Sort by ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green))
+        .border_style(Style::default().fg(theme.border))
         .style(Style::default().bg(theme.background));
 
     let style = Style::default().fg(theme.text).bg(theme.background);
@@ -462,11 +531,13 @@ pub fn draw_sort_select(frame: &mut Frame, app: &mut App) {
 
 /// Draw kill confirmation dialog
 pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
-    let DialogState::Kill { pid, name, command } = &app.dialog else { return; };
+    let DialogState::Kill { pid, name, command } = &app.dialog else {
+        return;
+    };
     let tagged_count = app.tagged_pids.len();
 
     // Determine dialog height based on tagged processes
-    let base_height = if tagged_count > 0 { 10 } else { 8 };
+    let base_height = if tagged_count > 0 { 10 } else { 9 };
     let extra_height = tagged_count.min(8) as u16; // Show up to 8 tagged processes
     let height = base_height + extra_height;
 
@@ -480,7 +551,9 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
         // Multiple processes - show list
         lines.push(Line::from(Span::styled(
             format!("Kill {} tagged processes?", tagged_count),
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.failed_read)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
 
@@ -489,18 +562,22 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
             if shown >= 8 {
                 lines.push(Line::from(Span::styled(
                     format!("  ... and {} more", tagged_count - 8),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.text_dim),
                 )));
                 break;
             }
             // Try to find process name
-            let proc_name = app.displayed_processes
+            let proc_name = app
+                .displayed_processes
                 .iter()
                 .find(|p| p.pid == *tagged_pid)
                 .map(|p| p.name.as_str())
                 .unwrap_or("(unknown)");
             lines.push(Line::from(vec![
-                Span::styled(format!("  {} ", tagged_pid), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("  {} ", tagged_pid),
+                    Style::default().fg(theme.meter_value_warn),
+                ),
                 Span::styled(proc_name, Style::default().fg(theme.text)),
             ]));
         }
@@ -508,29 +585,40 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
         // Single process
         lines.push(Line::from(Span::styled(
             "Kill this process?",
-            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.failed_read)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(""));
 
         lines.push(Line::from(vec![
-            Span::styled("PID:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{}", pid), Style::default().fg(Color::Yellow)),
+            Span::styled("PID:  ", Style::default().fg(theme.text_dim)),
+            Span::styled(
+                format!("{}", pid),
+                Style::default().fg(theme.meter_value_warn),
+            ),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("Name: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Name: ", Style::default().fg(theme.text_dim)),
             Span::styled(name.clone(), Style::default().fg(theme.text)),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("Cmd:  ", Style::default().fg(Color::DarkGray)),
-            Span::styled(truncate_str(command, 42), Style::default().fg(Color::DarkGray)),
+            Span::styled("Cmd:  ", Style::default().fg(theme.text_dim)),
+            Span::styled(
+                truncate_str(command, 42),
+                Style::default().fg(theme.text_dim),
+            ),
         ]));
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("[Y/Enter/Click]", Style::default().fg(Color::Green)),
+        Span::styled("[Y/Enter/Click]", Style::default().fg(theme.meter_value_ok)),
         Span::raw(" Yes  "),
-        Span::styled("[N/Esc/Right-click]", Style::default().fg(Color::Red)),
+        Span::styled(
+            "[N/Esc/Right-click]",
+            Style::default().fg(theme.failed_read),
+        ),
         Span::raw(" No"),
     ]));
 
@@ -539,10 +627,10 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
             Block::default()
                 .title(" Kill Process ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red))
+                .border_style(Style::default().fg(theme.failed_read))
                 .style(Style::default().bg(theme.background)),
         )
-        .style(Style::default().fg(Color::White));
+        .style(Style::default().fg(theme.text).bg(theme.background));
 
     frame.render_widget(Clear, area);
     frame.render_widget(dialog, area);
@@ -553,7 +641,15 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
 pub fn draw_priority(frame: &mut Frame, app: &mut App) {
     use crate::app::WindowsPriorityClass;
 
-    let DialogState::Priority { class_index, pid, name, .. } = &app.dialog else { return; };
+    let DialogState::Priority {
+        class_index,
+        pid,
+        name,
+        ..
+    } = &app.dialog
+    else {
+        return;
+    };
     let class_index = *class_index;
     let pid = *pid;
     let process_info = format!("PID: {} - {}", pid, name);
@@ -563,11 +659,12 @@ pub fn draw_priority(frame: &mut Frame, app: &mut App) {
     // Read efficiency state from the captured pid (not the live selection): a
     // background re-sort can move a different process under the cursor while the
     // dialog is open, which would otherwise display a mismatched flag.
-    let efficiency_mode = app.process_by_pid(pid)
+    let efficiency_mode = app
+        .process_by_pid(pid)
         .map(|p| p.efficiency_mode)
         .unwrap_or(false);
 
-    let theme = &app.theme;
+    let theme = app.theme.clone();
 
     // Build list of priority classes with base priority values
     let mut items: Vec<ListItem> = classes
@@ -576,12 +673,17 @@ pub fn draw_priority(frame: &mut Frame, app: &mut App) {
         .map(|(idx, class)| {
             let indicator = if idx == class_index { "▶ " } else { "  " };
             let style = if idx == class_index {
-                selected_style(theme)
+                selected_style(&theme)
             } else {
-                normal_style(theme)
+                normal_style(&theme)
             };
             ListItem::new(Line::from(Span::styled(
-                format!("{}{:<14} (base priority: {:>2})", indicator, class.name(), class.base_priority()),
+                format!(
+                    "{}{:<14} (base priority: {:>2})",
+                    indicator,
+                    class.name(),
+                    class.base_priority()
+                ),
                 style,
             )))
         })
@@ -592,14 +694,21 @@ pub fn draw_priority(frame: &mut Frame, app: &mut App) {
     items.push(ListItem::new(Line::from("")));
     let efficiency_status = if efficiency_mode { "ON 🌿" } else { "OFF" };
     items.push(ListItem::new(Line::from(vec![
-        Span::styled("  [E] Efficiency Mode: ", Style::default().fg(Color::Cyan)),
-        Span::styled(efficiency_status, Style::default().fg(if efficiency_mode { Color::Green } else { Color::DarkGray })),
+        Span::styled("  [E] Efficiency Mode: ", Style::default().fg(theme.label)),
+        Span::styled(
+            efficiency_status,
+            Style::default().fg(if efficiency_mode {
+                theme.meter_value_ok
+            } else {
+                theme.text_dim
+            }),
+        ),
     ])));
 
     let block = Block::default()
         .title(format!(" Set Priority: {} ", process_info))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(theme.border))
         .style(Style::default().bg(theme.background));
 
     let style = Style::default().fg(theme.text).bg(theme.background);
@@ -608,13 +717,15 @@ pub fn draw_priority(frame: &mut Frame, app: &mut App) {
     // Draw footer hint on the dialog's bottom inner row.
     let hint_area = Rect::new(area.x + 1, area.y + area.height - 2, area.width - 2, 1);
     let hint = Paragraph::new("↑↓ select, E efficiency, Enter apply, Esc cancel")
-        .style(Style::default().fg(Color::DarkGray));
+        .style(Style::default().fg(theme.text_dim).bg(theme.background));
     frame.render_widget(hint, hint_area);
 }
 
 /// Draw setup menu
 pub fn draw_setup(frame: &mut Frame, app: &mut App) {
-    let DialogState::Setup { selected } = &app.dialog else { return; };
+    let DialogState::Setup { selected } = &app.dialog else {
+        return;
+    };
     let selected = *selected;
     let theme = &app.theme;
     let area = centered_rect(60, 60, frame.area());
@@ -623,20 +734,44 @@ pub fn draw_setup(frame: &mut Frame, app: &mut App) {
     let setup_items: Vec<(&str, String)> = vec![
         ("Refresh rate", format!("{} ms", app.config.refresh_rate_ms)),
         ("CPU meter mode", meter_mode_str(app.config.cpu_meter_mode)),
-        ("Memory meter mode", meter_mode_str(app.config.memory_meter_mode)),
+        (
+            "Memory meter mode",
+            meter_mode_str(app.config.memory_meter_mode),
+        ),
         ("GPU meter mode", meter_mode_str(app.config.gpu_meter_mode)),
         ("NPU meter mode", meter_mode_str(app.config.npu_meter_mode)),
-        ("Show kernel threads", bool_to_str(app.config.show_kernel_threads)),
-        ("Show user threads", bool_to_str(app.config.show_user_threads)),
-        ("Show program path", bool_to_str(app.config.show_program_path)),
-        ("Highlight new processes", bool_to_str(app.config.highlight_new_processes)),
-        ("Highlight large numbers", bool_to_str(app.config.highlight_large_numbers)),
+        (
+            "Show kernel threads",
+            bool_to_str(app.config.show_kernel_threads),
+        ),
+        (
+            "Show user threads",
+            bool_to_str(app.config.show_user_threads),
+        ),
+        (
+            "Show program path",
+            bool_to_str(app.config.show_program_path),
+        ),
+        (
+            "Highlight new processes",
+            bool_to_str(app.config.highlight_new_processes),
+        ),
+        (
+            "Highlight large numbers",
+            bool_to_str(app.config.highlight_large_numbers),
+        ),
         ("Tree view", bool_to_str(app.tree_view)),
         ("Confirm before kill", bool_to_str(app.config.confirm_kill)),
         ("Color scheme", app.config.color_scheme.name().to_string()),
         ("Configure columns", "→".to_string()),
         ("Reset all settings", "⚠".to_string()),
-        ("GPU meter adapter", app.config.gpu_meter_adapter.clone().unwrap_or_else(|| "Auto".to_string())),
+        (
+            "GPU meter adapter",
+            app.config
+                .gpu_meter_adapter
+                .clone()
+                .unwrap_or_else(|| "Auto".to_string()),
+        ),
     ];
 
     let items: Vec<ListItem> = setup_items
@@ -644,8 +779,11 @@ pub fn draw_setup(frame: &mut Frame, app: &mut App) {
         .enumerate()
         .map(|(idx, (label, value))| {
             ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:<30} ", label), item_style(idx == selected, theme)),
-                Span::styled(value.to_string(), Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!(" {:<30} ", label),
+                    item_style(idx == selected, theme),
+                ),
+                Span::styled(value.to_string(), Style::default().fg(theme.meter_value_ok)),
             ]))
         })
         .collect();
@@ -653,7 +791,7 @@ pub fn draw_setup(frame: &mut Frame, app: &mut App) {
     let block = Block::default()
         .title(" Setup (Enter to toggle, Esc to close) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(theme.border))
         .style(Style::default().bg(theme.background));
 
     let style = Style::default().fg(theme.text).bg(theme.background);
@@ -661,7 +799,11 @@ pub fn draw_setup(frame: &mut Frame, app: &mut App) {
 }
 
 fn bool_to_str(val: bool) -> String {
-    if val { "Yes".to_string() } else { "No".to_string() }
+    if val {
+        "Yes".to_string()
+    } else {
+        "No".to_string()
+    }
 }
 
 fn meter_mode_str(mode: crate::config::MeterMode) -> String {
@@ -677,7 +819,9 @@ fn meter_mode_str(mode: crate::config::MeterMode) -> String {
 /// Draw process info dialog
 pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
     let theme = &app.theme;
-    let DialogState::ProcessInfo { target, scroll } = &mut app.dialog else { return; };
+    let DialogState::ProcessInfo { target, scroll } = &mut app.dialog else {
+        return;
+    };
     let area = centered_rect(70, 80, frame.area());
 
     // Use captured target to prevent race condition with list refresh
@@ -689,6 +833,7 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
             'I' => "Idle",
             'Z' => "Zombie",
             'T' => "Stopped",
+            '?' => "Unknown (not exposed by Windows native process query)",
             _ => "Unknown",
         };
 
@@ -703,8 +848,16 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
             s => s,
         };
 
-        let elevated_str = if proc.is_elevated { "Yes 🛡️" } else { "No" };
-        let efficiency_str = if proc.efficiency_mode { "Yes 🌿" } else { "No" };
+        let elevated_str = if proc.is_elevated {
+            "Yes 🛡️"
+        } else {
+            "No"
+        };
+        let efficiency_str = if proc.efficiency_mode {
+            "Yes 🌿"
+        } else {
+            "No"
+        };
 
         format!(
             " PROCESS\n\
@@ -760,7 +913,8 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
             proc.parent_pid,
             proc.name,
             proc.user,
-            proc.status, status_desc,
+            proc.status,
+            status_desc,
             arch_str,
             proc.priority,
             crate::app::WindowsPriorityClass::from_base_priority(proc.priority).name(),
@@ -793,7 +947,7 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
     let block = Block::default()
         .title(format!(" {} ", target.name))
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(theme.border))
         .style(Style::default().bg(theme.background));
 
     render_scrollable_dialog(
@@ -808,21 +962,24 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
 }
 
 /// Draw error message
-pub fn draw_error(frame: &mut Frame, error: &str) {
+pub fn draw_error(frame: &mut Frame, app: &mut App, error: &str) {
     let area = centered_rect_fixed(60, 5, frame.area());
+    let theme = &app.theme;
 
     let dialog = Paragraph::new(format!("\n{}\n\nPress any key to dismiss", error))
         .block(
             Block::default()
                 .title(" Error ")
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Red)),
+                .border_style(Style::default().fg(theme.failed_read))
+                .style(Style::default().bg(theme.background)),
         )
-        .style(Style::default().fg(Color::Red))
+        .style(Style::default().fg(theme.failed_read).bg(theme.background))
         .wrap(Wrap { trim: true });
 
     frame.render_widget(Clear, area);
     frame.render_widget(dialog, area);
+    cache_dialog_geometry(app, area);
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {
@@ -850,7 +1007,12 @@ fn truncate_str(s: &str, max_len: usize) -> String {
 
 /// Draw signal selection dialog
 pub fn draw_signal_select(frame: &mut Frame, app: &mut App) {
-    let DialogState::SignalSelect { index, pid, name, .. } = &app.dialog else { return; };
+    let DialogState::SignalSelect {
+        index, pid, name, ..
+    } = &app.dialog
+    else {
+        return;
+    };
     let index = *index;
     let title = format!(" Send Signal to {} ({}) ", name, pid);
     let theme = &app.theme;
@@ -872,7 +1034,7 @@ pub fn draw_signal_select(frame: &mut Frame, app: &mut App) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Red))
+        .border_style(Style::default().fg(theme.failed_read))
         .style(Style::default().bg(theme.background));
 
     let style = Style::default().fg(theme.text).bg(theme.background);
@@ -881,7 +1043,9 @@ pub fn draw_signal_select(frame: &mut Frame, app: &mut App) {
 
 /// Draw user selection dialog
 pub fn draw_user_select(frame: &mut Frame, app: &mut App) {
-    let DialogState::UserSelect { index, users } = &app.dialog else { return; };
+    let DialogState::UserSelect { index, users } = &app.dialog else {
+        return;
+    };
     let index = *index;
     let theme = &app.theme;
     let num_items = users.len() + 1; // +1 for "All users"
@@ -906,7 +1070,7 @@ pub fn draw_user_select(frame: &mut Frame, app: &mut App) {
     let block = Block::default()
         .title(" Filter by User ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(theme.border))
         .style(Style::default().bg(theme.background));
 
     let style = Style::default().fg(theme.text).bg(theme.background);
@@ -915,19 +1079,25 @@ pub fn draw_user_select(frame: &mut Frame, app: &mut App) {
 
 /// Draw environment variables dialog
 pub fn draw_environment(frame: &mut Frame, app: &mut App) {
-    let DialogState::Environment { pid, .. } = &app.dialog else { return; };
+    let DialogState::Environment { pid, .. } = &app.dialog else {
+        return;
+    };
     let pid = *pid;
     let area = centered_rect(80, 80, frame.area());
+    let theme = app.theme.clone();
 
-    let content = app.process_by_pid(pid)
-        .map(|proc| format!(
-            "Environment Variables for {} (PID: {})\n\n\
+    let content = app
+        .process_by_pid(pid)
+        .map(|proc| {
+            format!(
+                "Environment Variables for {} (PID: {})\n\n\
              Note: Environment variables cannot be read from \n\
              other processes on Windows without elevated privileges.\n\n\
              Command line:\n{}\n\n\
              Press Esc to close",
-            proc.name, proc.pid, proc.command
-        ))
+                proc.name, proc.pid, proc.command
+            )
+        })
         .unwrap_or_else(|| "No process selected".to_string());
 
     let wrap_width = area.width.saturating_sub(2) as usize;
@@ -937,17 +1107,20 @@ pub fn draw_environment(frame: &mut Frame, app: &mut App) {
         .map(Line::from)
         .collect();
 
-    let DialogState::Environment { scroll, .. } = &mut app.dialog else { return; };
+    let DialogState::Environment { scroll, .. } = &mut app.dialog else {
+        return;
+    };
     let block = Block::default()
         .title(" Environment ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta));
+        .border_style(Style::default().fg(theme.border))
+        .style(Style::default().bg(theme.background));
 
     render_scrollable_dialog(
         frame,
         area,
         block,
-        Style::default().fg(Color::White),
+        Style::default().fg(theme.text).bg(theme.background),
         lines,
         scroll,
     );
@@ -956,7 +1129,9 @@ pub fn draw_environment(frame: &mut Frame, app: &mut App) {
 
 /// Draw color scheme selection dialog
 pub fn draw_color_scheme(frame: &mut Frame, app: &mut App) {
-    let DialogState::ColorScheme { index } = &app.dialog else { return; };
+    let DialogState::ColorScheme { index } = &app.dialog else {
+        return;
+    };
     let index = *index;
     let theme = &app.theme;
     let schemes = ColorScheme::all();
@@ -966,17 +1141,22 @@ pub fn draw_color_scheme(frame: &mut Frame, app: &mut App) {
         .iter()
         .enumerate()
         .map(|(idx, scheme)| {
-            let indicator = if *scheme == app.config.color_scheme { " ●" } else { "  " };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{} {}", indicator, scheme.name()), item_style(idx == index, theme)),
-            ]))
+            let indicator = if *scheme == app.config.color_scheme {
+                " ●"
+            } else {
+                "  "
+            };
+            ListItem::new(Line::from(vec![Span::styled(
+                format!("{} {}", indicator, scheme.name()),
+                item_style(idx == index, theme),
+            )]))
         })
         .collect();
 
     let block = Block::default()
         .title(" Color Scheme ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green))
+        .border_style(Style::default().fg(theme.border))
         .style(Style::default().bg(theme.background));
 
     let style = Style::default().fg(theme.text).bg(theme.background);
@@ -985,7 +1165,9 @@ pub fn draw_color_scheme(frame: &mut Frame, app: &mut App) {
 
 /// Draw GPU meter adapter selection dialog
 pub fn draw_gpu_select(frame: &mut Frame, app: &mut App) {
-    let DialogState::GpuSelect { index, names } = &app.dialog else { return; };
+    let DialogState::GpuSelect { index, names } = &app.dialog else {
+        return;
+    };
     let index = *index;
     let names = names.clone();
     let theme = &app.theme;
@@ -995,11 +1177,18 @@ pub fn draw_gpu_select(frame: &mut Frame, app: &mut App) {
     let current = app.config.gpu_meter_adapter.as_deref();
     let mut items: Vec<ListItem> = Vec::with_capacity(num);
     items.push(ListItem::new(Line::from(Span::styled(
-        format!("{} Auto (most VRAM)", if current.is_none() { "●" } else { " " }),
+        format!(
+            "{} Auto (most VRAM)",
+            if current.is_none() { "●" } else { " " }
+        ),
         item_style(index == 0, theme),
     ))));
     for (i, name) in names.iter().enumerate() {
-        let marker = if current == Some(name.as_str()) { "●" } else { " " };
+        let marker = if current == Some(name.as_str()) {
+            "●"
+        } else {
+            " "
+        };
         items.push(ListItem::new(Line::from(Span::styled(
             format!("{} {}", marker, name),
             item_style(i + 1 == index, theme),
@@ -1009,7 +1198,7 @@ pub fn draw_gpu_select(frame: &mut Frame, app: &mut App) {
     let block = Block::default()
         .title(" GPU Meter Adapter ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green))
+        .border_style(Style::default().fg(theme.border))
         .style(Style::default().bg(theme.background));
     let style = Style::default().fg(theme.text).bg(theme.background);
     render_list_dialog(frame, app, area, block, style, items, index, 0, 0);
@@ -1027,9 +1216,12 @@ pub fn signal_count() -> usize {
 
 /// Draw wrapped command display dialog
 pub fn draw_command_wrap(frame: &mut Frame, app: &mut App) {
-    let DialogState::CommandWrap { pid, .. } = &app.dialog else { return; };
+    let DialogState::CommandWrap { pid, .. } = &app.dialog else {
+        return;
+    };
     let pid = *pid;
     let area = centered_rect(80, 70, frame.area());
+    let theme = app.theme.clone();
 
     let text_lines = if let Some(proc) = app.process_by_pid(pid) {
         let mut lines = vec![
@@ -1058,19 +1250,31 @@ pub fn draw_command_wrap(frame: &mut Frame, app: &mut App) {
 
     let lines: Vec<Line> = text_lines.into_iter().map(Line::from).collect();
 
-    let DialogState::CommandWrap { scroll, .. } = &mut app.dialog else { return; };
+    let DialogState::CommandWrap { scroll, .. } = &mut app.dialog else {
+        return;
+    };
     let block = Block::default()
         .title(" Command Line (w to close) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(Style::default().fg(theme.border))
+        .style(Style::default().bg(theme.background));
 
-    render_scrollable_dialog(frame, area, block, Style::default(), lines, scroll);
+    render_scrollable_dialog(
+        frame,
+        area,
+        block,
+        Style::default().fg(theme.text).bg(theme.background),
+        lines,
+        scroll,
+    );
     cache_dialog_geometry(app, area);
 }
 
 /// Draw column configuration dialog
 pub fn draw_column_config(frame: &mut Frame, app: &mut App) {
-    let DialogState::ColumnConfig { index } = &app.dialog else { return; };
+    let DialogState::ColumnConfig { index } = &app.dialog else {
+        return;
+    };
     let index = *index;
     let theme = &app.theme;
     let columns = SortColumn::all();
@@ -1092,7 +1296,9 @@ pub fn draw_column_config(frame: &mut Frame, app: &mut App) {
             let style = if idx == index {
                 selected_style(theme)
             } else if is_visible {
-                Style::default().fg(Color::Green).bg(theme.background)
+                Style::default()
+                    .fg(theme.meter_value_ok)
+                    .bg(theme.background)
             } else {
                 Style::default().fg(theme.text_dim).bg(theme.background)
             };
@@ -1106,14 +1312,15 @@ pub fn draw_column_config(frame: &mut Frame, app: &mut App) {
     // Add help text at bottom (pinned as footer rows so it stays visible while
     // the column list scrolls on short terminals).
     items.push(ListItem::new(Line::from("")));
-    items.push(ListItem::new(Line::from(vec![
-        Span::styled("Shift+↑↓ to reorder", Style::default().fg(Color::DarkGray)),
-    ])));
+    items.push(ListItem::new(Line::from(vec![Span::styled(
+        "Shift+↑↓ to reorder",
+        Style::default().fg(theme.text_dim),
+    )])));
 
     let block = Block::default()
         .title(" Columns (Space to toggle) ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(theme.border))
         .style(Style::default().bg(theme.background));
 
     let style = Style::default().fg(theme.text).bg(theme.background);
@@ -1122,7 +1329,14 @@ pub fn draw_column_config(frame: &mut Frame, app: &mut App) {
 
 /// Draw CPU affinity dialog
 pub fn draw_affinity(frame: &mut Frame, app: &mut App) {
-    let DialogState::Affinity { mask, selected, pid } = &app.dialog else { return; };
+    let DialogState::Affinity {
+        mask,
+        selected,
+        pid,
+    } = &app.dialog
+    else {
+        return;
+    };
     let mask = *mask;
     let selected = *selected;
     let pid = *pid;
@@ -1141,9 +1355,10 @@ pub fn draw_affinity(frame: &mut Frame, app: &mut App) {
     // Rows 0 and 1 (process name + blank) are pinned header rows; the CPU rows
     // that follow are the selectable region, so the navigable `selected` (a CPU
     // index) maps to item index `selected + 2`.
-    let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(vec![
-        Span::styled(proc_name, Style::default().fg(theme.meter_label).bg(theme.background)),
-    ]))];
+    let mut items: Vec<ListItem> = vec![ListItem::new(Line::from(vec![Span::styled(
+        proc_name,
+        Style::default().fg(theme.meter_label).bg(theme.background),
+    )]))];
 
     items.push(ListItem::new(Line::from("")));
 
@@ -1153,7 +1368,9 @@ pub fn draw_affinity(frame: &mut Frame, app: &mut App) {
         let style = if cpu_idx == selected {
             selected_style(theme)
         } else if is_set {
-            Style::default().fg(Color::Green).bg(theme.background)
+            Style::default()
+                .fg(theme.meter_value_ok)
+                .bg(theme.background)
         } else {
             Style::default().fg(theme.text_dim).bg(theme.background)
         };
@@ -1166,7 +1383,7 @@ pub fn draw_affinity(frame: &mut Frame, app: &mut App) {
     let block = Block::default()
         .title(" CPU Affinity ")
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta))
+        .border_style(Style::default().fg(theme.border))
         .style(Style::default().bg(theme.background));
 
     let style = Style::default().fg(theme.text).bg(theme.background);
@@ -1182,7 +1399,10 @@ mod tests {
         assert_eq!(wrap_text("hello world", 20), vec!["hello world"]);
         assert_eq!(wrap_text("", 10), vec![""]);
         // Internal alignment spacing survives when no wrapping is needed
-        assert_eq!(wrap_text("PID             123", 40), vec!["PID             123"]);
+        assert_eq!(
+            wrap_text("PID             123", 40),
+            vec!["PID             123"]
+        );
     }
 
     #[test]
@@ -1192,7 +1412,7 @@ mod tests {
 
     #[test]
     fn wrap_text_wraps_at_word_boundaries() {
-        assert_eq!(wrap_text("foo bar baz", 7), vec!["foo bar", "baz"]);
+        assert_eq!(wrap_text("foo bar baz", 7), vec!["foo bar", " baz"]);
     }
 
     #[test]
@@ -1207,7 +1427,7 @@ mod tests {
     fn wrap_text_preserves_indent() {
         assert_eq!(
             wrap_text("   foo bar baz", 7),
-            vec!["   foo", "   bar", "   baz"]
+            vec!["   foo ", "   bar ", "   baz"]
         );
     }
 

@@ -225,10 +225,10 @@ class UITester:
             "CPU Bar 100%": "  0[|||||||||||||||||||||||||||||||||||||||| 100.0%]",
             "Memory Bar": "Mem[|||||||||||||||||||||||||||||||||     4.52G/7.89G]",
             "Swap Bar": "Swp[                                        0K/2.00G]",
-            "Tasks": "Tasks: 245, 892 thr; 2 running",
+            "Tasks": "Tasks: 245, 892 thr",
             "Uptime": "Uptime: 12:34:56",
             "Header": "  PID USER      PRI  NI  VIRT   RES   SHR S CPU% MEM%   TIME+  Command",
-            "Footer": "F1Help  F2Setup F3Search F4Filter F5Tree  F6SortBy F7Nice- F8Nice+ F9Kill  F10Quit",
+            "Footer": "F1Help  F2Setup F3Search F4Filter F5Tree  F6Sort F7Pri F8Pri F9Kill F10Quit",
         }
 
         all_passed = True
@@ -331,14 +331,12 @@ def main():
         sys.exit(0 if success else 1)
 
     if args.capture:
-        print("Capture mode not yet implemented")
-        print("Run htop-win and manually capture the output")
-        sys.exit(0)
+        print("Error: capture mode is not yet implemented", file=sys.stderr)
+        sys.exit(2)
 
     if args.compare:
-        print("Compare mode not yet implemented")
-        print("Use --validate for pattern validation")
-        sys.exit(0)
+        print("Error: compare mode is not yet implemented", file=sys.stderr)
+        sys.exit(2)
 
 
 if __name__ == "__main__":

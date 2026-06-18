@@ -81,19 +81,23 @@ fn processor_layout() -> Vec<(u16, u32)> {
 #[cfg(windows)]
 fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
     use std::sync::Mutex;
-    use windows::core::PCWSTR;
     use windows::Win32::System::Performance::{
-        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-        PdhGetFormattedCounterValue, PdhOpenQueryW, PDH_CSTATUS_VALID_DATA,
-        PDH_FMT_DOUBLE, PDH_FMT_COUNTERVALUE, PDH_HCOUNTER, PDH_HQUERY,
+        PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
+        PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterValue,
+        PdhOpenQueryW,
     };
+    use windows::core::PCWSTR;
 
     /// Wrapper to make PDH handles Send (they're only accessed with mutex held)
     struct SendPtr(*mut std::ffi::c_void);
     unsafe impl Send for SendPtr {}
     impl SendPtr {
-        fn as_query(&self) -> PDH_HQUERY { PDH_HQUERY(self.0) }
-        fn as_counter(&self) -> PDH_HCOUNTER { PDH_HCOUNTER(self.0) }
+        fn as_query(&self) -> PDH_HQUERY {
+            PDH_HQUERY(self.0)
+        }
+        fn as_counter(&self) -> PDH_HCOUNTER {
+            PDH_HCOUNTER(self.0)
+        }
     }
 
     /// Counter set for each CPU core (user time, privileged/system time)
@@ -125,7 +129,9 @@ fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
     impl Drop for PdhState {
         fn drop(&mut self) {
             if self.initialized {
-                unsafe { let _ = PdhCloseQuery(self.query.as_query()); }
+                unsafe {
+                    let _ = PdhCloseQuery(self.query.as_query());
+                }
             }
         }
     }
@@ -134,14 +140,8 @@ fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
     unsafe fn add_counter(query: PDH_HQUERY, path: &str) -> Option<SendPtr> {
         let path_wide: Vec<u16> = format!("{}\0", path).encode_utf16().collect();
         let mut counter = PDH_HCOUNTER::default();
-        let status = unsafe {
-            PdhAddEnglishCounterW(
-                query,
-                PCWSTR(path_wide.as_ptr()),
-                0,
-                &mut counter,
-            )
-        };
+        let status =
+            unsafe { PdhAddEnglishCounterW(query, PCWSTR(path_wide.as_ptr()), 0, &mut counter) };
         if status == 0 {
             Some(SendPtr(counter.0))
         } else {
@@ -153,12 +153,7 @@ fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
     unsafe fn get_counter_value(counter: &SendPtr) -> f32 {
         let mut value = PDH_FMT_COUNTERVALUE::default();
         let status = unsafe {
-            PdhGetFormattedCounterValue(
-                counter.as_counter(),
-                PDH_FMT_DOUBLE,
-                None,
-                &mut value,
-            )
+            PdhGetFormattedCounterValue(counter.as_counter(), PDH_FMT_DOUBLE, None, &mut value)
         };
         if status == 0 && value.CStatus == PDH_CSTATUS_VALID_DATA {
             unsafe { (value.Anonymous.doubleValue as f32).clamp(0.0, 100.0) }
@@ -186,13 +181,11 @@ fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
             if status != 0 {
                 return fallback_cpu_info(cpu_count);
             }
-            state.query = SendPtr(query.0);
-
             // Add per-processor counters using the group-aware "Processor
             // Information(group,n)" counterset so every group is covered:
             // - % User Time: time in user mode
             // - % Privileged Time: time in kernel mode (system)
-            state.core_counters.reserve(cpu_count);
+            let mut core_counters = Vec::with_capacity(cpu_count);
             for &(group, n) in &layout {
                 let user_path = format!("\\Processor Information({group},{n})\\% User Time");
                 let priv_path = format!("\\Processor Information({group},{n})\\% Privileged Time");
@@ -210,9 +203,11 @@ fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
                         return fallback_cpu_info(cpu_count);
                     }
                 };
-                state.core_counters.push(CoreCounters { user, privileged });
+                core_counters.push(CoreCounters { user, privileged });
             }
 
+            state.query = SendPtr(query.0);
+            state.core_counters = core_counters;
             state.initialized = true;
         }
     }
@@ -230,7 +225,14 @@ fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
         state.first_sample_done = true;
         // Return zeros for first sample
         let core_usage = vec![0.0; cpu_count];
-        let breakdowns = vec![CpuBreakdown { user: 0.0, system: 0.0, idle: 100.0 }; cpu_count];
+        let breakdowns = vec![
+            CpuBreakdown {
+                user: 0.0,
+                system: 0.0,
+                idle: 100.0
+            };
+            cpu_count
+        ];
         return (core_usage, breakdowns);
     }
 
@@ -258,7 +260,14 @@ fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
 #[cfg(windows)]
 fn fallback_cpu_info(cpu_count: usize) -> (Vec<f32>, Vec<CpuBreakdown>) {
     let core_usage = vec![0.0; cpu_count];
-    let breakdowns = vec![CpuBreakdown { user: 0.0, system: 0.0, idle: 100.0 }; cpu_count];
+    let breakdowns = vec![
+        CpuBreakdown {
+            user: 0.0,
+            system: 0.0,
+            idle: 100.0
+        };
+        cpu_count
+    ];
     (core_usage, breakdowns)
 }
 
@@ -268,7 +277,12 @@ fn fallback_cpu_info(cpu_count: usize) -> (Vec<f32>, Vec<CpuBreakdown>) {
 pub fn debug_dump() -> String {
     use std::fmt::Write as _;
     let layout = processor_layout();
-    let groups = layout.iter().map(|(g, _)| *g).max().map(|g| g + 1).unwrap_or(0);
+    let groups = layout
+        .iter()
+        .map(|(g, _)| *g)
+        .max()
+        .map(|g| g + 1)
+        .unwrap_or(0);
     let _ = get_cpu_info_pdh(); // first sample primes the counters (returns zeros)
     std::thread::sleep(std::time::Duration::from_millis(300));
     let (usage, breakdown) = get_cpu_info_pdh();
@@ -277,16 +291,27 @@ pub fn debug_dump() -> String {
     let _ = writeln!(out, "Logical processors: {}", layout.len());
     let _ = writeln!(out, "Processor groups:   {groups}");
     let per_group: std::collections::BTreeMap<u16, usize> =
-        layout.iter().fold(std::collections::BTreeMap::new(), |mut m, (g, _)| {
-            *m.entry(*g).or_default() += 1;
-            m
-        });
+        layout
+            .iter()
+            .fold(std::collections::BTreeMap::new(), |mut m, (g, _)| {
+                *m.entry(*g).or_default() += 1;
+                m
+            });
     for (g, n) in &per_group {
         let _ = writeln!(out, "  group {g}: {n} processors");
     }
     let _ = writeln!(out, "\nper-core usage (after 300ms):");
     for (i, (u, bd)) in usage.iter().zip(breakdown.iter()).enumerate() {
-        let _ = writeln!(out, "  CPU {i:>3}: {u:5.1}%  (user {:.1} sys {:.1})", bd.user, bd.system);
+        let _ = writeln!(
+            out,
+            "  CPU {i:>3}: {u:5.1}%  (user {:.1} sys {:.1})",
+            bd.user, bd.system
+        );
     }
     out
+}
+
+#[cfg(not(windows))]
+pub fn debug_dump() -> String {
+    "CPU / processor-group diagnostics are only available on Windows".to_string()
 }

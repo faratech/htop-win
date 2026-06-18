@@ -5,12 +5,12 @@
 #![allow(dead_code)] // Library provides full API even if not all used
 
 use crossterm::{
+    ExecutableCommand, QueueableCommand,
     cursor::{Hide, MoveTo, Show},
     style::{
         Attribute, Color as CtColor, Print, SetAttribute, SetBackgroundColor, SetForegroundColor,
     },
     terminal::{self, Clear as CtClear, ClearType},
-    ExecutableCommand, QueueableCommand,
 };
 use std::io::{self, Stdout, Write};
 
@@ -29,7 +29,12 @@ pub struct Rect {
 
 impl Rect {
     pub fn new(x: u16, y: u16, width: u16, height: u16) -> Self {
-        Self { x, y, width, height }
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
     }
 
     /// Total cell count. Returns `usize` (not `u16`) so terminals with more than
@@ -554,13 +559,15 @@ impl Default for BufferCell {
 impl BufferCell {
     pub fn set_symbol(&mut self, symbol: &str) -> &mut Self {
         self.symbol.clear();
-        self.symbol.push_str(symbol);
+        for ch in symbol.chars() {
+            push_terminal_safe_char(&mut self.symbol, ch);
+        }
         self
     }
 
     pub fn set_char(&mut self, ch: char) -> &mut Self {
         self.symbol.clear();
-        self.symbol.push(ch);
+        push_terminal_safe_char(&mut self.symbol, ch);
         self
     }
 
@@ -590,6 +597,41 @@ impl BufferCell {
         self.symbol.clear();
         self.is_continuation = true;
         self
+    }
+}
+
+#[inline]
+fn push_terminal_safe_char(out: &mut String, ch: char) {
+    if ch == '\t' {
+        out.push(' ');
+    } else if ch.is_control() || ('\u{80}'..='\u{9f}').contains(&ch) {
+        out.push('�');
+    } else {
+        out.push(ch);
+    }
+}
+
+fn sanitized_terminal_symbol(symbol: &str) -> std::borrow::Cow<'_, str> {
+    if symbol
+        .chars()
+        .all(|ch| ch != '\t' && !ch.is_control() && !('\u{80}'..='\u{9f}').contains(&ch))
+    {
+        return std::borrow::Cow::Borrowed(symbol);
+    }
+
+    let mut safe = String::with_capacity(symbol.len());
+    for ch in symbol.chars() {
+        push_terminal_safe_char(&mut safe, ch);
+    }
+    std::borrow::Cow::Owned(safe)
+}
+
+#[inline]
+fn terminal_char_width(ch: char) -> u16 {
+    if ch == '\t' || ch.is_control() || ('\u{80}'..='\u{9f}').contains(&ch) {
+        1
+    } else {
+        unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16
     }
 }
 
@@ -653,12 +695,30 @@ impl Buffer {
         self.set_string_truncated(x, y, string, u16::MAX, style);
     }
 
-    pub fn set_string_truncated(&mut self, x: u16, y: u16, string: &str, max_width: u16, style: Style) {
+    pub fn set_string_truncated(
+        &mut self,
+        x: u16,
+        y: u16,
+        string: &str,
+        max_width: u16,
+        style: Style,
+    ) {
         let mut col = x;
-        let max_col = x.saturating_add(max_width).min(self.area.x + self.area.width);
+        let max_col = x
+            .saturating_add(max_width)
+            .min(self.area.x + self.area.width);
 
+        let mut last_base_col = None;
         for ch in string.chars() {
-            let width = if ch.is_ascii_graphic() { 1 } else { unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) } as u16;
+            let width = terminal_char_width(ch);
+            if width == 0 {
+                if let Some(base_col) = last_base_col
+                    && let Some(cell) = self.get_mut(base_col, y)
+                {
+                    push_terminal_safe_char(&mut cell.symbol, ch);
+                }
+                continue;
+            }
             if col + width > max_col {
                 break;
             }
@@ -667,6 +727,7 @@ impl Buffer {
                 cell.set_style(style);
                 cell.is_continuation = false;
             }
+            last_base_col = Some(col);
             // Mark continuation cells for wide characters
             for i in 1..width {
                 if let Some(cont_cell) = self.get_mut(col + i, y) {
@@ -674,18 +735,29 @@ impl Buffer {
                     cont_cell.set_style(style);
                 }
             }
-            col += width.max(1);
+            col += width;
         }
     }
 
     pub fn set_line(&mut self, x: u16, y: u16, line: &Line<'_>, max_width: u16) {
         let mut col = x;
-        let max_col = x.saturating_add(max_width).min(self.area.x + self.area.width);
+        let max_col = x
+            .saturating_add(max_width)
+            .min(self.area.x + self.area.width);
 
+        let mut last_base_col = None;
         for span in &line.spans {
             let style = line.style.patch(span.style);
             for ch in span.content.chars() {
-                let width = if ch.is_ascii_graphic() { 1 } else { unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) } as u16;
+                let width = terminal_char_width(ch);
+                if width == 0 {
+                    if let Some(base_col) = last_base_col
+                        && let Some(cell) = self.get_mut(base_col, y)
+                    {
+                        push_terminal_safe_char(&mut cell.symbol, ch);
+                    }
+                    continue;
+                }
                 if col + width > max_col {
                     return;
                 }
@@ -694,6 +766,7 @@ impl Buffer {
                     cell.set_style(style);
                     cell.is_continuation = false; // This cell has actual content
                 }
+                last_base_col = Some(col);
                 // Mark continuation cells for wide characters (width > 1)
                 // These cells are "occupied" by the wide char but contain no content
                 for i in 1..width {
@@ -702,7 +775,7 @@ impl Buffer {
                         cont_cell.set_style(style); // Keep same style for background
                     }
                 }
-                col += width.max(1);
+                col += width;
             }
         }
     }
@@ -822,6 +895,14 @@ impl Terminal {
         let current = &self.buffers[self.current];
         let previous = &self.buffers[1 - self.current];
 
+        self.backend.stdout.queue(SetAttribute(Attribute::Reset))?;
+        self.backend
+            .stdout
+            .queue(SetForegroundColor(CtColor::Reset))?;
+        self.backend
+            .stdout
+            .queue(SetBackgroundColor(CtColor::Reset))?;
+
         let mut last_fg = Color::Reset;
         let mut last_bg = Color::Reset;
         let mut last_modifier = Modifier::empty();
@@ -859,10 +940,11 @@ impl Terminal {
 
                 // Skip if same as previous
                 if let Some(p) = prev
-                    && cell == p {
-                        skip += 1;
-                        continue;
-                    }
+                    && cell == p
+                {
+                    skip += 1;
+                    continue;
+                }
 
                 // Position cursor (skip if sequential)
                 if skip > 0 || x == current.area.x {
@@ -872,11 +954,15 @@ impl Terminal {
 
                 // Set colors/modifiers if changed
                 if cell.fg != last_fg {
-                    self.backend.stdout.queue(SetForegroundColor(cell.fg.to_crossterm()))?;
+                    self.backend
+                        .stdout
+                        .queue(SetForegroundColor(cell.fg.to_crossterm()))?;
                     last_fg = cell.fg;
                 }
                 if cell.bg != last_bg {
-                    self.backend.stdout.queue(SetBackgroundColor(cell.bg.to_crossterm()))?;
+                    self.backend
+                        .stdout
+                        .queue(SetBackgroundColor(cell.bg.to_crossterm()))?;
                     last_bg = cell.bg;
                 }
                 if cell.modifier != last_modifier {
@@ -886,8 +972,12 @@ impl Terminal {
                         // Must reset to remove attributes, then re-apply what's needed
                         self.backend.stdout.queue(SetAttribute(Attribute::Reset))?;
                         // Re-apply colors after reset
-                        self.backend.stdout.queue(SetForegroundColor(cell.fg.to_crossterm()))?;
-                        self.backend.stdout.queue(SetBackgroundColor(cell.bg.to_crossterm()))?;
+                        self.backend
+                            .stdout
+                            .queue(SetForegroundColor(cell.fg.to_crossterm()))?;
+                        self.backend
+                            .stdout
+                            .queue(SetBackgroundColor(cell.bg.to_crossterm()))?;
                         last_fg = cell.fg;
                         last_bg = cell.bg;
                     }
@@ -907,18 +997,33 @@ impl Terminal {
                         self.backend.stdout.queue(SetAttribute(Attribute::Italic))?;
                     }
                     if to_apply.contains(Modifier::UNDERLINED) {
-                        self.backend.stdout.queue(SetAttribute(Attribute::Underlined))?;
+                        self.backend
+                            .stdout
+                            .queue(SetAttribute(Attribute::Underlined))?;
                     }
                     if to_apply.contains(Modifier::REVERSED) {
-                        self.backend.stdout.queue(SetAttribute(Attribute::Reverse))?;
+                        self.backend
+                            .stdout
+                            .queue(SetAttribute(Attribute::Reverse))?;
                     }
                     last_modifier = cell.modifier;
                 }
 
-                // Print the character
-                self.backend.stdout.queue(Print(&cell.symbol))?;
+                // Print the character. Defense-in-depth: cells are sanitized at
+                // write time, but sanitize again here so direct buffer mutation
+                // can never emit process-controlled ESC/C0/C1 controls.
+                let symbol = sanitized_terminal_symbol(&cell.symbol);
+                self.backend.stdout.queue(Print(symbol.as_ref()))?;
             }
         }
+
+        self.backend.stdout.queue(SetAttribute(Attribute::Reset))?;
+        self.backend
+            .stdout
+            .queue(SetForegroundColor(CtColor::Reset))?;
+        self.backend
+            .stdout
+            .queue(SetBackgroundColor(CtColor::Reset))?;
 
         Ok(())
     }
@@ -957,6 +1062,13 @@ pub struct Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
+    pub fn new(buffer: &'a mut Buffer) -> Self {
+        Self {
+            buffer,
+            cursor_position: None,
+        }
+    }
+
     pub fn area(&self) -> Rect {
         self.buffer.area
     }
@@ -1148,25 +1260,33 @@ impl Widget for Block<'_> {
 
         // Corners
         if self.borders.contains(Borders::TOP | Borders::LEFT)
-            && let Some(cell) = buf.get_mut(area.x, area.y) {
-                cell.set_symbol(symbols.2);
-                cell.set_style(self.border_style);
-            }
-        if self.borders.contains(Borders::TOP | Borders::RIGHT) && area.width > 1
-            && let Some(cell) = buf.get_mut(area.right() - 1, area.y) {
-                cell.set_symbol(symbols.3);
-                cell.set_style(self.border_style);
-            }
-        if self.borders.contains(Borders::BOTTOM | Borders::LEFT) && area.height > 1
-            && let Some(cell) = buf.get_mut(area.x, area.bottom() - 1) {
-                cell.set_symbol(symbols.4);
-                cell.set_style(self.border_style);
-            }
-        if self.borders.contains(Borders::BOTTOM | Borders::RIGHT) && area.width > 1 && area.height > 1
-            && let Some(cell) = buf.get_mut(area.right() - 1, area.bottom() - 1) {
-                cell.set_symbol(symbols.5);
-                cell.set_style(self.border_style);
-            }
+            && let Some(cell) = buf.get_mut(area.x, area.y)
+        {
+            cell.set_symbol(symbols.2);
+            cell.set_style(self.border_style);
+        }
+        if self.borders.contains(Borders::TOP | Borders::RIGHT)
+            && area.width > 1
+            && let Some(cell) = buf.get_mut(area.right() - 1, area.y)
+        {
+            cell.set_symbol(symbols.3);
+            cell.set_style(self.border_style);
+        }
+        if self.borders.contains(Borders::BOTTOM | Borders::LEFT)
+            && area.height > 1
+            && let Some(cell) = buf.get_mut(area.x, area.bottom() - 1)
+        {
+            cell.set_symbol(symbols.4);
+            cell.set_style(self.border_style);
+        }
+        if self.borders.contains(Borders::BOTTOM | Borders::RIGHT)
+            && area.width > 1
+            && area.height > 1
+            && let Some(cell) = buf.get_mut(area.right() - 1, area.bottom() - 1)
+        {
+            cell.set_symbol(symbols.5);
+            cell.set_style(self.border_style);
+        }
 
         // Title
         if let Some(title) = &self.title {
@@ -1241,14 +1361,97 @@ impl Widget for Paragraph<'_> {
 
         buf.set_style(text_area, self.style);
 
-        for (i, line) in self.text.lines.iter().enumerate() {
-            let y = text_area.y + i as u16;
+        let mut y = text_area.y;
+        for line in &self.text.lines {
             if y >= text_area.bottom() {
                 break;
             }
-            buf.set_line(text_area.x, y, line, text_area.width);
+            if let Some(wrap) = self.wrap {
+                for wrapped in wrap_line(line, text_area.width as usize, wrap.trim) {
+                    if y >= text_area.bottom() {
+                        break;
+                    }
+                    buf.set_line(text_area.x, y, &wrapped, text_area.width);
+                    y = y.saturating_add(1);
+                }
+            } else {
+                buf.set_line(text_area.x, y, line, text_area.width);
+                y = y.saturating_add(1);
+            }
         }
     }
+}
+
+fn wrap_line(line: &Line<'_>, width: usize, trim: bool) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let mut current = Line {
+        spans: Vec::new(),
+        style: line.style,
+    };
+    let mut current_width = 0usize;
+
+    for span in &line.spans {
+        let span_style = span.style;
+        for ch in span.content.chars() {
+            let char_width = terminal_char_width(ch) as usize;
+            if trim && current_width == 0 && char_width > 0 && ch.is_whitespace() {
+                continue;
+            }
+            if char_width > 0 && current_width > 0 && current_width + char_width > width {
+                finish_wrapped_line(&mut lines, &mut current, trim, line.style);
+                current_width = 0;
+                if trim && ch.is_whitespace() {
+                    continue;
+                }
+            }
+            push_wrapped_char(&mut current, ch, span_style);
+            current_width += char_width;
+        }
+    }
+
+    finish_wrapped_line(&mut lines, &mut current, trim, line.style);
+    if lines.is_empty() {
+        lines.push(Line {
+            spans: Vec::new(),
+            style: line.style,
+        });
+    }
+    lines
+}
+
+fn push_wrapped_char(line: &mut Line<'static>, ch: char, style: Style) {
+    if let Some(last) = line.spans.last_mut()
+        && last.style == style
+    {
+        last.content.to_mut().push(ch);
+        return;
+    }
+    line.spans.push(Span::styled(ch.to_string(), style));
+}
+
+fn finish_wrapped_line(
+    lines: &mut Vec<Line<'static>>,
+    current: &mut Line<'static>,
+    trim: bool,
+    style: Style,
+) {
+    if trim {
+        while let Some(last) = current.spans.last_mut() {
+            let trimmed_len = last.content.trim_end_matches(char::is_whitespace).len();
+            last.content.to_mut().truncate(trimmed_len);
+            if last.content.is_empty() {
+                current.spans.pop();
+            } else {
+                break;
+            }
+        }
+    }
+    lines.push(std::mem::take(current));
+    current.style = style;
 }
 
 impl<'a> From<Line<'a>> for Paragraph<'a> {
@@ -1356,7 +1559,10 @@ pub struct Table<'a> {
 }
 
 impl<'a> Table<'a> {
-    pub fn new<R: IntoIterator<Item = Row<'a>>, C: Into<Vec<Constraint>>>(rows: R, widths: C) -> Self {
+    pub fn new<R: IntoIterator<Item = Row<'a>>, C: Into<Vec<Constraint>>>(
+        rows: R,
+        widths: C,
+    ) -> Self {
         Self {
             rows: rows.into_iter().collect(),
             widths: widths.into(),
@@ -1476,47 +1682,47 @@ impl Widget for Table<'_> {
             return;
         }
 
-        // Apply base background style to entire table area
-        if let Some(bg) = self.style.bg {
-            let bg_style = Style::default().bg(bg);
-            buf.set_style(table_area, bg_style);
-        }
+        // Apply base style to entire table area.
+        buf.set_style(table_area, self.style);
 
         let col_widths = self.get_column_widths(table_area.width);
         let mut y = table_area.y;
 
         // Render header
         if let Some(header) = &self.header
-            && y < table_area.bottom() {
-                // Apply header row background first
-                let header_style = self.style.patch(header.style);
-                if let Some(bg) = header_style.bg {
-                    buf.set_style(Rect::new(table_area.x, y, table_area.width, 1), Style::default().bg(bg));
+            && y < table_area.bottom()
+        {
+            // Apply header row style first
+            let header_style = self.style.patch(header.style);
+            buf.set_style(
+                Rect::new(table_area.x, y, table_area.width, 1),
+                header_style,
+            );
+            let mut x = table_area.x;
+            for (i, cell) in header.cells.iter().enumerate() {
+                if let Some(&width) = col_widths.get(i) {
+                    let cell_style = header_style.patch(cell.style);
+                    buf.set_style(Rect::new(x, y, width, 1), cell_style);
+                    buf.set_line(x, y, &cell.content, width);
+                    x += width + self.column_spacing;
                 }
-                let mut x = table_area.x;
-                for (i, cell) in header.cells.iter().enumerate() {
-                    if let Some(&width) = col_widths.get(i) {
-                        // set_line preserves span styles, don't overwrite them
-                        buf.set_line(x, y, &cell.content, width);
-                        x += width + self.column_spacing;
-                    }
-                }
-                y += header.height;
             }
+            y += header.height;
+        }
 
         // Render rows
         for row in &self.rows {
             if y >= table_area.bottom() {
                 break;
             }
-            // Apply row background first
+            // Apply row style first
             let row_style = self.style.patch(row.style);
-            if let Some(bg) = row_style.bg {
-                buf.set_style(Rect::new(table_area.x, y, table_area.width, 1), Style::default().bg(bg));
-            }
+            buf.set_style(Rect::new(table_area.x, y, table_area.width, 1), row_style);
             let mut x = table_area.x;
             for (i, cell) in row.cells.iter().enumerate() {
                 if let Some(&width) = col_widths.get(i) {
+                    let cell_style = row_style.patch(cell.style);
+                    buf.set_style(Rect::new(x, y, width, 1), cell_style);
                     buf.set_line(x, y, &cell.content, width);
                     x += width + self.column_spacing;
                 }
@@ -1618,22 +1824,19 @@ impl Widget for List<'_> {
             return;
         }
 
-        // Apply base style background to entire list area
-        if let Some(bg) = self.style.bg {
-            let bg_style = Style::default().bg(bg);
-            buf.set_style(list_area, bg_style);
-        }
+        // Apply base style to entire list area.
+        buf.set_style(list_area, self.style);
 
         for (i, item) in self.items.iter().enumerate() {
             let y = list_area.y + i as u16;
             if y >= list_area.bottom() {
                 break;
             }
-            // Apply item background first (if any), then render line with span styles
-            if let Some(bg) = item.style.bg {
-                let bg_style = Style::default().bg(bg);
-                buf.set_style(Rect::new(list_area.x, y, list_area.width, 1), bg_style);
-            }
+            // Apply item style first, then render line with span styles.
+            buf.set_style(
+                Rect::new(list_area.x, y, list_area.width, 1),
+                self.style.patch(item.style),
+            );
             buf.set_line(list_area.x, y, &item.content, list_area.width);
         }
     }
@@ -1756,7 +1959,9 @@ impl StatefulWidget for Scrollbar<'_> {
         // passing position > scrollable pins the thumb to the track end
         // instead of pushing it off the track entirely.
         let viewport = state.viewport_content_length.max(1);
-        let thumb_size = (track_len * viewport / state.content_length.max(1)).max(1).min(track_len);
+        let thumb_size = (track_len * viewport / state.content_length.max(1))
+            .max(1)
+            .min(track_len);
         let scrollable = state.content_length.saturating_sub(viewport);
         let max_pos = track_len - thumb_size; // safe: thumb_size is .min(track_len)
         let thumb_pos = (max_pos * state.position)
@@ -1823,7 +2028,9 @@ mod tests {
         Scrollbar::new(ScrollbarOrientation::VerticalRight).render(area, &mut buf, &mut state);
 
         let thumb = "█";
-        let thumb_cells = (0..12).filter(|&y| buf.get(0, y).unwrap().symbol == thumb).count();
+        let thumb_cells = (0..12)
+            .filter(|&y| buf.get(0, y).unwrap().symbol == thumb)
+            .count();
         // 12 * 10 / 40 = 3 cells, not the degenerate 1-cell thumb.
         assert_eq!(thumb_cells, 3);
         // At position 0 the thumb starts at the top of the track.

@@ -56,25 +56,21 @@ def parse_cargo_toml(content: str) -> dict[str, tuple[str, int, int]]:
     """
     deps = {}
     lines = content.split('\n')
-    in_deps = False
-    in_target_deps = False
+    in_dep_section = False
 
     for i, line in enumerate(lines):
         # Check for dependency sections
-        if re.match(r'^\[dependencies\]', line):
-            in_deps = True
-            in_target_deps = False
+        if re.match(r'^\[(dependencies|dev-dependencies|build-dependencies|workspace\.dependencies)\]', line):
+            in_dep_section = True
             continue
         elif re.match(r'^\[target\..*\.dependencies\]', line):
-            in_deps = False
-            in_target_deps = True
+            in_dep_section = True
             continue
         elif re.match(r'^\[', line):
-            in_deps = False
-            in_target_deps = False
+            in_dep_section = False
             continue
 
-        if not (in_deps or in_target_deps):
+        if not in_dep_section:
             continue
 
         # Match simple dependency: crate = "version"

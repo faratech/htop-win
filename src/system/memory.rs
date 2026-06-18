@@ -55,9 +55,11 @@ impl MemoryInfo {
     /// - Cache (yellow): Standby memory (can be reclaimed)
     #[cfg(windows)]
     pub fn from_native() -> Self {
-        use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        use windows::Wdk::System::SystemInformation::{
+            NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS,
+        };
         use windows::Win32::System::ProcessStatus::{GetPerformanceInfo, PERFORMANCE_INFORMATION};
-        use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SYSTEM_INFORMATION_CLASS};
+        use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
         let mut status = MEMORYSTATUSEX {
             dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
@@ -93,14 +95,14 @@ impl MemoryInfo {
                 #[repr(C)]
                 #[derive(Default)]
                 struct SystemMemoryListInfo {
-                    zero_page_count: u64,
-                    free_page_count: u64,
-                    modified_page_count: u64,
-                    modified_no_write_page_count: u64,
-                    bad_page_count: u64,
-                    page_count_by_priority: [u64; 8], // Standby lists 0-7
-                    repurposed_page_by_priority: [u64; 8],
-                    modified_page_count_page_file: u64,
+                    zero_page_count: usize,
+                    free_page_count: usize,
+                    modified_page_count: usize,
+                    modified_no_write_page_count: usize,
+                    bad_page_count: usize,
+                    page_count_by_priority: [usize; 8], // Standby lists 0-7
+                    repurposed_page_by_priority: [usize; 8],
+                    modified_page_count_page_file: usize,
                 }
 
                 let mut mem_list = SystemMemoryListInfo::default();
@@ -115,13 +117,17 @@ impl MemoryInfo {
                 // "In Use" is always from GlobalMemoryStatusEx to match Task Manager
                 let (used, cached, buffers, shared) = if status_code.is_ok() {
                     // Calculate standby (cache) from priority lists
-                    let standby_pages: u64 = mem_list.page_count_by_priority.iter().sum();
+                    let standby_pages: u64 = mem_list
+                        .page_count_by_priority
+                        .iter()
+                        .map(|&pages| pages as u64)
+                        .sum();
                     let standby = standby_pages * page_size;
-                    let modified = mem_list.modified_page_count * page_size;
 
-                    // Cache = standby (clean cached) + modified (dirty cached)
-                    // This is what Windows considers "Available" minus truly free pages
-                    let cache = standby + modified;
+                    // Keep cache disjoint from Task Manager "In Use" memory. Modified
+                    // pages are already part of `in_use`, so including them in cache
+                    // double-counts the meter segments.
+                    let cache = standby;
 
                     // Buffers: portion of system file cache (for htop-style display)
                     let buffers = system_cache.min(in_use / 10); // Cap at 10% of used
@@ -163,7 +169,9 @@ impl MemoryInfo {
                     &mut return_length,
                 );
 
-                let (swap_total, swap_used) = if pf_status.is_ok() && return_length as usize >= pf_struct_size {
+                let (swap_total, swap_used) = if pf_status.is_ok()
+                    && return_length as usize >= pf_struct_size
+                {
                     // Parse the page file info - may have multiple page files
                     let mut total_size: u64 = 0;
                     let mut total_in_use: u64 = 0;
@@ -199,10 +207,10 @@ impl MemoryInfo {
                     // Fallback: estimate from GetPerformanceInfo
                     // Page file size ≈ commit limit - physical memory
                     let pf_total = (perf_info.CommitLimit as u64)
-                        .saturating_sub(perf_info.PhysicalTotal as u64) * page_size;
+                        .saturating_sub(perf_info.PhysicalTotal as u64)
+                        * page_size;
                     // Usage estimate: committed that exceeds physical
-                    let pf_used = (perf_info.CommitTotal as u64 * page_size)
-                        .saturating_sub(total);
+                    let pf_used = (perf_info.CommitTotal as u64 * page_size).saturating_sub(total);
                     (pf_total, pf_used.min(pf_total))
                 };
 
@@ -214,10 +222,18 @@ impl MemoryInfo {
                     shared,
                     buffers,
                     cached,
-                    used_percent: if total > 0 { total_used as f32 / total as f32 * 100.0 } else { 0.0 },
+                    used_percent: if total > 0 {
+                        total_used as f32 / total as f32 * 100.0
+                    } else {
+                        0.0
+                    },
                     swap_total,
                     swap_used,
-                    swap_percent: if swap_total > 0 { swap_used as f32 / swap_total as f32 * 100.0 } else { 0.0 },
+                    swap_percent: if swap_total > 0 {
+                        swap_used as f32 / swap_total as f32 * 100.0
+                    } else {
+                        0.0
+                    },
                 }
             } else {
                 Self::default()

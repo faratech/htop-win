@@ -2,6 +2,10 @@ mod app;
 mod config;
 mod data;
 mod input;
+#[cfg(windows)]
+mod installer;
+#[cfg(not(windows))]
+#[path = "installer_stub.rs"]
 mod installer;
 mod json;
 mod system;
@@ -16,7 +20,7 @@ use crossterm::{
     cursor,
     event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use terminal::{CrosstermBackend, Terminal};
 
@@ -86,16 +90,20 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             }
             Short('p') | Long("pid") => {
                 let val: String = parser.value()?.parse()?;
-                let pids: Vec<u32> = val
-                    .split(',')
-                    .filter_map(|s| s.trim().parse().ok())
-                    .collect();
+                let mut pids = Vec::new();
+                for part in val.split(',') {
+                    let pid = part
+                        .trim()
+                        .parse()
+                        .map_err(|_| lexopt::Error::from(format!("Invalid PID: {part}")))?;
+                    pids.push(pid);
+                }
                 args.pids = Some(pids);
             }
             Short('F') | Long("filter") => {
                 args.filter = Some(parser.value()?.parse()?);
             }
-            Short('n') | Long("max-iterations") => {
+            Short('n') | Long("max-iterations") | Long("iterations") => {
                 args.max_iterations = Some(parser.value()?.parse()?);
             }
             Long("no-meters") => {
@@ -104,7 +112,7 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Long("readonly") => {
                 args.readonly = true;
             }
-            Short('H') | Long("highlight-changes") => {
+            Short('H') | Long("highlight-changes") | Long("highlight") => {
                 args.highlight_changes = Some(parser.value()?.parse()?);
             }
             Short('h') | Long("help") => {
@@ -114,7 +122,13 @@ fn parse_args() -> Result<Args, lexopt::Error> {
                 args.version = true;
             }
             Long("benchmark") => {
-                args.benchmark = Some(parser.value().ok().and_then(|v| v.parse().ok()).unwrap_or(20));
+                args.benchmark = Some(match parser.optional_value() {
+                    Some(value) => value.parse()?,
+                    None => 20,
+                });
+            }
+            Long("benchmark-iterations") => {
+                args.benchmark = Some(parser.value()?.parse()?);
             }
             Long("inefficient") => {
                 args.inefficient = true;
@@ -145,7 +159,7 @@ fn print_help() {
     println!("Interactive process viewer for Windows\n");
     println!("USAGE: htop-win [OPTIONS]\n");
     println!("OPTIONS:");
-    println!("  -d, --delay <MS>             Refresh rate in milliseconds (default: 1000)");
+    println!("  -d, --delay <MS>             Refresh rate in milliseconds (default: 1500)");
     println!("  -u, --user <USER>            Show only processes owned by USER");
     println!("  -t, --tree                   Start in tree view mode");
     println!("  -s, --sort <COLUMN>          Sort by: pid, cpu, mem, time, command, user");
@@ -153,12 +167,14 @@ fn print_help() {
     println!("      --no-color               Use monochrome mode");
     println!("  -p, --pid <PID,...>          Show only specific PIDs (comma-separated)");
     println!("  -F, --filter <FILTER>        Initial filter string");
-    println!("  -n, --max-iterations <N>     Exit after N updates");
+    println!("  -n, --max-iterations <N>     Exit after N updates (alias: --iterations)");
     println!("      --no-meters              Hide header meters");
     println!("      --benchmark [N]          Run N iterations (default 20) and print timing stats");
     println!("      --readonly               Disable kill/priority operations");
     println!("      --inefficient            Disable Efficiency Mode (run at normal priority)");
-    println!("  -H, --highlight-changes <S>  Highlight process changes (seconds)");
+    println!(
+        "  -H, --highlight-changes <S>  Highlight process changes (seconds; alias: --highlight)"
+    );
     println!("      --install                Install to PATH (requires admin, will prompt UAC)");
     println!("      --update                 Check for updates and install if available");
     println!("  -f, --force                  Force install/update even if same version");
@@ -202,10 +218,9 @@ fn get_process_cpu_time() -> Duration {
 #[cfg(windows)]
 fn enable_efficiency_mode() {
     use windows::Win32::System::Threading::{
-        GetCurrentProcess, SetPriorityClass, SetProcessInformation,
-        ProcessPowerThrottling, IDLE_PRIORITY_CLASS,
-        PROCESS_POWER_THROTTLING_STATE, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        GetCurrentProcess, IDLE_PRIORITY_CLASS, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
+        ProcessPowerThrottling, SetPriorityClass, SetProcessInformation,
     };
 
     unsafe {
@@ -270,8 +285,11 @@ impl BenchmarkStats {
         println!("\n╔══════════════════════════════════════════════════════════════╗");
         println!("║                    BENCHMARK RESULTS                         ║");
         println!("╠══════════════════════════════════════════════════════════════╣");
-        println!("║ Iterations: {:>6}    Processes: {:>6}                       ║",
-                 self.refresh_times.len(), process_count);
+        println!(
+            "║ Iterations: {:>6}    Processes: {:>6}                       ║",
+            self.refresh_times.len(),
+            process_count
+        );
         println!("╠══════════════════════════════════════════════════════════════╣");
 
         // Refresh stats
@@ -281,8 +299,14 @@ impl BenchmarkStats {
             let max = self.refresh_times.iter().max().copied().unwrap_or_default();
             let total: Duration = self.refresh_times.iter().sum();
             println!("║ REFRESH (system data collection)                             ║");
-            println!("║   Total: {:>10.2?}  Avg: {:>10.2?}                       ║", total, avg);
-            println!("║   Min:   {:>10.2?}  Max: {:>10.2?}                       ║", min, max);
+            println!(
+                "║   Total: {:>10.2?}  Avg: {:>10.2?}                       ║",
+                total, avg
+            );
+            println!(
+                "║   Min:   {:>10.2?}  Max: {:>10.2?}                       ║",
+                min, max
+            );
         }
 
         // Draw stats
@@ -293,16 +317,31 @@ impl BenchmarkStats {
             let total: Duration = self.draw_times.iter().sum();
             println!("╠══════════════════════════════════════════════════════════════╣");
             println!("║ DRAW (UI rendering)                                          ║");
-            println!("║   Total: {:>10.2?}  Avg: {:>10.2?}                       ║", total, avg);
-            println!("║   Min:   {:>10.2?}  Max: {:>10.2?}                       ║", min, max);
+            println!(
+                "║   Total: {:>10.2?}  Avg: {:>10.2?}                       ║",
+                total, avg
+            );
+            println!(
+                "║   Min:   {:>10.2?}  Max: {:>10.2?}                       ║",
+                min, max
+            );
         }
 
         // Overall stats
         println!("╠══════════════════════════════════════════════════════════════╣");
         println!("║ OVERALL                                                      ║");
-        println!("║   Wall time:    {:>10.2?}                                  ║", total_elapsed);
-        println!("║   CPU time:     {:>10.2?}                                  ║", process_cpu_used);
-        println!("║   CPU usage:    {:>10.1}%                                  ║", cpu_percent);
+        println!(
+            "║   Wall time:    {:>10.2?}                                  ║",
+            total_elapsed
+        );
+        println!(
+            "║   CPU time:     {:>10.2?}                                  ║",
+            process_cpu_used
+        );
+        println!(
+            "║   CPU usage:    {:>10.1}%                                  ║",
+            cpu_percent
+        );
         println!("╚══════════════════════════════════════════════════════════════╝");
     }
 }
@@ -411,6 +450,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         stats.print_report(process_count);
     }
 
+    if result.is_err() {
+        std::process::exit(1);
+    }
+
     Ok(())
 }
 
@@ -427,7 +470,12 @@ fn run_tui(
 ) {
     let mut bench_stats = None;
     let mut process_count = 0;
-    let result = run_tui_inner(args, update_just_applied, &mut bench_stats, &mut process_count);
+    let result = run_tui_inner(
+        args,
+        update_just_applied,
+        &mut bench_stats,
+        &mut process_count,
+    );
     (result, bench_stats, process_count)
 }
 
@@ -499,7 +547,7 @@ fn run_tui_inner(
             "user" => app::SortColumn::User,
             "ppid" => app::SortColumn::PPid,
             "threads" | "thr" => app::SortColumn::Threads,
-            _ => app::SortColumn::Cpu,
+            _ => return Err(format!("Unknown sort column: {sort}").into()),
         };
     }
 
@@ -633,7 +681,9 @@ fn run_app(
         }
 
         // Check for update result from background thread
-        if !app.update_checked && let Ok(status) = update_rx.try_recv() {
+        if !app.update_checked
+            && let Ok(status) = update_rx.try_recv()
+        {
             app.update_checked = true;
             match status {
                 installer::UpdateStatus::Downloaded { version, path } => {
