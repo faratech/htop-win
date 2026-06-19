@@ -1141,7 +1141,8 @@ impl App {
             return;
         }
         if let Some(proc) = self.selected_process() {
-            let (pid, name, command) = (proc.pid, proc.name.clone(), proc.command.clone());
+            let (pid, name, command) =
+                (proc.pid, proc.name.to_string(), proc.command.to_string());
 
             // Skip confirmation dialog if disabled in settings
             if !self.config.confirm_kill {
@@ -1166,7 +1167,7 @@ impl App {
             self.dialog = DialogState::Priority {
                 class_index,
                 pid: proc.pid,
-                name: proc.name.clone(),
+                name: proc.name.to_string(),
             };
         }
     }
@@ -1181,8 +1182,10 @@ impl App {
             if proc_copy.exe_path.is_empty() {
                 let exe_path = crate::system::get_process_exe_path(proc.pid);
                 if !exe_path.is_empty() {
-                    proc_copy.exe_path = exe_path.clone();
-                    proc_copy.command = exe_path;
+                    // Share one allocation between exe_path and command (refcounted).
+                    let shared: std::sync::Arc<str> = std::sync::Arc::from(exe_path);
+                    proc_copy.exe_path = shared.clone();
+                    proc_copy.command = shared;
                 }
             }
             self.dialog = DialogState::ProcessInfo {
@@ -1341,7 +1344,7 @@ impl App {
                 .filter(|p| {
                     // Kernel/System threads filter
                     // On Windows, "kernel threads" are SYSTEM user processes
-                    let is_kernel = p.user_lower == "system"
+                    let is_kernel = &*p.user_lower == "system"
                         || p.user_lower.starts_with("nt authority")
                         || p.pid == 0
                         || p.pid == 4;
@@ -1364,7 +1367,7 @@ impl App {
                     }
                     // User filter
                     if let Some(ref user) = self.user_filter
-                        && &p.user != user
+                        && &*p.user != user.as_str()
                     {
                         return false;
                     }
@@ -2190,7 +2193,7 @@ impl App {
         let mut users: Vec<String> = self
             .processes
             .iter()
-            .map(|p| p.user.clone())
+            .map(|p| p.user.to_string())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();

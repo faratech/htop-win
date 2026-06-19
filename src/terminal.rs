@@ -1701,8 +1701,13 @@ impl Widget for Table<'_> {
             let mut x = table_area.x;
             for (i, cell) in header.cells.iter().enumerate() {
                 if let Some(&width) = col_widths.get(i) {
-                    let cell_style = header_style.patch(cell.style);
-                    buf.set_style(Rect::new(x, y, width, 1), cell_style);
+                    // The row-wide set_style above already painted header_style
+                    // across the full width (including inter-column gaps); only
+                    // re-style this cell when it carries its own style override.
+                    if cell.style != Style::default() {
+                        let cell_style = header_style.patch(cell.style);
+                        buf.set_style(Rect::new(x, y, width, 1), cell_style);
+                    }
                     buf.set_line(x, y, &cell.content, width);
                     x += width + self.column_spacing;
                 }
@@ -1721,8 +1726,13 @@ impl Widget for Table<'_> {
             let mut x = table_area.x;
             for (i, cell) in row.cells.iter().enumerate() {
                 if let Some(&width) = col_widths.get(i) {
-                    let cell_style = row_style.patch(cell.style);
-                    buf.set_style(Rect::new(x, y, width, 1), cell_style);
+                    // Row-wide set_style already applied row_style across the full
+                    // width (incl. column-spacing gaps); skip the redundant per-cell
+                    // restyle unless this cell carries its own style override.
+                    if cell.style != Style::default() {
+                        let cell_style = row_style.patch(cell.style);
+                        buf.set_style(Rect::new(x, y, width, 1), cell_style);
+                    }
                     buf.set_line(x, y, &cell.content, width);
                     x += width + self.column_spacing;
                 }

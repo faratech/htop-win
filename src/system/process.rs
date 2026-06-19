@@ -1,5 +1,6 @@
 #[cfg(windows)]
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(windows)]
@@ -115,19 +116,19 @@ static NETWORK_SERVICE_STR: &str = "NETWORK SERVICE";
 /// Intern a username from UTF-16, avoiding conversion for common names
 #[cfg(windows)]
 #[inline]
-fn intern_username_utf16(name: &[u16]) -> String {
+fn intern_username_utf16(name: &[u16]) -> Arc<str> {
     // Fast path: check against known common usernames (avoids UTF-16 conversion)
     if name == SYSTEM_UTF16 {
-        return SYSTEM_STR.to_string();
+        return Arc::from(SYSTEM_STR);
     }
     if name == LOCAL_SERVICE_UTF16 {
-        return LOCAL_SERVICE_STR.to_string();
+        return Arc::from(LOCAL_SERVICE_STR);
     }
     if name == NETWORK_SERVICE_UTF16 {
-        return NETWORK_SERVICE_STR.to_string();
+        return Arc::from(NETWORK_SERVICE_STR);
     }
     // Fallback: convert from UTF-16
-    String::from_utf16_lossy(name)
+    Arc::from(String::from_utf16_lossy(name))
 }
 
 /// Clean up caches by removing entries for PIDs that no longer exist
@@ -207,7 +208,7 @@ fn query_exe_path(handle: HANDLE) -> String {
 
 /// Extract username from an already-opened token handle (avoids duplicate OpenProcess)
 #[cfg(windows)]
-fn get_user_from_token(token_handle: HANDLE, pid: u32) -> Option<String> {
+fn get_user_from_token(token_handle: HANDLE, pid: u32) -> Option<Arc<str>> {
     unsafe {
         // Get token user info - first call to get required size
         let mut token_info_len: u32 = 0;
@@ -329,7 +330,7 @@ struct EnrichedProcessData {
     elevation_fresh: bool,
     is_elevated: bool,
     arch: ProcessArch,
-    user: Option<String>,
+    user: Option<Arc<str>>,
     exe_path: String,
 }
 
@@ -372,7 +373,7 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                     elevation_fresh: true,
                     is_elevated: pid == 4, // System process is elevated
                     arch: ProcessArch::Native,
-                    user: Some(SYSTEM_STR.to_string()),
+                    user: Some(Arc::from(SYSTEM_STR)),
                     exe_path: String::new(),
                 };
             }
@@ -665,13 +666,15 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                 && *user != proc.user
             {
                 proc.user = user.clone();
-                proc.user_lower = user.to_lowercase();
+                proc.user_lower = user.to_lowercase().into();
             }
             // Update exe_path and command if we got a valid path
-            if !data.exe_path.is_empty() && data.exe_path != proc.exe_path {
-                proc.exe_path = data.exe_path.clone();
-                proc.command = data.exe_path.clone();
-                proc.command_lower = data.exe_path.to_lowercase();
+            if !data.exe_path.is_empty() && data.exe_path != *proc.exe_path {
+                // Share one allocation between exe_path and command (refcounted).
+                let path: Arc<str> = Arc::from(data.exe_path.clone());
+                proc.exe_path = path.clone();
+                proc.command = path;
+                proc.command_lower = data.exe_path.to_lowercase().into();
             }
         }
     }
@@ -719,10 +722,10 @@ fn get_win_process_info(_pid: u32) -> WinProcessInfo {
 pub struct ProcessInfo {
     pub pid: u32,
     pub parent_pid: u32,
-    pub name: String,
-    pub exe_path: String, // Full executable path
-    pub command: String,  // Full command line with arguments
-    pub user: String,
+    pub name: Arc<str>,
+    pub exe_path: Arc<str>, // Full executable path
+    pub command: Arc<str>,  // Full command line with arguments
+    pub user: Arc<str>,
     pub status: char,
     pub cpu_percent: f32,
     pub mem_percent: f32,
@@ -749,9 +752,9 @@ pub struct ProcessInfo {
     pub npu_percent: f32,       // NPU utilization (max across NPU engine nodes)
     pub npu_memory: u64,        // NPU dedicated + shared committed bytes
     // Pre-computed lowercase strings for efficient filtering (avoid per-filter allocations)
-    pub name_lower: String,
-    pub command_lower: String,
-    pub user_lower: String,
+    pub name_lower: Arc<str>,
+    pub command_lower: Arc<str>,
+    pub user_lower: Arc<str>,
     // Pre-computed search match flag (set during filtering, used in rendering)
     pub matches_search: bool,
     // Windows 11 Efficiency Mode (EcoQoS)
@@ -855,13 +858,13 @@ impl ProcessInfo {
                     })
                     .unwrap_or(false);
 
-                let user = cached_entry
+                let user: Arc<str> = cached_entry
                     .and_then(|e| e.user.clone())
                     .unwrap_or_else(|| {
                         if pid == 0 || pid == 4 {
-                            SYSTEM_STR.to_string()
+                            Arc::from(SYSTEM_STR)
                         } else {
-                            "-".to_string()
+                            Arc::from("-")
                         }
                     });
 
@@ -884,19 +887,23 @@ impl ProcessInfo {
         let start_time = filetime_to_unix(create_time_100ns);
 
         // Parse name only here (allocation)
-        let name = proc.name();
+        let name: Arc<str> = proc.name().into();
+        let name_lower: Arc<str> = name.to_lowercase().into();
 
-        let (exe_path, command, command_lower) = if !cached_exe_path.is_empty() {
-            let lower = cached_exe_path.to_lowercase();
-            (cached_exe_path.clone(), cached_exe_path, lower)
-        } else {
-            (String::new(), name.clone(), name.to_lowercase())
-        };
+        let (exe_path, command, command_lower): (Arc<str>, Arc<str>, Arc<str>) =
+            if !cached_exe_path.is_empty() {
+                let lower: Arc<str> = cached_exe_path.to_lowercase().into();
+                // Single allocation shared between exe_path and command (refcounted).
+                let path: Arc<str> = Arc::from(cached_exe_path);
+                (path.clone(), path, lower)
+            } else {
+                // No exe path: command falls back to the (already-owned) name.
+                (Arc::from(""), name.clone(), name_lower.clone())
+            };
 
         let (exe_updated, exe_deleted) = check_exe_status(&exe_path, create_time_100ns);
 
-        let name_lower = name.to_lowercase();
-        let user_lower = user.to_lowercase();
+        let user_lower: Arc<str> = user.to_lowercase().into();
 
         ProcessInfo {
             pid,

@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Instant;
 
 use super::process::ProcessArch;
@@ -41,8 +41,10 @@ pub struct ProcessCacheEntry {
     pub prev_io_write: u64,
     pub io_updated: Instant,
 
-    // User info (never changes for a PID)
-    pub user: Option<String>,
+    // User info (never changes for a PID). Arc<str> so common accounts
+    // (SYSTEM, LOCAL SERVICE, ...) are shared across processes rather than
+    // re-allocated per process per refresh.
+    pub user: Option<Arc<str>>,
 
     // Static info (never changes for a PID)
     pub is_elevated: Option<bool>,
@@ -156,7 +158,7 @@ impl ProcessCache {
     }
 
     /// Cache username for a PID
-    pub fn set_user(&self, pid: u32, user: String) {
+    pub fn set_user(&self, pid: u32, user: Arc<str>) {
         if let Ok(mut cache) = self.entries.write() {
             let entry = cache.entry(pid).or_default();
             entry.user = Some(user);
@@ -323,9 +325,9 @@ mod tests {
     #[test]
     fn test_user_cache() {
         let cache = ProcessCache::new();
-        cache.set_user(123, "testuser".to_string());
+        cache.set_user(123, Arc::from("testuser"));
         let user = cache.with_read(|c| c[&123].user.clone());
-        assert_eq!(user, Some("testuser".to_string()));
+        assert_eq!(user, Some(Arc::from("testuser")));
     }
 
     #[test]
@@ -351,7 +353,7 @@ mod tests {
     fn test_with_read() {
         let cache = ProcessCache::new();
         cache.update_times_batch(&[(1, 100, 200, 1, 0, 0), (2, 300, 400, 2, 0, 0)]);
-        cache.set_user(1, "user1".to_string());
+        cache.set_user(1, Arc::from("user1"));
 
         cache.with_read(|c| {
             assert_eq!(c.len(), 2);

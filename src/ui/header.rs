@@ -1027,8 +1027,8 @@ fn draw_tasks_info(frame: &mut Frame, app: &App, area: Rect) {
 
     // Windows' native process list does not expose htop-style running/sleeping
     // process state, so do not fabricate a "K running" value.
-    let total_threads: u32 = app.processes.iter().map(|p| p.thread_count).sum();
-
+    // Thread total is already summed once per refresh in SystemMetrics; reuse it
+    // instead of re-summing every process on every frame.
     let line = Line::from(vec![
         Span::styled(
             "Tasks: ",
@@ -1044,7 +1044,7 @@ fn draw_tasks_info(frame: &mut Frame, app: &App, area: Rect) {
         ),
         Span::styled(", ", Style::default().fg(theme.text)),
         Span::styled(
-            format!("{}", total_threads),
+            format!("{}", metrics.threads_total),
             Style::default()
                 .fg(theme.meter_value)
                 .add_modifier(Modifier::BOLD),
