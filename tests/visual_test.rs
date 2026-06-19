@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use htop_win::app::{App, ScreenTab, SortColumn};
 use htop_win::config::Config;
-use htop_win::system::{CpuInfo, MemoryInfo, ProcessArch, ProcessInfo, SystemMetrics};
+use htop_win::system::{
+    CpuInfo, GpuInfo, MemoryInfo, NpuInfo, ProcessArch, ProcessInfo, SystemMetrics,
+};
 use htop_win::terminal::{Buffer, Frame, Rect};
 
 fn fixture_process(pid: u32, user: &str, name: &str, cpu: f32, mem: f32) -> ProcessInfo {
@@ -153,4 +155,94 @@ fn visual_snapshot_renders_real_app() {
             "rendered UI did not contain snapshot line `{expected}`\n\nactual:\n{actual}"
         );
     }
+}
+
+#[test]
+fn reset_hardware_columns_render_elevated_system_with_wide_indicator() {
+    let mut config = Config::default();
+    config.visible_columns = vec![
+        "PID".to_string(),
+        "USER".to_string(),
+        "PRI".to_string(),
+        "CLASS".to_string(),
+        "THR".to_string(),
+        "VIRT".to_string(),
+        "RES".to_string(),
+        "SHR".to_string(),
+        "S".to_string(),
+        "CPU%".to_string(),
+        "MEM%".to_string(),
+        "TIME+".to_string(),
+        "Command".to_string(),
+    ];
+    config.highlight_large_numbers = false;
+
+    let mut app = App::new(config.clone());
+    app.show_header = false;
+    app.screen_tabs = vec![ScreenTab {
+        name: "Main".to_string(),
+        columns: config.visible_columns.clone(),
+        sort_column: SortColumn::Pid,
+        sort_ascending: true,
+    }];
+    app.active_tab = 0;
+    app.sort_column = SortColumn::Pid;
+    app.sort_ascending = true;
+
+    let mut metrics = SystemMetrics::default();
+    metrics.gpu = Some(GpuInfo {
+        name: "Fixture GPU".to_string(),
+        utilization: 10.0,
+        mem_used: 512 * 1024 * 1024,
+        mem_total: 4 * 1024 * 1024 * 1024,
+        dedicated_used: 0,
+        dedicated_total: 0,
+        shared_used: 0,
+    });
+    metrics.npu = Some(NpuInfo {
+        name: "Fixture NPU".to_string(),
+        utilization: 0.0,
+        mem_used: 0,
+        mem_total: 1024 * 1024 * 1024,
+        dedicated_used: 0,
+        dedicated_total: 0,
+        shared_used: 0,
+    });
+    app.system_metrics = metrics;
+
+    let mut system = fixture_process(4, "SYSTEM", "System", 0.1, 0.3);
+    system.command = "System".into();
+    system.exe_path = "".into();
+    system.is_elevated = true;
+    system.thread_count = 316;
+    app.processes = vec![
+        fixture_process(1, "SYSTEM", "Idle", 0.0, 0.0),
+        system,
+        fixture_process(200, "alice", "Shell", 12.5, 1.5),
+    ];
+    app.selected_index = 0;
+    app.update_displayed_processes();
+
+    app.config.reset_to_defaults();
+    app.reset_screen_tabs();
+    app.update_visible_columns_cache();
+
+    let area = Rect::new(0, 0, 120, 10);
+    let mut buffer = Buffer::empty(area);
+    let mut frame = Frame::new(&mut buffer);
+    htop_win::ui::draw(&mut frame, &mut app);
+
+    for y in 0..area.height {
+        for x in 0..area.width.saturating_sub(3) {
+            let cell = buffer.get(x, y).unwrap();
+            if cell.symbol == "🛡️" {
+                assert!(buffer.get(x + 1, y).unwrap().is_continuation);
+                assert_eq!(buffer.get(x + 2, y).unwrap().symbol, " ");
+                assert_eq!(buffer.get(x + 3, y).unwrap().symbol, "S");
+                return;
+            }
+        }
+    }
+
+    panic!("rendered reset view did not contain elevated System command row");
 }

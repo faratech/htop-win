@@ -169,52 +169,51 @@ impl MemoryInfo {
                     &mut return_length,
                 );
 
-                let (swap_total, swap_used) = if pf_status.is_ok()
-                    && return_length as usize >= pf_struct_size
-                {
-                    // Parse the page file info - may have multiple page files
-                    let mut total_size: u64 = 0;
-                    let mut total_in_use: u64 = 0;
-                    let mut offset = 0usize;
-                    let buf_len = (return_length as usize).min(pagefile_info.len());
+                let (swap_total, swap_used) =
+                    if pf_status.is_ok() && return_length as usize >= pf_struct_size {
+                        // Parse the page file info - may have multiple page files
+                        let mut total_size: u64 = 0;
+                        let mut total_in_use: u64 = 0;
+                        let mut offset = 0usize;
+                        let buf_len = (return_length as usize).min(pagefile_info.len());
 
-                    loop {
-                        if offset + pf_struct_size > buf_len {
-                            break;
-                        }
-                        // Read fields with read_unaligned: `pagefile_info` is a byte
-                        // array (align 1) but the record contains an 8-aligned pointer,
-                        // so forming a `&SystemPageFileInfo` reference would be UB. The
-                        // first three ULONGs sit at byte offsets 0/4/8.
-                        let base = pagefile_info.as_ptr().add(offset);
-                        let next_entry_offset = (base.add(0) as *const u32).read_unaligned();
-                        let entry_total_size = (base.add(4) as *const u32).read_unaligned();
-                        let entry_total_in_use = (base.add(8) as *const u32).read_unaligned();
-                        total_size += entry_total_size as u64 * page_size;
-                        total_in_use += entry_total_in_use as u64 * page_size;
+                        loop {
+                            if offset + pf_struct_size > buf_len {
+                                break;
+                            }
+                            // Read fields with read_unaligned: `pagefile_info` is a byte
+                            // array (align 1) but the record contains an 8-aligned pointer,
+                            // so forming a `&SystemPageFileInfo` reference would be UB. The
+                            // first three ULONGs sit at byte offsets 0/4/8.
+                            let base = pagefile_info.as_ptr().add(offset);
+                            let next_entry_offset = (base.add(0) as *const u32).read_unaligned();
+                            let entry_total_size = (base.add(4) as *const u32).read_unaligned();
+                            let entry_total_in_use = (base.add(8) as *const u32).read_unaligned();
+                            total_size += entry_total_size as u64 * page_size;
+                            total_in_use += entry_total_in_use as u64 * page_size;
 
-                        if next_entry_offset == 0 {
-                            break;
+                            if next_entry_offset == 0 {
+                                break;
+                            }
+                            let next = offset + next_entry_offset as usize;
+                            if next <= offset || next + pf_struct_size > buf_len {
+                                break; // Prevent infinite loop or out-of-bounds
+                            }
+                            offset = next;
                         }
-                        let next = offset + next_entry_offset as usize;
-                        if next <= offset || next + pf_struct_size > buf_len {
-                            break; // Prevent infinite loop or out-of-bounds
-                        }
-                        offset = next;
-                    }
-                    (total_size, total_in_use)
-                } else {
-                    // Fallback: estimate from GetPerformanceInfo
-                    // Page file size ≈ commit limit - physical memory
-                    let pf_total = (perf_info.CommitLimit as u64)
-                        .saturating_sub(perf_info.PhysicalTotal as u64)
-                        .saturating_mul(page_size);
-                    // Usage estimate: committed that exceeds physical
-                    let pf_used = (perf_info.CommitTotal as u64)
-                        .saturating_mul(page_size)
-                        .saturating_sub(total);
-                    (pf_total, pf_used.min(pf_total))
-                };
+                        (total_size, total_in_use)
+                    } else {
+                        // Fallback: estimate from GetPerformanceInfo
+                        // Page file size ≈ commit limit - physical memory
+                        let pf_total = (perf_info.CommitLimit as u64)
+                            .saturating_sub(perf_info.PhysicalTotal as u64)
+                            .saturating_mul(page_size);
+                        // Usage estimate: committed that exceeds physical
+                        let pf_used = (perf_info.CommitTotal as u64)
+                            .saturating_mul(page_size)
+                            .saturating_sub(total);
+                        (pf_total, pf_used.min(pf_total))
+                    };
 
                 // used_percent reflects actual application memory usage
                 let total_used = used + buffers + shared;

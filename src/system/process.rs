@@ -858,15 +858,16 @@ impl ProcessInfo {
                     })
                     .unwrap_or(false);
 
-                let user: Arc<str> = cached_entry
-                    .and_then(|e| e.user.clone())
-                    .unwrap_or_else(|| {
-                        if pid == 0 || pid == 4 {
-                            Arc::from(SYSTEM_STR)
-                        } else {
-                            Arc::from("-")
-                        }
-                    });
+                let user: Arc<str> =
+                    cached_entry
+                        .and_then(|e| e.user.clone())
+                        .unwrap_or_else(|| {
+                            if pid == 0 || pid == 4 {
+                                Arc::from(SYSTEM_STR)
+                            } else {
+                                Arc::from("-")
+                            }
+                        });
 
                 (is_elevated, arch, cached_exe_path, efficiency_mode, user)
             });

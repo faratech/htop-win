@@ -559,9 +559,7 @@ impl Default for BufferCell {
 impl BufferCell {
     pub fn set_symbol(&mut self, symbol: &str) -> &mut Self {
         self.symbol.clear();
-        for ch in symbol.chars() {
-            push_terminal_safe_char(&mut self.symbol, ch);
-        }
+        push_terminal_safe_str(&mut self.symbol, symbol);
         self
     }
 
@@ -627,11 +625,87 @@ fn sanitized_terminal_symbol(symbol: &str) -> std::borrow::Cow<'_, str> {
 }
 
 #[inline]
+fn is_terminal_control(ch: char) -> bool {
+    ch == '\t' || ch.is_control() || ('\u{80}'..='\u{9f}').contains(&ch)
+}
+
+#[inline]
 fn terminal_char_width(ch: char) -> u16 {
-    if ch == '\t' || ch.is_control() || ('\u{80}'..='\u{9f}').contains(&ch) {
+    if is_terminal_control(ch) {
         1
     } else {
         unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16
+    }
+}
+
+#[inline]
+fn terminal_symbol_width(symbol: &str) -> u16 {
+    if symbol.chars().any(is_terminal_control) {
+        1
+    } else {
+        unicode_width::UnicodeWidthStr::width(symbol) as u16
+    }
+}
+
+#[derive(Clone, Copy)]
+struct TerminalSymbol<'a> {
+    text: &'a str,
+    width: u16,
+}
+
+struct TerminalSymbols<'a> {
+    text: &'a str,
+    chars: std::iter::Peekable<std::str::CharIndices<'a>>,
+}
+
+fn terminal_symbols(text: &str) -> TerminalSymbols<'_> {
+    TerminalSymbols {
+        text,
+        chars: text.char_indices().peekable(),
+    }
+}
+
+impl<'a> Iterator for TerminalSymbols<'a> {
+    type Item = TerminalSymbol<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (start, first) = self.chars.next()?;
+        let mut end = start + first.len_utf8();
+
+        if is_terminal_control(first) || terminal_char_width(first) == 0 {
+            return Some(TerminalSymbol {
+                text: &self.text[start..end],
+                width: terminal_char_width(first),
+            });
+        }
+
+        let mut join_next = false;
+        while let Some(&(idx, ch)) = self.chars.peek() {
+            if is_terminal_control(ch) {
+                break;
+            }
+            let include = join_next || ch == '\u{200d}' || terminal_char_width(ch) == 0;
+            if !include {
+                break;
+            }
+
+            self.chars.next();
+            end = idx + ch.len_utf8();
+            join_next = ch == '\u{200d}';
+        }
+
+        let text = &self.text[start..end];
+        Some(TerminalSymbol {
+            text,
+            width: terminal_symbol_width(text),
+        })
+    }
+}
+
+#[inline]
+fn push_terminal_safe_str(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        push_terminal_safe_char(out, ch);
     }
 }
 
@@ -709,33 +783,22 @@ impl Buffer {
             .min(self.area.x + self.area.width);
 
         let mut last_base_col = None;
-        for ch in string.chars() {
-            let width = terminal_char_width(ch);
+        for symbol in terminal_symbols(string) {
+            let width = symbol.width;
             if width == 0 {
                 if let Some(base_col) = last_base_col
                     && let Some(cell) = self.get_mut(base_col, y)
                 {
-                    push_terminal_safe_char(&mut cell.symbol, ch);
+                    push_terminal_safe_str(&mut cell.symbol, symbol.text);
                 }
                 continue;
             }
-            if col + width > max_col {
+            if col.saturating_add(width) > max_col {
                 break;
             }
-            if let Some(cell) = self.get_mut(col, y) {
-                cell.set_char(ch);
-                cell.set_style(style);
-                cell.is_continuation = false;
-            }
+            self.set_symbol_at(col, y, symbol.text, width, style);
             last_base_col = Some(col);
-            // Mark continuation cells for wide characters
-            for i in 1..width {
-                if let Some(cont_cell) = self.get_mut(col + i, y) {
-                    cont_cell.set_continuation();
-                    cont_cell.set_style(style);
-                }
-            }
-            col += width;
+            col = col.saturating_add(width);
         }
     }
 
@@ -748,34 +811,37 @@ impl Buffer {
         let mut last_base_col = None;
         for span in &line.spans {
             let style = line.style.patch(span.style);
-            for ch in span.content.chars() {
-                let width = terminal_char_width(ch);
+            for symbol in terminal_symbols(&span.content) {
+                let width = symbol.width;
                 if width == 0 {
                     if let Some(base_col) = last_base_col
                         && let Some(cell) = self.get_mut(base_col, y)
                     {
-                        push_terminal_safe_char(&mut cell.symbol, ch);
+                        push_terminal_safe_str(&mut cell.symbol, symbol.text);
                     }
                     continue;
                 }
-                if col + width > max_col {
+                if col.saturating_add(width) > max_col {
                     return;
                 }
-                if let Some(cell) = self.get_mut(col, y) {
-                    cell.set_char(ch);
-                    cell.set_style(style);
-                    cell.is_continuation = false; // This cell has actual content
-                }
+                self.set_symbol_at(col, y, symbol.text, width, style);
                 last_base_col = Some(col);
-                // Mark continuation cells for wide characters (width > 1)
-                // These cells are "occupied" by the wide char but contain no content
-                for i in 1..width {
-                    if let Some(cont_cell) = self.get_mut(col + i, y) {
-                        cont_cell.set_continuation();
-                        cont_cell.set_style(style); // Keep same style for background
-                    }
-                }
-                col += width;
+                col = col.saturating_add(width);
+            }
+        }
+    }
+
+    fn set_symbol_at(&mut self, col: u16, y: u16, symbol: &str, width: u16, style: Style) {
+        if let Some(cell) = self.get_mut(col, y) {
+            cell.set_symbol(symbol);
+            cell.set_style(style);
+            cell.is_continuation = false;
+        }
+        // These cells are occupied by the wide symbol but contain no content.
+        for i in 1..width {
+            if let Some(cont_cell) = self.get_mut(col + i, y) {
+                cont_cell.set_continuation();
+                cont_cell.set_style(style);
             }
         }
     }
@@ -1396,20 +1462,21 @@ fn wrap_line(line: &Line<'_>, width: usize, trim: bool) -> Vec<Line<'static>> {
 
     for span in &line.spans {
         let span_style = span.style;
-        for ch in span.content.chars() {
-            let char_width = terminal_char_width(ch) as usize;
-            if trim && current_width == 0 && char_width > 0 && ch.is_whitespace() {
+        for symbol in terminal_symbols(&span.content) {
+            let symbol_width = symbol.width as usize;
+            let is_whitespace = symbol.text.chars().next().is_some_and(char::is_whitespace);
+            if trim && current_width == 0 && symbol_width > 0 && is_whitespace {
                 continue;
             }
-            if char_width > 0 && current_width > 0 && current_width + char_width > width {
+            if symbol_width > 0 && current_width > 0 && current_width + symbol_width > width {
                 finish_wrapped_line(&mut lines, &mut current, trim, line.style);
                 current_width = 0;
-                if trim && ch.is_whitespace() {
+                if trim && is_whitespace {
                     continue;
                 }
             }
-            push_wrapped_char(&mut current, ch, span_style);
-            current_width += char_width;
+            push_wrapped_symbol(&mut current, symbol.text, span_style);
+            current_width += symbol_width;
         }
     }
 
@@ -1423,14 +1490,14 @@ fn wrap_line(line: &Line<'_>, width: usize, trim: bool) -> Vec<Line<'static>> {
     lines
 }
 
-fn push_wrapped_char(line: &mut Line<'static>, ch: char, style: Style) {
+fn push_wrapped_symbol(line: &mut Line<'static>, symbol: &str, style: Style) {
     if let Some(last) = line.spans.last_mut()
         && last.style == style
     {
-        last.content.to_mut().push(ch);
+        last.content.to_mut().push_str(symbol);
         return;
     }
-    line.spans.push(Span::styled(ch.to_string(), style));
+    line.spans.push(Span::styled(symbol.to_string(), style));
 }
 
 fn finish_wrapped_line(
@@ -2004,6 +2071,112 @@ impl StatefulWidget for Scrollbar<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PhysicalLine {
+        cells: Vec<String>,
+        continuations: Vec<bool>,
+    }
+
+    impl PhysicalLine {
+        fn new(width: usize) -> Self {
+            Self {
+                cells: vec![" ".to_string(); width],
+                continuations: vec![false; width],
+            }
+        }
+
+        fn print_at(&mut self, x: usize, symbol: &str) -> usize {
+            if x >= self.cells.len() {
+                return x;
+            }
+
+            let width = usize::from(terminal_symbol_width(symbol).max(1));
+            self.cells[x] = symbol.to_string();
+            self.continuations[x] = false;
+            for offset in 1..width {
+                let idx = x + offset;
+                if idx >= self.cells.len() {
+                    break;
+                }
+                self.cells[idx].clear();
+                self.continuations[idx] = true;
+            }
+            x + width
+        }
+
+        fn line(&self) -> String {
+            self.cells
+                .iter()
+                .zip(&self.continuations)
+                .filter_map(|(cell, continuation)| (!continuation).then_some(cell.as_str()))
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        }
+    }
+
+    fn replay_diff_for_test(previous: &Buffer, current: &Buffer, physical: &mut PhysicalLine) {
+        let mut skip = 0usize;
+        let mut cursor = current.area.x as usize;
+
+        for x in current.area.x..current.area.right() {
+            let Some(cell) = current.get(x, current.area.y) else {
+                skip += 1;
+                continue;
+            };
+            let prev = previous.get(x, current.area.y);
+
+            if cell.is_continuation {
+                skip += 1;
+                continue;
+            }
+            if let Some(prev_cell) = prev
+                && cell == prev_cell
+            {
+                skip += 1;
+                continue;
+            }
+
+            if skip > 0 || x == current.area.x {
+                cursor = x as usize;
+            }
+            skip = 0;
+            cursor = physical.print_at(cursor, &cell.symbol);
+        }
+    }
+
+    #[test]
+    fn set_line_places_emoji_presentation_as_wide_symbol() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 1));
+
+        buf.set_line(0, 0, &Line::raw("🛡️ System"), 12);
+
+        assert_eq!(buf.get(0, 0).unwrap().symbol, "🛡️");
+        assert!(buf.get(1, 0).unwrap().is_continuation);
+        assert_eq!(buf.get(2, 0).unwrap().symbol, " ");
+        assert_eq!(buf.get(3, 0).unwrap().symbol, "S");
+        assert_eq!(buf.get(4, 0).unwrap().symbol, "y");
+        assert_eq!(buf.get(5, 0).unwrap().symbol, "s");
+        assert_eq!(buf.get(8, 0).unwrap().symbol, "m");
+    }
+
+    #[test]
+    fn diff_replay_keeps_system_s_after_wide_indicator() {
+        let area = Rect::new(0, 0, 24, 1);
+        let empty = Buffer::empty(area);
+        let mut previous = Buffer::empty(area);
+        let mut current = Buffer::empty(area);
+        let mut physical = PhysicalLine::new(area.width as usize);
+
+        previous.set_string(0, 0, "xxABsD", Style::default());
+        current.set_line(0, 0, &Line::raw("🛡️ System"), area.width);
+
+        replay_diff_for_test(&empty, &previous, &mut physical);
+        replay_diff_for_test(&previous, &current, &mut physical);
+
+        assert_eq!(physical.line(), "🛡️ System");
+        assert!(!physical.line().contains("Sytem"));
+    }
 
     #[test]
     fn test_scrollbar_thumb_clamped_to_track() {

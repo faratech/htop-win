@@ -1141,8 +1141,7 @@ impl App {
             return;
         }
         if let Some(proc) = self.selected_process() {
-            let (pid, name, command) =
-                (proc.pid, proc.name.to_string(), proc.command.to_string());
+            let (pid, name, command) = (proc.pid, proc.name.to_string(), proc.command.to_string());
 
             // Skip confirmation dialog if disabled in settings
             if !self.config.confirm_kill {
