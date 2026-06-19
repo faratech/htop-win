@@ -208,9 +208,11 @@ impl MemoryInfo {
                     // Page file size ≈ commit limit - physical memory
                     let pf_total = (perf_info.CommitLimit as u64)
                         .saturating_sub(perf_info.PhysicalTotal as u64)
-                        * page_size;
+                        .saturating_mul(page_size);
                     // Usage estimate: committed that exceeds physical
-                    let pf_used = (perf_info.CommitTotal as u64 * page_size).saturating_sub(total);
+                    let pf_used = (perf_info.CommitTotal as u64)
+                        .saturating_mul(page_size)
+                        .saturating_sub(total);
                     (pf_total, pf_used.min(pf_total))
                 };
 

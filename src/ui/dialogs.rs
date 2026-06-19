@@ -571,7 +571,7 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
                 .displayed_processes
                 .iter()
                 .find(|p| p.pid == *tagged_pid)
-                .map(|p| p.name.as_str())
+                .map(|p| &*p.name)
                 .unwrap_or("(unknown)");
             lines.push(Line::from(vec![
                 Span::styled(
@@ -840,7 +840,7 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
         let exe_display = if proc.exe_path.is_empty() {
             "(access denied)".to_string()
         } else {
-            proc.exe_path.clone()
+            proc.exe_path.to_string()
         };
 
         let arch_str = match proc.arch.as_str() {
