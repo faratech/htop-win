@@ -2,7 +2,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use crate::app::{App, DialogState, SortColumn};
+use crate::app::{App, DialogState, SetupItem, SortColumn};
 
 /// Handle scroll keys for dialogs. Returns true if the key was handled.
 /// Content length isn't known here; offsets are clamped at render time
@@ -204,7 +204,7 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
 
         // Toggle header meters (#)
         KeyCode::Char('#') => {
-            app.show_header = !app.show_header;
+            app.toggle_header();
         }
 
         // Toggle kernel threads (K)
@@ -298,11 +298,11 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         // Higher priority (F7, ])
         KeyCode::F(7) | KeyCode::Char(']') => {
-            app.enter_priority_mode();
+            app.enter_priority_mode(1);
         }
         // Lower priority (F8, [)
         KeyCode::F(8) | KeyCode::Char('[') => {
-            app.enter_priority_mode();
+            app.enter_priority_mode(-1);
         }
         KeyCode::F(9) => {
             app.enter_kill_mode();
@@ -622,9 +622,12 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
             app.dialog = DialogState::None;
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
-            // Toggle selected setting or open submenu
-            match selected {
-                0 => {
+            // Toggle the selected setting or open its submenu
+            let Some(&item) = SetupItem::ALL.get(selected) else {
+                return false;
+            };
+            match item {
+                SetupItem::RefreshRate => {
                     // Cycle refresh rate: 100 -> 250 -> 500 -> 1000 -> 1500 -> 2000 -> 5000 -> 100
                     app.config.refresh_rate_ms = match app.config.refresh_rate_ms {
                         100 => 250,
@@ -636,56 +639,46 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                         _ => 100,
                     };
                 }
-                1 => {
-                    // Cycle CPU meter mode
+                SetupItem::CpuMeterMode => {
                     app.config.cpu_meter_mode = cycle_meter_mode(app.config.cpu_meter_mode);
                 }
-                2 => {
-                    // Cycle Memory meter mode
+                SetupItem::MemoryMeterMode => {
                     app.config.memory_meter_mode = cycle_meter_mode(app.config.memory_meter_mode);
                 }
-                3 => {
-                    // Cycle GPU meter mode (meter only appears on GPU machines)
+                SetupItem::GpuMeterMode => {
+                    // Meter only appears on GPU machines
                     app.config.gpu_meter_mode = cycle_meter_mode(app.config.gpu_meter_mode);
                 }
-                4 => {
-                    // Cycle NPU meter mode (meter only appears on NPU machines)
+                SetupItem::NpuMeterMode => {
+                    // Meter only appears on NPU machines
                     app.config.npu_meter_mode = cycle_meter_mode(app.config.npu_meter_mode);
                 }
-                5 => {
-                    // Toggle show kernel threads
+                SetupItem::ShowKernelThreads => {
                     app.config.show_kernel_threads = !app.config.show_kernel_threads;
                     app.needs_process_update = true;
                 }
-                6 => {
-                    // Toggle show user threads
+                SetupItem::ShowUserThreads => {
                     app.config.show_user_threads = !app.config.show_user_threads;
                     app.needs_process_update = true;
                 }
-                7 => {
-                    // Toggle show program path
+                SetupItem::ShowProgramPath => {
                     app.config.show_program_path = !app.config.show_program_path;
                     app.needs_process_update = true;
                 }
-                8 => {
-                    // Toggle highlight new processes
+                SetupItem::HighlightNewProcesses => {
                     app.config.highlight_new_processes = !app.config.highlight_new_processes;
                 }
-                9 => {
-                    // Toggle highlight large numbers
+                SetupItem::HighlightLargeNumbers => {
                     app.config.highlight_large_numbers = !app.config.highlight_large_numbers;
                 }
-                10 => {
-                    // Toggle tree view
+                SetupItem::TreeView => {
                     app.toggle_tree_view();
                     app.config.tree_view_default = app.tree_view;
                 }
-                11 => {
-                    // Toggle confirm before kill
+                SetupItem::ConfirmKill => {
                     app.config.confirm_kill = !app.config.confirm_kill;
                 }
-                12 => {
-                    // Open color scheme selection
+                SetupItem::ColorScheme => {
                     let schemes = ColorScheme::all();
                     let index = schemes
                         .iter()
@@ -693,12 +686,13 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                         .unwrap_or(0);
                     app.dialog = DialogState::ColorScheme { index };
                 }
-                13 => {
-                    // Open column configuration
+                SetupItem::ConfigureColumns => {
                     app.enter_column_config_mode();
                 }
-                14 => {
-                    // Reset all settings to defaults
+                SetupItem::GpuMeterAdapter => {
+                    app.enter_gpu_select_mode();
+                }
+                SetupItem::ResetAllSettings => {
                     app.config.reset_to_defaults();
                     app.reset_screen_tabs();
                     app.update_theme();
@@ -709,20 +703,15 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                         std::time::Instant::now(),
                     ));
                 }
-                15 => {
-                    // Open the GPU adapter selector.
-                    app.enter_gpu_select_mode();
-                }
-                _ => {}
             }
         }
         KeyCode::Left | KeyCode::Right => {
             // Allow left/right to adjust values for some settings
-            match selected {
-                0 => {
-                    // Adjust refresh rate
-                    if key.code == KeyCode::Right {
-                        app.config.refresh_rate_ms = match app.config.refresh_rate_ms {
+            let forward = key.code == KeyCode::Right;
+            match SetupItem::ALL.get(selected) {
+                Some(SetupItem::RefreshRate) => {
+                    app.config.refresh_rate_ms = if forward {
+                        match app.config.refresh_rate_ms {
                             100 => 250,
                             250 => 500,
                             500 => 1000,
@@ -730,9 +719,9 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                             1500 => 2000,
                             2000 => 5000,
                             _ => 100,
-                        };
+                        }
                     } else {
-                        app.config.refresh_rate_ms = match app.config.refresh_rate_ms {
+                        match app.config.refresh_rate_ms {
                             5000 => 2000,
                             2000 => 1500,
                             1500 => 1000,
@@ -740,50 +729,44 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                             500 => 250,
                             250 => 100,
                             _ => 5000,
-                        };
-                    }
+                        }
+                    };
                 }
-                1 => {
-                    // Adjust CPU meter mode
-                    if key.code == KeyCode::Right {
-                        app.config.cpu_meter_mode = cycle_meter_mode(app.config.cpu_meter_mode);
+                Some(SetupItem::CpuMeterMode) => {
+                    app.config.cpu_meter_mode = if forward {
+                        cycle_meter_mode(app.config.cpu_meter_mode)
                     } else {
-                        app.config.cpu_meter_mode = cycle_meter_mode_rev(app.config.cpu_meter_mode);
-                    }
+                        cycle_meter_mode_rev(app.config.cpu_meter_mode)
+                    };
                 }
-                2 => {
-                    // Adjust Memory meter mode
-                    if key.code == KeyCode::Right {
-                        app.config.memory_meter_mode =
-                            cycle_meter_mode(app.config.memory_meter_mode);
+                Some(SetupItem::MemoryMeterMode) => {
+                    app.config.memory_meter_mode = if forward {
+                        cycle_meter_mode(app.config.memory_meter_mode)
                     } else {
-                        app.config.memory_meter_mode =
-                            cycle_meter_mode_rev(app.config.memory_meter_mode);
-                    }
+                        cycle_meter_mode_rev(app.config.memory_meter_mode)
+                    };
                 }
-                3 => {
-                    // Adjust GPU meter mode
-                    if key.code == KeyCode::Right {
-                        app.config.gpu_meter_mode = cycle_meter_mode(app.config.gpu_meter_mode);
+                Some(SetupItem::GpuMeterMode) => {
+                    app.config.gpu_meter_mode = if forward {
+                        cycle_meter_mode(app.config.gpu_meter_mode)
                     } else {
-                        app.config.gpu_meter_mode = cycle_meter_mode_rev(app.config.gpu_meter_mode);
-                    }
+                        cycle_meter_mode_rev(app.config.gpu_meter_mode)
+                    };
                 }
-                4 => {
-                    // Adjust NPU meter mode
-                    if key.code == KeyCode::Right {
-                        app.config.npu_meter_mode = cycle_meter_mode(app.config.npu_meter_mode);
+                Some(SetupItem::NpuMeterMode) => {
+                    app.config.npu_meter_mode = if forward {
+                        cycle_meter_mode(app.config.npu_meter_mode)
                     } else {
-                        app.config.npu_meter_mode = cycle_meter_mode_rev(app.config.npu_meter_mode);
-                    }
+                        cycle_meter_mode_rev(app.config.npu_meter_mode)
+                    };
                 }
                 _ => {}
             }
         }
-        // Up/Down/j/k/PgUp/PgDn/Home/End move the selection (15 setup items).
+        // Up/Down/j/k/PgUp/PgDn/Home/End move the selection.
         other => {
             if let DialogState::Setup { ref mut selected } = app.dialog {
-                handle_list_nav(selected, 16, other);
+                handle_list_nav(selected, SetupItem::ALL.len(), other);
             }
         }
     }
@@ -1195,7 +1178,7 @@ fn dialog_nav_len(app: &App) -> usize {
         DialogState::SortSelect { .. } | DialogState::ColumnConfig { .. } => {
             SortColumn::all().len()
         }
-        DialogState::Setup { .. } => 16,
+        DialogState::Setup { .. } => SetupItem::ALL.len(),
         DialogState::Priority { .. } => crate::app::WindowsPriorityClass::all().len(),
         DialogState::UserSelect { users, .. } => users.len() + 1,
         DialogState::ColorScheme { .. } => crate::ui::colors::ColorScheme::all().len(),
@@ -1282,20 +1265,17 @@ fn handle_dialog_click(app: &mut App, x: u16, y: u16, double: bool) {
     // Confirmation-style dialogs: only a double-click on the explicit
     // confirmation row confirms.
     // Keyboard Enter/Y remains the normal single-action confirmation path.
-    match app.dialog {
-        DialogState::Kill { .. } => {
-            if !double || !kill_confirmation_row(app, inner).is_some_and(|row| row == y) {
-                return;
-            }
-            if !app.tagged_pids.is_empty() {
-                app.kill_tagged(15);
-            } else {
-                app.kill_target_process(15);
-            }
-            app.dialog = DialogState::None;
+    if let DialogState::Kill { .. } = app.dialog {
+        if !double || kill_confirmation_row(app, inner) != Some(y) {
             return;
         }
-        _ => {}
+        if !app.tagged_pids.is_empty() {
+            app.kill_tagged(15);
+        } else {
+            app.kill_target_process(15);
+        }
+        app.dialog = DialogState::None;
+        return;
     }
 
     // Map the clicked row to a selectable item. Header rows (above) and footer
@@ -1372,34 +1352,36 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
     // Handle the action based on element type
     if let Some(element) = element {
         match (&element, action) {
+            // Meter clicks cycle the meter mode. A double-click's second
+            // click cycles again so rapid clicking advances every click.
             // CPU meter click - cycle meter mode
-            (UIElement::CpuMeter(_), UIAction::Click) => {
+            (UIElement::CpuMeter(_), UIAction::Click | UIAction::DoubleClick) => {
                 app.config.cpu_meter_mode = app.config.cpu_meter_mode.next();
-                app.save_config();
+                app.mark_config_dirty();
             }
 
             // Memory meter click - cycle meter mode
-            (UIElement::MemoryMeter, UIAction::Click) => {
+            (UIElement::MemoryMeter, UIAction::Click | UIAction::DoubleClick) => {
                 app.config.memory_meter_mode = app.config.memory_meter_mode.next();
-                app.save_config();
+                app.mark_config_dirty();
             }
 
             // Swap meter click - cycle meter mode (shares with memory)
-            (UIElement::SwapMeter, UIAction::Click) => {
+            (UIElement::SwapMeter, UIAction::Click | UIAction::DoubleClick) => {
                 app.config.memory_meter_mode = app.config.memory_meter_mode.next();
-                app.save_config();
+                app.mark_config_dirty();
             }
 
             // GPU meter click - cycle meter mode
-            (UIElement::GpuMeter, UIAction::Click) => {
+            (UIElement::GpuMeter, UIAction::Click | UIAction::DoubleClick) => {
                 app.config.gpu_meter_mode = app.config.gpu_meter_mode.next();
-                app.save_config();
+                app.mark_config_dirty();
             }
 
             // NPU meter click - cycle meter mode
-            (UIElement::NpuMeter, UIAction::Click) => {
+            (UIElement::NpuMeter, UIAction::Click | UIAction::DoubleClick) => {
                 app.config.npu_meter_mode = app.config.npu_meter_mode.next();
-                app.save_config();
+                app.mark_config_dirty();
             }
 
             // Column header clicks - sort
@@ -1478,10 +1460,10 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
                 handle_function_key(app, *key);
             }
 
-            // Header area double-click - toggle header visibility
-            (UIElement::Header, UIAction::DoubleClick) => {
-                app.show_header = !app.show_header;
-            }
+            // Header blank-area double-click deliberately does nothing:
+            // hiding the header on a double-click was too easy to trigger
+            // accidentally and left no visible way back (issue #28). Use `#`
+            // (or Enter with header focus) to toggle the header.
 
             // Footer area double-click - open setup
             (UIElement::Footer, UIAction::DoubleClick) => {
@@ -1496,4 +1478,67 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
 /// Handle function key press (F1-F10) - delegates to App::handle_function_key
 fn handle_function_key(app: &mut App, key: u8) {
     app.handle_function_key(key);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::{UIAction, UIElement, UIRegion};
+    use crate::config::{Config, MeterMode};
+
+    fn test_app() -> App {
+        App::new(Config::default())
+    }
+
+    #[test]
+    fn hash_toggles_header_and_hints_recovery() {
+        let mut app = test_app();
+        assert!(app.show_header);
+
+        let hash = KeyEvent::new(KeyCode::Char('#'), KeyModifiers::empty());
+        assert!(!handle_key_event(&mut app, hash));
+        assert!(!app.show_header);
+        let (msg, _) = app.status_message.as_ref().expect("recovery hint expected");
+        assert!(msg.contains('#'), "hint must mention the # key: {msg}");
+
+        assert!(!handle_key_event(&mut app, hash));
+        assert!(app.show_header);
+    }
+
+    #[test]
+    fn meter_clicks_cycle_without_hiding() {
+        let mut app = test_app();
+        app.ui_bounds
+            .add_region(UIRegion::new(UIElement::CpuMeter(Some(0)), 0, 0, 20, 1));
+
+        // Four clicks wrap the whole cycle; Hidden must never appear because
+        // a hidden meter loses its click region and can't be clicked back
+        // (issue #28).
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            handle_element_action(&mut app, 1, 0, UIAction::Click);
+            seen.push(app.config.cpu_meter_mode);
+        }
+        assert_eq!(
+            seen,
+            vec![
+                MeterMode::Text,
+                MeterMode::Graph,
+                MeterMode::Bar,
+                MeterMode::Text
+            ]
+        );
+        // Cycling defers the write instead of saving per click.
+        assert!(app.config_dirty);
+    }
+
+    #[test]
+    fn header_double_click_no_longer_hides() {
+        let mut app = test_app();
+        // Make the blank header area hit-test as UIElement::Header.
+        app.ui_bounds.header_y_end = 5;
+
+        handle_element_action(&mut app, 2, 2, UIAction::DoubleClick);
+        assert!(app.show_header, "double-click must not hide the header");
+    }
 }

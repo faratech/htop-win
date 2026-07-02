@@ -32,8 +32,9 @@ impl ColorScheme {
         }
     }
 
-    /// Parse from string
-    pub fn from_str(s: &str) -> Self {
+    /// Parse from the name produced by `as_str` (unknown names fall back to
+    /// Default). Not named `from_str` to avoid clashing with `std::str::FromStr`.
+    pub fn from_name(s: &str) -> Self {
         match s {
             "Monochrome" => ColorScheme::Monochrome,
             "BlackOnWhite" => ColorScheme::BlackOnWhite,

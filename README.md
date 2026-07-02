@@ -225,8 +225,8 @@ htop -p 1234,5678,9012
 | `F4` / `\` | Filter processes |
 | `F5` / `t` | Toggle tree view |
 | `F6` / `<` `>` | Change sort column |
-| `F7` / `]` | Open priority dialog |
-| `F8` / `[` | Open priority dialog |
+| `F7` / `]` | Raise priority (opens dialog one class higher, Enter to apply) |
+| `F8` / `[` | Lower priority (opens dialog one class lower, Enter to apply) |
 | `F9` | Kill process |
 | `F10` / `q` | Quit |
 

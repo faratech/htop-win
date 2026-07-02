@@ -531,6 +531,76 @@ impl ScreenTab {
     }
 }
 
+/// One row of the F2 Setup dialog, in display order via `SetupItem::ALL`.
+///
+/// `draw_setup` renders each item's label and current value, and
+/// `handle_setup_keys` dispatches Enter/Left/Right on the item — both iterate
+/// this table, so the rendered list and the input handling can never disagree
+/// about item order or count (issue #27 was caused by exactly that: the draw
+/// list and the numeric match arms drifting apart).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupItem {
+    RefreshRate,
+    CpuMeterMode,
+    MemoryMeterMode,
+    GpuMeterMode,
+    NpuMeterMode,
+    ShowKernelThreads,
+    ShowUserThreads,
+    ShowProgramPath,
+    HighlightNewProcesses,
+    HighlightLargeNumbers,
+    TreeView,
+    ConfirmKill,
+    ColorScheme,
+    ConfigureColumns,
+    GpuMeterAdapter,
+    // Destructive action, always kept last in the list.
+    ResetAllSettings,
+}
+
+impl SetupItem {
+    pub const ALL: &'static [SetupItem] = &[
+        SetupItem::RefreshRate,
+        SetupItem::CpuMeterMode,
+        SetupItem::MemoryMeterMode,
+        SetupItem::GpuMeterMode,
+        SetupItem::NpuMeterMode,
+        SetupItem::ShowKernelThreads,
+        SetupItem::ShowUserThreads,
+        SetupItem::ShowProgramPath,
+        SetupItem::HighlightNewProcesses,
+        SetupItem::HighlightLargeNumbers,
+        SetupItem::TreeView,
+        SetupItem::ConfirmKill,
+        SetupItem::ColorScheme,
+        SetupItem::ConfigureColumns,
+        SetupItem::GpuMeterAdapter,
+        SetupItem::ResetAllSettings,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SetupItem::RefreshRate => "Refresh rate",
+            SetupItem::CpuMeterMode => "CPU meter mode",
+            SetupItem::MemoryMeterMode => "Memory meter mode",
+            SetupItem::GpuMeterMode => "GPU meter mode",
+            SetupItem::NpuMeterMode => "NPU meter mode",
+            SetupItem::ShowKernelThreads => "Show kernel threads",
+            SetupItem::ShowUserThreads => "Show user threads",
+            SetupItem::ShowProgramPath => "Show program path",
+            SetupItem::HighlightNewProcesses => "Highlight new processes",
+            SetupItem::HighlightLargeNumbers => "Highlight large numbers",
+            SetupItem::TreeView => "Tree view",
+            SetupItem::ConfirmKill => "Confirm before kill",
+            SetupItem::ColorScheme => "Color scheme",
+            SetupItem::ConfigureColumns => "Configure columns",
+            SetupItem::GpuMeterAdapter => "GPU meter adapter",
+            SetupItem::ResetAllSettings => "Reset all settings",
+        }
+    }
+}
+
 /// Dialog/view state - encapsulates per-dialog state into enum variants
 /// Replaces the previous flat ViewMode enum + scattered dialog fields
 #[derive(Debug, Clone, Default)]
@@ -677,6 +747,10 @@ pub struct App {
     pub last_error: Option<(String, Instant)>,
     /// Status message (success/info) with timestamp for auto-expiry
     pub status_message: Option<(String, Instant)>,
+    /// Set when a hot path (meter clicks, arrow-key meter cycling) changes the
+    /// config; flushed to disk at most once per tick and on exit, instead of
+    /// doing a synchronous file write per input event.
+    pub config_dirty: bool,
 
     /// Collapsed PIDs in tree view
     pub collapsed_pids: HashSet<u32>,
@@ -824,6 +898,7 @@ impl App {
             terminal_width: 80,
             last_error: None,
             status_message: None,
+            config_dirty: false,
             collapsed_pids: HashSet::new(),
             follow_pid: None,
             paused: false,
@@ -1002,6 +1077,21 @@ impl App {
         if let Err(e) = self.config.save() {
             eprintln!("Failed to save config: {}", e);
         }
+        self.config_dirty = false;
+    }
+
+    /// Mark the config as changed without writing it. Hot paths (meter
+    /// clicks, arrow-key meter cycling) use this instead of a synchronous
+    /// file write per input event; the main loop flushes once per tick.
+    pub fn mark_config_dirty(&mut self) {
+        self.config_dirty = true;
+    }
+
+    /// Write the config out if something marked it dirty.
+    pub fn flush_config(&mut self) {
+        if self.config_dirty {
+            self.save_config();
+        }
     }
 
     // =========================================================================
@@ -1055,8 +1145,9 @@ impl App {
     pub fn navigate_left(&mut self) {
         match self.focus_region {
             FocusRegion::Header => {
-                // Cycle through meter modes
+                // Cycle through meter modes (persisted, like meter clicks)
                 self.config.cpu_meter_mode = self.config.cpu_meter_mode.next();
+                self.mark_config_dirty();
             }
             FocusRegion::ProcessList => {
                 // Nothing to do for left in process list
@@ -1076,8 +1167,9 @@ impl App {
     pub fn navigate_right(&mut self) {
         match self.focus_region {
             FocusRegion::Header => {
-                // Cycle through meter modes
+                // Cycle through meter modes (persisted, like meter clicks)
                 self.config.memory_meter_mode = self.config.memory_meter_mode.next();
+                self.mark_config_dirty();
             }
             FocusRegion::ProcessList => {
                 // Nothing to do for right in process list
@@ -1093,12 +1185,32 @@ impl App {
         }
     }
 
+    /// Toggle header visibility (`#` key, or Enter with header focus).
+    ///
+    /// Hiding leaves no on-screen meters, so surface the recovery key in the
+    /// status line (issue #28). Showing again rescues configs where every
+    /// primary meter mode is Hidden (older builds allowed click-cycling into
+    /// that state) — otherwise the "restored" header would come back with no
+    /// meters and `#` would still look broken.
+    pub fn toggle_header(&mut self) {
+        self.show_header = !self.show_header;
+        if !self.show_header {
+            self.status_message = Some((
+                "Header hidden - press # to restore".to_string(),
+                Instant::now(),
+            ));
+        } else if self.config.rescue_hidden_meters() {
+            self.save_config();
+            self.status_message =
+                Some(("Hidden header meters restored".to_string(), Instant::now()));
+        }
+    }
+
     /// Activate the currently focused element (Enter/Space)
     pub fn activate_focused(&mut self) -> bool {
         match self.focus_region {
             FocusRegion::Header => {
-                // Toggle header visibility
-                self.show_header = !self.show_header;
+                self.toggle_header();
                 false
             }
             FocusRegion::ProcessList => {
@@ -1128,8 +1240,8 @@ impl App {
             4 => self.start_filter(),
             5 => self.toggle_tree_view(),
             6 => self.dialog = DialogState::SortSelect { index: 0 },
-            7 => self.enter_priority_mode(),
-            8 => self.enter_priority_mode(),
+            7 => self.enter_priority_mode(1),
+            8 => self.enter_priority_mode(-1),
             9 => self.enter_kill_mode(),
             _ => {}
         }
@@ -1157,12 +1269,18 @@ impl App {
     }
 
     /// Enter priority mode and capture the target process
-    pub fn enter_priority_mode(&mut self) {
+    /// Open the priority dialog for the selected process. `step` pre-selects
+    /// a class relative to the process's current one — F7/`]` aim one class
+    /// higher (+1), F8/`[` one lower (-1), matching htop's Nice -/Nice + keys
+    /// — so pressing Enter applies that step (issue #26).
+    pub fn enter_priority_mode(&mut self, step: i32) {
         if self.readonly_blocked("change process priority") {
             return;
         }
         if let Some(proc) = self.selected_process() {
-            let class_index = WindowsPriorityClass::from_base_priority(proc.priority).index();
+            let current = WindowsPriorityClass::from_base_priority(proc.priority).index() as i32;
+            let max = WindowsPriorityClass::all().len() as i32 - 1;
+            let class_index = (current + step).clamp(0, max) as usize;
             self.dialog = DialogState::Priority {
                 class_index,
                 pid: proc.pid,
@@ -1203,6 +1321,43 @@ impl App {
         }
     }
 
+    /// Refresh the Process Info dialog's stats from the latest snapshot so
+    /// the dialog tracks the live process instead of freezing at open time.
+    /// The dialog stays pinned to the process captured at open: stats are
+    /// only copied when the fresh entry is the same process (creation-time
+    /// match, falling back to name when unavailable), so PID reuse can't
+    /// swap in a stranger's numbers. If the process exits, the last known
+    /// stats stay on screen.
+    pub fn refresh_process_info_stats(&mut self) {
+        let DialogState::ProcessInfo { ref mut target, .. } = self.dialog else {
+            return;
+        };
+        let Some(fresh) = self.processes.iter().find(|p| p.pid == target.pid) else {
+            return;
+        };
+        let same_process = if target.create_time_100ns != 0 && fresh.create_time_100ns != 0 {
+            fresh.create_time_100ns == target.create_time_100ns
+        } else {
+            fresh.name == target.name
+        };
+        if !same_process {
+            return;
+        }
+
+        let mut updated = fresh.clone();
+        // The dialog owns the cumulative I/O counters: refresh_process_info_io
+        // re-reads them every tick, even between snapshots and while paused.
+        updated.io_read_bytes = target.io_read_bytes;
+        updated.io_write_bytes = target.io_write_bytes;
+        // Keep the exe-path enrichment done at open time when the snapshot
+        // lacks it (the two share one allocation, see enter_process_info_mode).
+        if updated.exe_path.is_empty() && !target.exe_path.is_empty() {
+            updated.exe_path = target.exe_path.clone();
+            updated.command = target.command.clone();
+        }
+        **target = updated;
+    }
+
     /// Refresh system data (synchronous, used for initial refresh fallback)
     pub fn refresh_system(&mut self) {
         // Use native Windows APIs for all system metrics
@@ -1211,6 +1366,7 @@ impl App {
         self.system_metrics
             .update_processes_native(&mut self.processes);
         self.update_displayed_processes();
+        self.refresh_process_info_stats();
 
         // Update history for graph mode
         self.update_meter_history();
@@ -1221,6 +1377,7 @@ impl App {
         self.system_metrics = snapshot.metrics;
         self.processes = snapshot.processes;
         self.update_displayed_processes();
+        self.refresh_process_info_stats();
         self.update_meter_history();
     }
 
@@ -2408,6 +2565,13 @@ mod tests {
             "columns not in canonical display order: {:?}",
             columns
         );
+    }
+
+    #[test]
+    fn destructive_reset_is_last_setup_item() {
+        // Keep the destructive action at the bottom of the Setup list
+        // (issue #27) — draw and input both derive order from this table.
+        assert_eq!(SetupItem::ALL.last(), Some(&SetupItem::ResetAllSettings));
     }
 
     #[test]

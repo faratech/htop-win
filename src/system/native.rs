@@ -49,10 +49,6 @@ impl<'a> SystemProcess<'a> {
         self.info.working_set_size as u64
     }
 
-    pub fn private_bytes(&self) -> u64 {
-        self.info.private_page_count as u64
-    }
-
     pub fn private_working_set(&self) -> u64 {
         self.info.working_set_private_size.max(0) as u64
     }

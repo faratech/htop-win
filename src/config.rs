@@ -37,13 +37,16 @@ impl MeterMode {
 }
 
 impl MeterMode {
-    /// Cycle to the next meter mode
+    /// Cycle to the next meter mode for interactive cycling (meter clicks,
+    /// arrow keys in header focus). Deliberately skips `Hidden`: a hidden
+    /// meter is not rendered, so it has no click region and could never be
+    /// clicked back (issue #28). `Hidden` remains reachable through F2 Setup,
+    /// which can also cycle it back out.
     pub fn next(self) -> Self {
         match self {
             MeterMode::Bar => MeterMode::Text,
             MeterMode::Text => MeterMode::Graph,
-            MeterMode::Graph => MeterMode::Hidden,
-            MeterMode::Hidden => MeterMode::Bar,
+            MeterMode::Graph | MeterMode::Hidden => MeterMode::Bar,
         }
     }
 }
@@ -234,6 +237,29 @@ impl Config {
         Self::default()
     }
 
+    /// If every primary meter is Hidden, reset all Hidden meter modes to Bar
+    /// and return true. Recovery path for configs stranded by older builds
+    /// where click-cycling could hide meters one by one (issue #28); invoked
+    /// when `#` re-shows the header, which would otherwise come back with no
+    /// meters. A partially-hidden config (e.g. only CPU hidden via F2 Setup)
+    /// is left alone.
+    pub fn rescue_hidden_meters(&mut self) -> bool {
+        if self.cpu_meter_mode != MeterMode::Hidden || self.memory_meter_mode != MeterMode::Hidden {
+            return false;
+        }
+        for mode in [
+            &mut self.cpu_meter_mode,
+            &mut self.memory_meter_mode,
+            &mut self.gpu_meter_mode,
+            &mut self.npu_meter_mode,
+        ] {
+            if *mode == MeterMode::Hidden {
+                *mode = MeterMode::Bar;
+            }
+        }
+        true
+    }
+
     /// Save configuration to file
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(path) = Self::config_path() {
@@ -326,7 +352,7 @@ impl Config {
         Self {
             refresh_rate_ms: get_u64("refresh_rate_ms", defaults.refresh_rate_ms).max(100),
             tree_view_default: get_bool("tree_view_default", defaults.tree_view_default),
-            color_scheme: ColorScheme::from_str(&get_str(
+            color_scheme: ColorScheme::from_name(&get_str(
                 "color_scheme",
                 defaults.color_scheme.as_str(),
             )),
@@ -587,5 +613,42 @@ mod tests {
         assert_eq!(loaded.gpu_meter_mode, config.gpu_meter_mode);
         assert_eq!(loaded.show_npu_meter, config.show_npu_meter);
         assert_eq!(loaded.npu_meter_mode, config.npu_meter_mode);
+    }
+
+    #[test]
+    fn interactive_meter_cycle_skips_hidden() {
+        // Clicking must never make a meter vanish (issue #28): the meter's
+        // click region disappears with it, so it could never be clicked back.
+        assert_eq!(MeterMode::Bar.next(), MeterMode::Text);
+        assert_eq!(MeterMode::Text.next(), MeterMode::Graph);
+        assert_eq!(MeterMode::Graph.next(), MeterMode::Bar);
+        // A meter hidden via F2 Setup (or an old config) cycles back to Bar.
+        assert_eq!(MeterMode::Hidden.next(), MeterMode::Bar);
+    }
+
+    #[test]
+    fn rescue_restores_meters_only_when_all_primaries_hidden() {
+        // Partially hidden (deliberate Setup choice): left alone.
+        let mut config = Config {
+            cpu_meter_mode: MeterMode::Hidden,
+            ..Config::default()
+        };
+        assert!(!config.rescue_hidden_meters());
+        assert_eq!(config.cpu_meter_mode, MeterMode::Hidden);
+
+        // Both primaries hidden (stranded state): every Hidden mode resets
+        // to Bar, but non-hidden modes keep their configured value.
+        let mut config = Config {
+            cpu_meter_mode: MeterMode::Hidden,
+            memory_meter_mode: MeterMode::Hidden,
+            npu_meter_mode: MeterMode::Hidden,
+            gpu_meter_mode: MeterMode::Graph,
+            ..Config::default()
+        };
+        assert!(config.rescue_hidden_meters());
+        assert_eq!(config.cpu_meter_mode, MeterMode::Bar);
+        assert_eq!(config.memory_meter_mode, MeterMode::Bar);
+        assert_eq!(config.npu_meter_mode, MeterMode::Bar);
+        assert_eq!(config.gpu_meter_mode, MeterMode::Graph);
     }
 }

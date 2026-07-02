@@ -1,16 +1,6 @@
-mod app;
-mod config;
-mod data;
-mod input;
-#[cfg(windows)]
-mod installer;
-#[cfg(not(windows))]
-#[path = "installer_stub.rs"]
-mod installer;
-mod json;
-mod system;
-mod terminal;
-mod ui;
+// The binary is a thin wrapper over the htop_win library crate — modules are
+// declared once in lib.rs so each source file compiles a single time.
+use htop_win::{app, config, data, input, installer, system, terminal, ui};
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -382,12 +372,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if args.gpu_debug {
-        print!("{}", crate::system::gpu_debug_dump());
+        print!("{}", system::gpu_debug_dump());
         return Ok(());
     }
 
     if args.cpu_debug {
-        print!("{}", crate::system::cpu_debug_dump());
+        print!("{}", system::cpu_debug_dump());
         return Ok(());
     }
 
@@ -604,7 +594,7 @@ fn run_tui_inner(
     };
 
     // Run the main loop
-    run_app(
+    let result = run_app(
         &mut terminal,
         &mut app,
         &config,
@@ -612,7 +602,13 @@ fn run_tui_inner(
         update_rx,
         data_rx,
         &collector,
-    )
+    );
+
+    // Persist any config change still pending from the debounced hot paths
+    // (meter clicks / arrow-key meter cycling).
+    app.flush_config();
+
+    result
 }
 
 fn run_app(
@@ -738,6 +734,9 @@ fn run_app(
                 app.refresh_process_info_io();
                 needs_redraw = true;
             }
+
+            // Flush debounced config changes at most once per tick.
+            app.flush_config();
 
             // Advance the tick even while paused to avoid busy-looping with a
             // zero-duration poll timeout (which drives CPU usage up).

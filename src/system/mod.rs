@@ -70,8 +70,13 @@ pub use d3dkmt::{
     set_gpu_selection, set_npu_process_stats_enabled,
 };
 pub use memory::{MemoryInfo, format_bytes};
+// Part of the library API (used by tests/visual_test.rs); the binary target
+// compiles this module tree too but never references the re-export, so the
+// unused-import lint must be silenced for that target.
+#[allow(unused_imports)]
+pub use process::ProcessArch;
 pub use process::{
-    ProcessArch, ProcessInfo, enable_debug_privilege, enrich_processes, get_process_affinity,
+    ProcessInfo, enable_debug_privilege, enrich_processes, get_process_affinity,
     get_process_exe_path, get_process_io_counters, kill_process, set_efficiency_mode,
     set_priority_class, set_process_affinity,
 };

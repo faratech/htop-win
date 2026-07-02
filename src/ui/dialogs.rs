@@ -3,7 +3,7 @@ use crate::terminal::{
     ScrollbarOrientation, ScrollbarState, Span, Style, Wrap,
 };
 
-use crate::app::{App, DialogState, SortColumn};
+use crate::app::{App, DialogState, SetupItem, SortColumn};
 use crate::system::format_bytes;
 use crate::ui::colors::ColorScheme;
 use crate::ui::{centered_rect, centered_rect_fixed};
@@ -277,8 +277,8 @@ pub fn draw_help(frame: &mut Frame, app: &mut App) {
         "    F4, \\              Filter processes (hide non-matching)",
         "    F5, t              Toggle tree view",
         "    F6, >, ., <, ,     Select sort column",
-        "    F7, ]              Open priority dialog",
-        "    F8, [              Open priority dialog",
+        "    F7, ]              Raise priority (dialog, Enter to apply)",
+        "    F8, [              Lower priority (dialog, Enter to apply)",
         "    F9                 Kill selected/tagged process(es)",
         "    F10, q, Q          Quit",
         "",
@@ -343,7 +343,7 @@ pub fn draw_help(frame: &mut Frame, app: &mut App) {
         "    Right-click        Tag/untag process (for batch kill)",
         "    Middle-click       Open kill dialog for process",
         "    Click header       Sort by column",
-        "    Click meter        Cycle meter mode (Bar/Text/Graph/Hidden)",
+        "    Click meter        Cycle meter mode (Bar/Text/Graph)",
         "    Click F-key        Trigger function key action",
         "    Scroll             Scroll process list (or dialog content)",
         "    Click dialog row   Select item (double-click to activate)",
@@ -730,60 +730,21 @@ pub fn draw_setup(frame: &mut Frame, app: &mut App) {
     let theme = &app.theme;
     let area = centered_rect(60, 60, frame.area());
 
-    // Build setup items with actual config values
-    let setup_items: Vec<(&str, String)> = vec![
-        ("Refresh rate", format!("{} ms", app.config.refresh_rate_ms)),
-        ("CPU meter mode", meter_mode_str(app.config.cpu_meter_mode)),
-        (
-            "Memory meter mode",
-            meter_mode_str(app.config.memory_meter_mode),
-        ),
-        ("GPU meter mode", meter_mode_str(app.config.gpu_meter_mode)),
-        ("NPU meter mode", meter_mode_str(app.config.npu_meter_mode)),
-        (
-            "Show kernel threads",
-            bool_to_str(app.config.show_kernel_threads),
-        ),
-        (
-            "Show user threads",
-            bool_to_str(app.config.show_user_threads),
-        ),
-        (
-            "Show program path",
-            bool_to_str(app.config.show_program_path),
-        ),
-        (
-            "Highlight new processes",
-            bool_to_str(app.config.highlight_new_processes),
-        ),
-        (
-            "Highlight large numbers",
-            bool_to_str(app.config.highlight_large_numbers),
-        ),
-        ("Tree view", bool_to_str(app.tree_view)),
-        ("Confirm before kill", bool_to_str(app.config.confirm_kill)),
-        ("Color scheme", app.config.color_scheme.name().to_string()),
-        ("Configure columns", "→".to_string()),
-        ("Reset all settings", "⚠".to_string()),
-        (
-            "GPU meter adapter",
-            app.config
-                .gpu_meter_adapter
-                .clone()
-                .unwrap_or_else(|| "Auto".to_string()),
-        ),
-    ];
-
-    let items: Vec<ListItem> = setup_items
+    // Items and their order come from SetupItem::ALL — the same table the
+    // input handler dispatches on — so draw and input can't get out of sync.
+    let items: Vec<ListItem> = SetupItem::ALL
         .iter()
         .enumerate()
-        .map(|(idx, (label, value))| {
+        .map(|(idx, item)| {
             ListItem::new(Line::from(vec![
                 Span::styled(
-                    format!(" {:<30} ", label),
+                    format!(" {:<30} ", item.label()),
                     item_style(idx == selected, theme),
                 ),
-                Span::styled(value.to_string(), Style::default().fg(theme.meter_value_ok)),
+                Span::styled(
+                    setup_item_value(*item, app),
+                    Style::default().fg(theme.meter_value_ok),
+                ),
             ]))
         })
         .collect();
@@ -796,6 +757,32 @@ pub fn draw_setup(frame: &mut Frame, app: &mut App) {
 
     let style = Style::default().fg(theme.text).bg(theme.background);
     render_list_dialog(frame, app, area, block, style, items, selected, 0, 0);
+}
+
+/// The displayed value for a Setup row, read from live app/config state.
+fn setup_item_value(item: SetupItem, app: &App) -> String {
+    match item {
+        SetupItem::RefreshRate => format!("{} ms", app.config.refresh_rate_ms),
+        SetupItem::CpuMeterMode => meter_mode_str(app.config.cpu_meter_mode),
+        SetupItem::MemoryMeterMode => meter_mode_str(app.config.memory_meter_mode),
+        SetupItem::GpuMeterMode => meter_mode_str(app.config.gpu_meter_mode),
+        SetupItem::NpuMeterMode => meter_mode_str(app.config.npu_meter_mode),
+        SetupItem::ShowKernelThreads => bool_to_str(app.config.show_kernel_threads),
+        SetupItem::ShowUserThreads => bool_to_str(app.config.show_user_threads),
+        SetupItem::ShowProgramPath => bool_to_str(app.config.show_program_path),
+        SetupItem::HighlightNewProcesses => bool_to_str(app.config.highlight_new_processes),
+        SetupItem::HighlightLargeNumbers => bool_to_str(app.config.highlight_large_numbers),
+        SetupItem::TreeView => bool_to_str(app.tree_view),
+        SetupItem::ConfirmKill => bool_to_str(app.config.confirm_kill),
+        SetupItem::ColorScheme => app.config.color_scheme.name().to_string(),
+        SetupItem::ConfigureColumns => "→".to_string(),
+        SetupItem::GpuMeterAdapter => app
+            .config
+            .gpu_meter_adapter
+            .clone()
+            .unwrap_or_else(|| "Auto".to_string()),
+        SetupItem::ResetAllSettings => "⚠".to_string(),
+    }
 }
 
 fn bool_to_str(val: bool) -> String {

@@ -2,4 +2,4 @@ PID▲ USER CPU% MEM% TIME+ Command
 100 SYSTEM 0.0 0.1 1:15.00 SystemIdle
 200 alice 12.5 1.5 1:15.00 Shell
 300 builder 42.0 4.0 1:15.00 RustCompiler
-F1Help F2Setup F3Search F4Filter F5Tree F6Sort F7Pri F8Pri F9Kill F10Quit
+F1Help F2Setup F3Search F4Filter F5Tree F6Sort F7Nice - F8Nice + F9Kill F10Quit

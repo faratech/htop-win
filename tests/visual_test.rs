@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use htop_win::app::{App, ScreenTab, SortColumn};
+use htop_win::app::{App, DialogState, ScreenTab, SortColumn, WindowsPriorityClass};
 use htop_win::config::Config;
 use htop_win::system::{
     CpuInfo, GpuInfo, MemoryInfo, NpuInfo, ProcessArch, ProcessInfo, SystemMetrics,
@@ -58,16 +58,18 @@ fn fixture_process(pid: u32, user: &str, name: &str, cpu: f32, mem: f32) -> Proc
 }
 
 fn fixture_app() -> App {
-    let mut config = Config::default();
-    config.visible_columns = vec![
-        "PID".to_string(),
-        "USER".to_string(),
-        "CPU%".to_string(),
-        "MEM%".to_string(),
-        "TIME+".to_string(),
-        "Command".to_string(),
-    ];
-    config.highlight_large_numbers = false;
+    let config = Config {
+        visible_columns: vec![
+            "PID".to_string(),
+            "USER".to_string(),
+            "CPU%".to_string(),
+            "MEM%".to_string(),
+            "TIME+".to_string(),
+            "Command".to_string(),
+        ],
+        highlight_large_numbers: false,
+        ..Config::default()
+    };
 
     let mut app = App::new(config.clone());
     app.show_header = false;
@@ -158,24 +160,110 @@ fn visual_snapshot_renders_real_app() {
 }
 
 #[test]
+fn process_info_dialog_tracks_live_stats() {
+    let mut app = fixture_app();
+
+    // Open the dialog on the Shell process (pid 200).
+    app.dialog = DialogState::ProcessInfo {
+        target: Box::new(app.processes[1].clone()),
+        scroll: 0,
+    };
+
+    // A new snapshot arrives with changed stats for the same process, but
+    // without the exe-path enrichment done at dialog-open time.
+    let mut fresh = fixture_process(200, "alice", "Shell", 55.5, 9.0);
+    fresh.thread_count = 42;
+    fresh.io_read_rate = 4096;
+    fresh.exe_path = "".into();
+    fresh.command = "".into();
+    app.processes[1] = fresh;
+    // Dialog-owned cumulative I/O counters must survive the stats refresh.
+    if let DialogState::ProcessInfo { ref mut target, .. } = app.dialog {
+        target.io_read_bytes = 999_999;
+    }
+
+    app.refresh_process_info_stats();
+
+    let DialogState::ProcessInfo { ref target, .. } = app.dialog else {
+        panic!("dialog closed unexpectedly");
+    };
+    assert_eq!(target.cpu_percent, 55.5);
+    assert_eq!(target.thread_count, 42);
+    assert_eq!(target.io_read_rate, 4096);
+    assert_eq!(target.io_read_bytes, 999_999);
+    assert!(target.exe_path.contains("Shell"));
+
+    // PID reuse: same pid, different creation time — stats must not update.
+    let mut imposter = fixture_process(200, "mallory", "Imposter", 1.0, 0.5);
+    imposter.create_time_100ns += 12_345;
+    app.processes[1] = imposter;
+
+    app.refresh_process_info_stats();
+
+    let DialogState::ProcessInfo { ref target, .. } = app.dialog else {
+        panic!("dialog closed unexpectedly");
+    };
+    assert_eq!(&*target.name, "Shell");
+    assert_eq!(target.cpu_percent, 55.5);
+}
+
+#[test]
+fn f7_f8_preselect_stepped_priority_class() {
+    let mut app = fixture_app();
+    app.selected_index = 1; // pid 200 (Shell)
+    app.processes[1].priority = 8; // Normal (class index 2)
+    app.update_displayed_processes();
+
+    // F7 aims one class higher, F8 one lower (htop's Nice -/Nice + keys).
+    app.enter_priority_mode(1);
+    let DialogState::Priority {
+        class_index, pid, ..
+    } = &app.dialog
+    else {
+        panic!("expected priority dialog");
+    };
+    assert_eq!(*pid, 200);
+    assert_eq!(*class_index, 3);
+
+    app.dialog = DialogState::None;
+    app.enter_priority_mode(-1);
+    let DialogState::Priority { class_index, .. } = &app.dialog else {
+        panic!("expected priority dialog");
+    };
+    assert_eq!(*class_index, 1);
+
+    // The pre-selection clamps at the top of the class list.
+    app.dialog = DialogState::None;
+    app.processes[1].priority = 24; // Realtime (last class)
+    app.update_displayed_processes();
+    app.enter_priority_mode(1);
+    let DialogState::Priority { class_index, .. } = &app.dialog else {
+        panic!("expected priority dialog");
+    };
+    assert_eq!(*class_index, WindowsPriorityClass::all().len() - 1);
+}
+
+#[test]
 fn reset_hardware_columns_render_elevated_system_with_wide_indicator() {
-    let mut config = Config::default();
-    config.visible_columns = vec![
-        "PID".to_string(),
-        "USER".to_string(),
-        "PRI".to_string(),
-        "CLASS".to_string(),
-        "THR".to_string(),
-        "VIRT".to_string(),
-        "RES".to_string(),
-        "SHR".to_string(),
-        "S".to_string(),
-        "CPU%".to_string(),
-        "MEM%".to_string(),
-        "TIME+".to_string(),
-        "Command".to_string(),
-    ];
-    config.highlight_large_numbers = false;
+    let config = Config {
+        visible_columns: vec![
+            "PID".to_string(),
+            "USER".to_string(),
+            "PRI".to_string(),
+            "CLASS".to_string(),
+            "THR".to_string(),
+            "VIRT".to_string(),
+            "RES".to_string(),
+            "SHR".to_string(),
+            "S".to_string(),
+            "CPU%".to_string(),
+            "MEM%".to_string(),
+            "TIME+".to_string(),
+            "Command".to_string(),
+        ],
+        highlight_large_numbers: false,
+        ..Config::default()
+    };
 
     let mut app = App::new(config.clone());
     app.show_header = false;
