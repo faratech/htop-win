@@ -4,6 +4,10 @@
 fn main() {
     println!("cargo:rerun-if-changed=media/htop.rc");
     println!("cargo:rerun-if-changed=media/htop.ico");
+    // Emitting rerun-if-changed disables the default rerun-on-any-change
+    // behavior, so a Cargo.toml version bump alone would not regenerate the
+    // resource — track the version explicitly.
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
 
     // Check if we're targeting Windows (works for cross-compilation)
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
