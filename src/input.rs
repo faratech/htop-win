@@ -641,17 +641,21 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                 }
                 SetupItem::CpuMeterMode => {
                     app.config.cpu_meter_mode = cycle_meter_mode(app.config.cpu_meter_mode);
+                    app.ensure_meter_visible(item);
                 }
                 SetupItem::MemoryMeterMode => {
                     app.config.memory_meter_mode = cycle_meter_mode(app.config.memory_meter_mode);
+                    app.ensure_meter_visible(item);
                 }
                 SetupItem::GpuMeterMode => {
                     // Meter only appears on GPU machines
                     app.config.gpu_meter_mode = cycle_meter_mode(app.config.gpu_meter_mode);
+                    app.ensure_meter_visible(item);
                 }
                 SetupItem::NpuMeterMode => {
                     // Meter only appears on NPU machines
                     app.config.npu_meter_mode = cycle_meter_mode(app.config.npu_meter_mode);
+                    app.ensure_meter_visible(item);
                 }
                 SetupItem::ShowKernelThreads => {
                     app.config.show_kernel_threads = !app.config.show_kernel_threads;
@@ -738,6 +742,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     } else {
                         cycle_meter_mode_rev(app.config.cpu_meter_mode)
                     };
+                    app.ensure_meter_visible(SetupItem::CpuMeterMode);
                 }
                 Some(SetupItem::MemoryMeterMode) => {
                     app.config.memory_meter_mode = if forward {
@@ -745,6 +750,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     } else {
                         cycle_meter_mode_rev(app.config.memory_meter_mode)
                     };
+                    app.ensure_meter_visible(SetupItem::MemoryMeterMode);
                 }
                 Some(SetupItem::GpuMeterMode) => {
                     app.config.gpu_meter_mode = if forward {
@@ -752,6 +758,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     } else {
                         cycle_meter_mode_rev(app.config.gpu_meter_mode)
                     };
+                    app.ensure_meter_visible(SetupItem::GpuMeterMode);
                 }
                 Some(SetupItem::NpuMeterMode) => {
                     app.config.npu_meter_mode = if forward {
@@ -759,6 +766,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     } else {
                         cycle_meter_mode_rev(app.config.npu_meter_mode)
                     };
+                    app.ensure_meter_visible(SetupItem::NpuMeterMode);
                 }
                 _ => {}
             }
@@ -1540,5 +1548,63 @@ mod tests {
 
         handle_element_action(&mut app, 2, 2, UIAction::DoubleClick);
         assert!(app.show_header, "double-click must not hide the header");
+    }
+
+    #[test]
+    fn setup_meter_mode_change_forces_visibility() {
+        // A user stranded with hidden meters (mode Hidden, show flag false,
+        // header toggled off) changes the mode in F2 Setup — the result must
+        // actually appear, not stay suppressed by the other two flags.
+        let mut app = test_app();
+        app.show_header = false;
+        app.config.show_cpu_meters = false;
+        app.config.cpu_meter_mode = MeterMode::Hidden;
+
+        let cpu_row = SetupItem::ALL
+            .iter()
+            .position(|i| *i == SetupItem::CpuMeterMode)
+            .unwrap();
+        app.dialog = DialogState::Setup { selected: cpu_row };
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
+        assert!(!handle_key_event(&mut app, enter));
+
+        assert_eq!(app.config.cpu_meter_mode, MeterMode::Bar); // Hidden -> Bar
+        assert!(app.config.show_cpu_meters);
+        assert!(app.show_header);
+    }
+
+    #[test]
+    fn real_double_click_on_meter_never_hides_anything() {
+        let mut app = test_app();
+        app.ui_bounds.header_y_end = 6;
+        app.ui_bounds
+            .add_region(UIRegion::new(UIElement::CpuMeter(Some(0)), 0, 0, 20, 1));
+
+        // Real double-click: two left-downs at the same spot within the
+        // threshold, through the full mouse path (detection included).
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        handle_mouse_event(&mut app, click);
+        handle_mouse_event(&mut app, click);
+
+        assert!(app.show_header, "double-click must not hide the header");
+        // Bar -> Text (first click) -> Graph (second click); never Hidden.
+        assert_eq!(app.config.cpu_meter_mode, MeterMode::Graph);
+
+        // Double-click on blank header space is inert too.
+        let blank = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 15,
+            row: 4,
+            modifiers: KeyModifiers::empty(),
+        };
+        handle_mouse_event(&mut app, blank);
+        handle_mouse_event(&mut app, blank);
+        assert!(app.show_header);
+        assert_eq!(app.config.cpu_meter_mode, MeterMode::Graph);
     }
 }

@@ -237,14 +237,18 @@ impl Config {
         Self::default()
     }
 
-    /// If every primary meter is Hidden, reset all Hidden meter modes to Bar
-    /// and return true. Recovery path for configs stranded by older builds
-    /// where click-cycling could hide meters one by one (issue #28); invoked
-    /// when `#` re-shows the header, which would otherwise come back with no
-    /// meters. A partially-hidden config (e.g. only CPU hidden via F2 Setup)
-    /// is left alone.
+    /// If both primary meters are invisible — mode Hidden, or their `show_*`
+    /// flag false (nothing in the UI exposes those flags, so a stale `false`
+    /// in config.json strands them) — reset every Hidden mode to Bar and
+    /// re-enable all meter flags, returning true. Recovery path for configs
+    /// stranded by older builds where click-cycling could hide meters one by
+    /// one (issue #28); invoked when `#` re-shows the header, which would
+    /// otherwise come back with no meters. A partially-hidden config (e.g.
+    /// only CPU hidden via F2 Setup) is left alone.
     pub fn rescue_hidden_meters(&mut self) -> bool {
-        if self.cpu_meter_mode != MeterMode::Hidden || self.memory_meter_mode != MeterMode::Hidden {
+        let cpu_gone = self.cpu_meter_mode == MeterMode::Hidden || !self.show_cpu_meters;
+        let mem_gone = self.memory_meter_mode == MeterMode::Hidden || !self.show_memory_meter;
+        if !cpu_gone || !mem_gone {
             return false;
         }
         for mode in [
@@ -257,6 +261,13 @@ impl Config {
                 *mode = MeterMode::Bar;
             }
         }
+        self.show_cpu_meters = true;
+        self.show_memory_meter = true;
+        self.show_swap_meter = true;
+        self.show_gpu_meter = true;
+        self.show_npu_meter = true;
+        self.show_tasks_meter = true;
+        self.show_uptime_meter = true;
         true
     }
 
@@ -650,5 +661,18 @@ mod tests {
         assert_eq!(config.memory_meter_mode, MeterMode::Bar);
         assert_eq!(config.npu_meter_mode, MeterMode::Bar);
         assert_eq!(config.gpu_meter_mode, MeterMode::Graph);
+
+        // Primaries can also be stranded by show_* flags alone (nothing in
+        // the UI exposes them; a stale false in config.json hides the meter
+        // regardless of mode). The rescue re-enables them too.
+        let mut config = Config {
+            show_cpu_meters: false,
+            show_memory_meter: false,
+            ..Config::default()
+        };
+        assert!(config.rescue_hidden_meters());
+        assert!(config.show_cpu_meters);
+        assert!(config.show_memory_meter);
+        assert!(config.show_swap_meter);
     }
 }

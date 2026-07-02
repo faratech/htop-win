@@ -1206,6 +1206,26 @@ impl App {
         }
     }
 
+    /// A Setup change to a meter's display mode must actually become visible:
+    /// re-show the header (it may have been toggled off with `#`) and
+    /// re-enable the meter's `show_*` config flag, which no dialog exposes —
+    /// a stale `false` in config.json would otherwise silently defeat the
+    /// mode change (issue #28 follow-up).
+    pub fn ensure_meter_visible(&mut self, item: SetupItem) {
+        self.show_header = true;
+        match item {
+            SetupItem::CpuMeterMode => self.config.show_cpu_meters = true,
+            SetupItem::MemoryMeterMode => {
+                // Swap shares the memory meter mode.
+                self.config.show_memory_meter = true;
+                self.config.show_swap_meter = true;
+            }
+            SetupItem::GpuMeterMode => self.config.show_gpu_meter = true,
+            SetupItem::NpuMeterMode => self.config.show_npu_meter = true,
+            _ => {}
+        }
+    }
+
     /// Activate the currently focused element (Enter/Space)
     pub fn activate_focused(&mut self) -> bool {
         match self.focus_region {
