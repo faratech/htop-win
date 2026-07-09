@@ -178,7 +178,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
         ],
         DialogState::Kill { .. } => vec![
-            (None, "Enter", "Kill"),
+            (None, "Enter", "Terminate"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
             (None, "", ""),
@@ -193,18 +193,6 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "↑/↓", "Select"),
             (None, "Enter", "Set"),
             (None, "Esc", "Cancel"),
-            (None, "", ""),
-            (None, "", ""),
-            (None, "", ""),
-            (None, "", ""),
-            (None, "", ""),
-            (None, "", ""),
-            (None, "", ""),
-        ],
-        DialogState::SignalSelect { .. } => vec![
-            (None, "Enter", "Kill"),
-            (None, "Esc", "Back"),
-            (None, "", ""),
             (None, "", ""),
             (None, "", ""),
             (None, "", ""),
@@ -306,7 +294,7 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (Some(6), "F6", "Sort"),
             (Some(7), "F7", "Nice -"),
             (Some(8), "F8", "Nice +"),
-            (Some(9), "F9", "Kill"),
+            (Some(9), "F9", "Force"),
             (Some(10), "F10", "Quit"),
         ],
     }
@@ -380,9 +368,9 @@ fn build_status_line(app: &App) -> Vec<Span<'static>> {
     }
 
     // Show follow mode indicator
-    if let Some(pid) = app.follow_pid {
+    if let Some(identity) = app.follow_pid {
         spans.push(Span::styled(
-            format!("[Follow:{}] ", pid),
+            format!("[Follow:{}] ", identity.pid),
             Style::default().fg(theme.process_priv),
         ));
     }

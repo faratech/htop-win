@@ -25,23 +25,12 @@ fn main() {
 /// made absolute because the generated copy no longer lives next to the icon.
 fn write_versioned_rc() -> std::path::PathBuf {
     let version = std::env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION is set by Cargo");
-    let numeric = version
-        .split('.')
-        .map(|part| {
-            part.parse::<u16>()
-                .expect("package version parts must be numeric")
-                .to_string()
-        })
-        .chain(std::iter::repeat("0".to_string()))
-        .take(4)
-        .collect::<Vec<_>>()
-        .join(",");
+    let numeric = windows_resource_version(&version).unwrap_or_else(|error| panic!("{error}"));
     // Forward slashes work in quoted rc paths for both rc.exe and windres.
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
         .expect("CARGO_MANIFEST_DIR is set by Cargo")
         .replace('\\', "/");
-    let template =
-        std::fs::read_to_string("media/htop.rc").expect("failed to read media/htop.rc");
+    let template = std::fs::read_to_string("media/htop.rc").expect("failed to read media/htop.rc");
 
     let rc: String = template
         .lines()
@@ -69,4 +58,52 @@ fn write_versioned_rc() -> std::path::PathBuf {
         .join("htop.rc");
     std::fs::write(&out, rc).expect("failed to write versioned htop.rc");
     out
+}
+
+/// Convert Cargo SemVer to the four numeric fields supported by VERSIONINFO.
+/// Cargo has already validated the full version, including prerelease and build
+/// identifiers; Windows only accepts the three numeric core components.
+fn windows_resource_version(version: &str) -> Result<String, String> {
+    let without_build = version.split_once('+').map_or(version, |(core, _)| core);
+    let core = without_build
+        .split_once('-')
+        .map_or(without_build, |(core, _)| core);
+    let parts = core.split('.').collect::<Vec<_>>();
+    if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+        return Err(format!(
+            "package version '{version}' does not have a three-part SemVer core"
+        ));
+    }
+
+    let mut numeric = Vec::with_capacity(4);
+    for part in parts {
+        let component = part.parse::<u16>().map_err(|_| {
+            format!(
+                "SemVer core component '{part}' in '{version}' exceeds the Windows resource limit of 65535"
+            )
+        })?;
+        numeric.push(component.to_string());
+    }
+    numeric.push("0".to_string());
+    Ok(numeric.join(","))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::windows_resource_version;
+
+    #[test]
+    fn resource_version_uses_semver_core() {
+        assert_eq!(windows_resource_version("1.2.3").unwrap(), "1,2,3,0");
+        assert_eq!(
+            windows_resource_version("1.2.3-beta.1+build.7").unwrap(),
+            "1,2,3,0"
+        );
+    }
+
+    #[test]
+    fn resource_version_rejects_oversized_components() {
+        let error = windows_resource_version("1.65536.3").unwrap_err();
+        assert!(error.contains("65535"));
+    }
 }

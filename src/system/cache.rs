@@ -114,9 +114,16 @@ impl ProcessCache {
         &self,
         updates: &[(u32, u64, u64, u64, u64, u64)],
     ) -> HashMap<u32, (u64, u64)> {
+        self.update_times_batch_at(updates, Instant::now())
+    }
+
+    fn update_times_batch_at(
+        &self,
+        updates: &[(u32, u64, u64, u64, u64, u64)],
+        now: Instant,
+    ) -> HashMap<u32, (u64, u64)> {
         let mut io_rates = HashMap::with_capacity(updates.len());
         if let Ok(mut cache) = self.entries.write() {
-            let now = Instant::now();
             for &(pid, kernel_time, user_time, create_time, io_read, io_write) in updates {
                 let entry = cache.entry(pid).or_default();
                 // Detect PID reuse: if create_time changed, invalidate static fields
@@ -132,7 +139,9 @@ impl ProcessCache {
                 }
                 // First appearance (new PID or PID reuse): rate = 0, not a delta
                 let is_first = entry.create_time == 0 || entry.create_time != create_time;
-                let elapsed = now.duration_since(entry.io_updated).as_secs_f64();
+                let elapsed = now
+                    .saturating_duration_since(entry.io_updated)
+                    .as_secs_f64();
                 let read_rate = if is_first || elapsed <= 0.0 {
                     0
                 } else {
@@ -306,20 +315,64 @@ mod tests {
     #[test]
     fn test_batch_update_and_io_rates() {
         let cache = ProcessCache::new();
+        let start = Instant::now();
 
         // First tick: new process, rate should be 0
-        let rates = cache.update_times_batch(&[(100, 500, 600, 9999, 1000, 2000)]);
+        let rates = cache.update_times_batch_at(&[(100, 500, 600, 9999, 1000, 2000)], start);
         assert_eq!(rates[&100], (0, 0)); // First appearance → zero rate
 
         // Second tick: delta-based rate
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        let rates = cache.update_times_batch(&[(100, 700, 800, 9999, 1500, 2800)]);
-        assert!(rates[&100].0 > 0); // bytes/sec from 1500-1000 over elapsed time
-        assert!(rates[&100].1 > 0); // bytes/sec from 2800-2000 over elapsed time
+        let rates = cache.update_times_batch_at(
+            &[(100, 700, 800, 9999, 1500, 2800)],
+            start + std::time::Duration::from_secs(2),
+        );
+        assert_eq!(rates[&100], (250, 400));
 
         // PID reuse (different create_time): rate resets to 0
-        let rates = cache.update_times_batch(&[(100, 10, 20, 5555, 300, 400)]);
+        let rates = cache.update_times_batch_at(
+            &[(100, 10, 20, 5555, 300, 400)],
+            start + std::time::Duration::from_secs(3),
+        );
         assert_eq!(rates[&100], (0, 0));
+    }
+
+    #[test]
+    fn process_membership_changes_do_not_reset_survivor_io_rates() {
+        let cache = ProcessCache::new();
+        let start = Instant::now();
+        let first = [
+            (100, 10, 20, 1_000, 1_000, 2_000),
+            (200, 30, 40, 2_000, 9_000_000, 8_000_000),
+        ];
+        let rates = cache.update_times_batch_at(&first, start);
+        assert_eq!(rates[&100], (0, 0));
+        assert_eq!(rates[&200], (0, 0));
+
+        // PID 200 exits. PID 100's delta is still computed from its own identity.
+        let rates = cache.update_times_batch_at(
+            &[(100, 15, 25, 1_000, 1_300, 2_500)],
+            start + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(rates[&100], (300, 500));
+    }
+
+    #[test]
+    fn io_counter_reset_rebaselines_the_affected_direction() {
+        let cache = ProcessCache::new();
+        let start = Instant::now();
+        cache.update_times_batch_at(&[(100, 10, 20, 1_000, 1_000, 2_000)], start);
+
+        let rates = cache.update_times_batch_at(
+            &[(100, 15, 25, 1_000, 100, 2_200)],
+            start + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(rates[&100], (0, 200));
+
+        let rates = cache.update_times_batch_at(
+            &[(100, 20, 30, 1_000, 150, 2_300)],
+            start + std::time::Duration::from_secs(2),
+        );
+        assert_eq!(rates[&100], (50, 100));
     }
 
     #[test]

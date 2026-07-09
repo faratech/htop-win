@@ -1,10 +1,15 @@
 //! Installation and update functionality for htop-win
 
-use std::fs;
-use std::path::PathBuf;
+use std::cmp::Ordering;
+use std::fs::{self, File};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 #[cfg(windows)]
-use windows::Win32::Foundation::GetLastError;
+use windows::Win32::Foundation::{
+    CloseHandle, GetLastError, HANDLE, WAIT_ABANDONED, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+};
 #[cfg(windows)]
 use windows::Win32::Networking::WinHttp::{
     URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE,
@@ -13,6 +18,8 @@ use windows::Win32::Networking::WinHttp::{
     WinHttpOpenRequest, WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData,
     WinHttpReceiveResponse, WinHttpSendRequest,
 };
+#[cfg(windows)]
+use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 #[cfg(windows)]
 use windows::core::{PCWSTR, PWSTR, w};
 
@@ -52,6 +59,15 @@ pub fn install_to_path(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     let current_version = env!("CARGO_PKG_VERSION");
     let target_path = get_install_path()?;
 
+    if target_path.exists() && paths_refer_to_same_file(&current_exe, &target_path)? {
+        println!(
+            "htop {} is already installed and up to date.",
+            current_version
+        );
+        println!("Location: {}", target_path.display());
+        return Ok(());
+    }
+
     // Check if already installed and compare versions (unless force)
     if target_path.exists() && !force {
         if let Some(installed_version) = get_installed_version() {
@@ -87,24 +103,163 @@ pub fn install_to_path(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Parse version string to comparable tuple
-fn parse_version(version: &str) -> Option<(u32, u32, u32)> {
-    let parts: Vec<&str> = version.trim_start_matches('v').split('.').collect();
-    if parts.len() >= 3 {
-        Some((
-            parts[0].parse().ok()?,
-            parts[1].parse().ok()?,
-            parts[2].parse().ok()?,
-        ))
-    } else {
-        None
+fn paths_refer_to_same_file(source: &Path, target: &Path) -> io::Result<bool> {
+    let source_identity = file_identity(source)?;
+    if source_identity != (0, 0) && source_identity == file_identity(target)? {
+        return Ok(true);
+    }
+
+    let source = fs::canonicalize(source)?;
+    let target = fs::canonicalize(target)?;
+    Ok(source
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&target.to_string_lossy()))
+}
+
+#[repr(C)]
+struct FileInformation {
+    file_attributes: u32,
+    creation_time: [u32; 2],
+    last_access_time: [u32; 2],
+    last_write_time: [u32; 2],
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    #[link_name = "GetFileInformationByHandle"]
+    fn get_file_information_by_handle(
+        file: *mut std::ffi::c_void,
+        information: *mut FileInformation,
+    ) -> i32;
+}
+
+fn file_identity(path: &Path) -> io::Result<(u32, u64)> {
+    use std::os::windows::io::AsRawHandle;
+
+    let file = File::open(path)?;
+    let mut information = std::mem::MaybeUninit::<FileInformation>::uninit();
+    let succeeded = unsafe {
+        get_file_information_by_handle(file.as_raw_handle(), information.as_mut_ptr()) != 0
+    };
+    if !succeeded {
+        return Err(io::Error::last_os_error());
+    }
+    let information = unsafe { information.assume_init() };
+    let index =
+        (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
+    Ok((information.volume_serial_number, index))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SemVersion<'a> {
+    core: [&'a str; 3],
+    prerelease: Option<Vec<&'a str>>,
+}
+
+fn valid_identifier(identifier: &str) -> bool {
+    !identifier.is_empty()
+        && identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+/// Parse one optional `v` prefix followed by a strict SemVer string.
+fn parse_version(version: &str) -> Option<SemVersion<'_>> {
+    let version = version.strip_prefix('v').unwrap_or(version);
+    let (without_build, build) = version
+        .split_once('+')
+        .map_or((version, None), |(core, build)| (core, Some(build)));
+    if build.is_some_and(|build| {
+        build
+            .split('.')
+            .any(|identifier| !valid_identifier(identifier))
+    }) || without_build.contains('+')
+    {
+        return None;
+    }
+
+    let (core, prerelease) = without_build
+        .split_once('-')
+        .map_or((without_build, None), |(core, prerelease)| {
+            (core, Some(prerelease))
+        });
+    let core = core.split('.').collect::<Vec<_>>();
+    if core.len() != 3 || core.iter().any(|part| !valid_numeric_identifier(part)) {
+        return None;
+    }
+
+    let prerelease = match prerelease {
+        Some(prerelease) => {
+            let identifiers = prerelease.split('.').collect::<Vec<_>>();
+            if identifiers.iter().any(|identifier| {
+                !valid_identifier(identifier)
+                    || (identifier.bytes().all(|byte| byte.is_ascii_digit())
+                        && !valid_numeric_identifier(identifier))
+            }) {
+                return None;
+            }
+            Some(identifiers)
+        }
+        None => None,
+    };
+
+    Some(SemVersion {
+        core: [core[0], core[1], core[2]],
+        prerelease,
+    })
+}
+
+fn valid_numeric_identifier(identifier: &str) -> bool {
+    !identifier.is_empty()
+        && identifier.bytes().all(|byte| byte.is_ascii_digit())
+        && (identifier == "0" || !identifier.starts_with('0'))
+}
+
+fn compare_numeric_identifier(a: &str, b: &str) -> Ordering {
+    a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+}
+
+fn compare_versions(a: &SemVersion<'_>, b: &SemVersion<'_>) -> Ordering {
+    for (a, b) in a.core.iter().zip(b.core.iter()) {
+        let ordering = compare_numeric_identifier(a, b);
+        if ordering != Ordering::Equal {
+            return ordering;
+        }
+    }
+
+    match (&a.prerelease, &b.prerelease) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(a), Some(b)) => {
+            for (a, b) in a.iter().zip(b.iter()) {
+                let a_numeric = a.bytes().all(|byte| byte.is_ascii_digit());
+                let b_numeric = b.bytes().all(|byte| byte.is_ascii_digit());
+                let ordering = match (a_numeric, b_numeric) {
+                    (true, true) => compare_numeric_identifier(a, b),
+                    (true, false) => Ordering::Less,
+                    (false, true) => Ordering::Greater,
+                    (false, false) => a.cmp(b),
+                };
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            a.len().cmp(&b.len())
+        }
     }
 }
 
 /// Compare two version strings, returns true if `a` is newer than `b`
 pub fn is_newer_version(a: &str, b: &str) -> bool {
     match (parse_version(a), parse_version(b)) {
-        (Some(va), Some(vb)) => va > vb,
+        (Some(va), Some(vb)) => compare_versions(&va, &vb) == Ordering::Greater,
         _ => false,
     }
 }
@@ -172,35 +327,280 @@ fn validate_target_pe_executable(body: &[u8]) -> Result<(), String> {
     }
 }
 
-fn update_meta_path() -> PathBuf {
-    std::env::temp_dir().join("htop-win-update.meta")
+const UPDATE_FILE_NAME: &str = "htop-win-update.exe";
+const UPDATE_METADATA_NAME: &str = "htop-win-update.meta";
+const UPDATE_ROOT_NAME: &str = "htop-win-updates";
+const ABANDONED_STAGE_AGE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+static STAGE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone)]
+struct PendingUpdate {
+    version: String,
+    path: PathBuf,
+    generation_dir: Option<PathBuf>,
 }
 
-fn write_update_metadata(version: &str) {
-    let _ = fs::write(
-        update_meta_path(),
-        format!("version={version}\narch={}\n", target_arch()),
-    );
+fn update_root_path() -> PathBuf {
+    std::env::temp_dir()
+        .join(UPDATE_ROOT_NAME)
+        .join(target_arch())
 }
 
-fn pending_metadata_matches(expected_version: &str) -> bool {
-    pending_metadata_version()
-        .as_deref()
-        .is_some_and(|version| version == expected_version)
+fn legacy_update_path() -> PathBuf {
+    std::env::temp_dir().join(UPDATE_FILE_NAME)
 }
 
-fn pending_metadata_version() -> Option<String> {
-    let Ok(meta) = fs::read_to_string(update_meta_path()) else {
-        return None;
-    };
-    let version = meta
+fn legacy_update_meta_path() -> PathBuf {
+    std::env::temp_dir().join(UPDATE_METADATA_NAME)
+}
+
+fn update_metadata(version: &str) -> String {
+    format!("version={version}\narch={}\n", target_arch())
+}
+
+fn read_update_metadata(path: &Path) -> Result<String, String> {
+    let metadata = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read update metadata: {error}"))?;
+    let version = metadata
         .lines()
         .find_map(|line| line.strip_prefix("version="))
-        .map(str::to_string)?;
-    let arch_matches = meta
+        .ok_or_else(|| "update metadata is missing a version".to_string())?;
+    if parse_version(version).is_none() {
+        return Err(format!("update metadata has invalid SemVer: {version}"));
+    }
+    if !metadata
         .lines()
-        .any(|line| line == format!("arch={}", target_arch()));
-    arch_matches.then_some(version)
+        .any(|line| line == format!("arch={}", target_arch()))
+    {
+        return Err(format!(
+            "update metadata architecture does not match {}",
+            target_arch()
+        ));
+    }
+    Ok(version.to_string())
+}
+
+fn unique_generation_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let counter = STAGE_COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+    format!("{}-{nanos}-{counter}", std::process::id())
+}
+
+fn write_synced_file(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(contents)?;
+    file.sync_all()
+}
+
+/// Write a complete update pair into a private directory, then publish it with
+/// one same-volume directory rename. Readers never observe a partial pair.
+fn stage_pending_update(version: &str, body: &[u8]) -> Result<PendingUpdate, String> {
+    stage_pending_update_in(&update_root_path(), version, body)
+}
+
+fn stage_pending_update_in(
+    root: &Path,
+    version: &str,
+    body: &[u8],
+) -> Result<PendingUpdate, String> {
+    validate_target_pe_executable(body)
+        .map_err(|error| format!("downloaded update rejected: {error}"))?;
+    if parse_version(version).is_none() {
+        return Err(format!("release returned invalid SemVer: {version}"));
+    }
+
+    fs::create_dir_all(root)
+        .map_err(|error| format!("failed to create update staging directory: {error}"))?;
+    let id = unique_generation_id();
+    let staging_dir = root.join(format!(".stage-{id}"));
+    let generation_dir = root.join(format!("pending-{id}"));
+    fs::create_dir(&staging_dir)
+        .map_err(|error| format!("failed to create private update stage: {error}"))?;
+
+    let result = (|| -> Result<(), String> {
+        write_synced_file(&staging_dir.join(UPDATE_FILE_NAME), body)
+            .map_err(|error| format!("failed to write staged update: {error}"))?;
+        write_synced_file(
+            &staging_dir.join(UPDATE_METADATA_NAME),
+            update_metadata(version).as_bytes(),
+        )
+        .map_err(|error| format!("failed to write staged update metadata: {error}"))?;
+        fs::rename(&staging_dir, &generation_dir)
+            .map_err(|error| format!("failed to publish staged update: {error}"))?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(error);
+    }
+
+    Ok(PendingUpdate {
+        version: version.to_string(),
+        path: generation_dir.join(UPDATE_FILE_NAME),
+        generation_dir: Some(generation_dir),
+    })
+}
+
+fn validate_pending_pair(update_path: &Path, metadata_path: &Path) -> Result<String, String> {
+    let version = read_update_metadata(metadata_path)?;
+    let body =
+        fs::read(update_path).map_err(|error| format!("failed to read pending update: {error}"))?;
+    validate_target_pe_executable(&body)
+        .map_err(|error| format!("pending update rejected: {error}"))?;
+    Ok(version)
+}
+
+fn load_pending_generations(root: &Path) -> Result<Vec<PendingUpdate>, String> {
+    let mut updates = Vec::new();
+    if root.exists() {
+        let entries = fs::read_dir(root)
+            .map_err(|error| format!("failed to inspect pending updates: {error}"))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("failed to inspect update entry: {error}"))?;
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_name.starts_with(".stage-") {
+                let abandoned = entry
+                    .metadata()
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age >= ABANDONED_STAGE_AGE);
+                if abandoned {
+                    let _ = fs::remove_dir_all(path);
+                }
+                continue;
+            }
+            if !file_name.starts_with("pending-") || !path.is_dir() {
+                continue;
+            }
+
+            let update_path = path.join(UPDATE_FILE_NAME);
+            let metadata_path = path.join(UPDATE_METADATA_NAME);
+            match validate_pending_pair(&update_path, &metadata_path) {
+                Ok(version) => updates.push(PendingUpdate {
+                    version,
+                    path: update_path,
+                    generation_dir: Some(path),
+                }),
+                Err(_) => {
+                    let _ = fs::remove_dir_all(path);
+                }
+            }
+        }
+    }
+    Ok(updates)
+}
+
+fn load_pending_updates() -> Result<Vec<PendingUpdate>, String> {
+    let mut updates = load_pending_generations(&update_root_path())?;
+    let legacy_update = legacy_update_path();
+    let legacy_metadata = legacy_update_meta_path();
+    if legacy_update.exists() || legacy_metadata.exists() {
+        match validate_pending_pair(&legacy_update, &legacy_metadata) {
+            Ok(version) => updates.push(PendingUpdate {
+                version,
+                path: legacy_update,
+                generation_dir: None,
+            }),
+            Err(_) => {
+                let _ = fs::remove_file(legacy_update);
+                let _ = fs::remove_file(legacy_metadata);
+            }
+        }
+    }
+    Ok(updates)
+}
+
+fn remove_pending_update(update: &PendingUpdate) {
+    if let Some(generation_dir) = &update.generation_dir {
+        let _ = fs::remove_dir_all(generation_dir);
+    } else {
+        let _ = fs::remove_file(&update.path);
+        let _ = fs::remove_file(legacy_update_meta_path());
+    }
+}
+
+fn newest_pending_update(updates: &[PendingUpdate]) -> Option<PendingUpdate> {
+    updates
+        .iter()
+        .filter(|update| is_newer_version(&update.version, env!("CARGO_PKG_VERSION")))
+        .max_by(|a, b| {
+            let a = parse_version(&a.version).expect("pending versions were validated");
+            let b = parse_version(&b.version).expect("pending versions were validated");
+            compare_versions(&a, &b)
+        })
+        .cloned()
+}
+
+struct UpdateLock {
+    handle: HANDLE,
+}
+
+fn update_mutex_name() -> Vec<u16> {
+    // Global namespace covers console/RDP sessions. Hash the per-user temp
+    // path so unrelated users do not contend for, or need access to, the same
+    // kernel object.
+    let mut hash = 0xcbf29ce484222325u64;
+    let lock_identity = get_install_path().unwrap_or_else(|_| std::env::temp_dir());
+    for byte in lock_identity.to_string_lossy().to_lowercase().bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("Global\\htop-win-update-{hash:016x}")
+        .encode_utf16()
+        .chain(Some(0))
+        .collect()
+}
+
+impl UpdateLock {
+    fn acquire() -> io::Result<Self> {
+        unsafe {
+            // A kernel mutex is released automatically if its owner exits, so
+            // crash recovery cannot race with a new owner the way stale lock-
+            // file deletion can.
+            let name = update_mutex_name();
+            let handle = CreateMutexW(None, false, PCWSTR(name.as_ptr()))
+                .map_err(|error| io::Error::other(format!("CreateMutexW failed: {error}")))?;
+            let wait = WaitForSingleObject(handle, 5_000);
+            if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+                return Ok(Self { handle });
+            }
+
+            let error = if wait == WAIT_TIMEOUT {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "timed out waiting for the update lock",
+                )
+            } else if wait == WAIT_FAILED {
+                io::Error::last_os_error()
+            } else {
+                io::Error::other(format!(
+                    "unexpected update mutex wait result: {:#x}",
+                    wait.0
+                ))
+            };
+            let _ = CloseHandle(handle);
+            Err(error)
+        }
+    }
+}
+
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.handle);
+            let _ = CloseHandle(self.handle);
+        }
+    }
 }
 
 /// Helper struct to automatically close WinHTTP handles
@@ -385,7 +785,7 @@ pub fn get_latest_release() -> Result<(String, String), Box<dyn std::error::Erro
 
     // Parse JSON manually to avoid complex deps
     // We look for "tag_name": "vX.Y.Z"
-    let version = json_text
+    let release_tag = json_text
         .split("\"tag_name\"")
         .nth(1)
         .and_then(|s| s.split(':').nth(1))
@@ -395,9 +795,14 @@ pub fn get_latest_release() -> Result<(String, String), Box<dyn std::error::Erro
                 "Failed to parse tag_name from GitHub API response (body length: {} bytes)",
                 json_text.len()
             )
-        })?
-        .trim_start_matches('v')
+        })?;
+    let version = release_tag
+        .strip_prefix('v')
+        .ok_or_else(|| format!("Release tag must start with 'v': {release_tag}"))?
         .to_string();
+    if parse_version(&version).is_none() {
+        return Err(format!("Release tag is not strict SemVer: {release_tag}").into());
+    }
 
     // Detect architecture
     let target_arch = target_arch();
@@ -435,18 +840,8 @@ pub fn get_latest_release() -> Result<(String, String), Box<dyn std::error::Erro
     Ok((version, download_url))
 }
 
-/// Clean up any leftover temp files from previous updates
-fn cleanup_temp_files() {
-    let temp_dir = std::env::temp_dir();
-    let _ = fs::remove_file(temp_dir.join("htop-win-update.exe"));
-    let _ = fs::remove_file(update_meta_path());
-}
-
 /// Update htop-win from GitHub releases
 pub fn update_from_github(force: bool) -> Result<(), Box<dyn std::error::Error>> {
-    // Clean up any old temp files from previous failed updates
-    cleanup_temp_files();
-
     println!("Checking for updates...");
 
     let (latest_version, download_url) = match get_latest_release() {
@@ -472,139 +867,190 @@ pub fn update_from_github(force: bool) -> Result<(), Box<dyn std::error::Error>>
     }
     println!("Downloading from GitHub...");
 
-    // Download to temp file
-    let temp_dir = std::env::temp_dir();
-    let temp_file = temp_dir.join("htop-win-update.exe");
+    let body = native_http_get(&download_url)
+        .map_err(|error| format!("Failed to download update: {error}"))?;
 
-    let body = native_http_get(&download_url)?;
-    validate_target_pe_executable(&body)
-        .map_err(|e| format!("Downloaded update rejected: {}", e))?;
-    fs::write(&temp_file, body)?;
-    write_update_metadata(&latest_version);
+    // Serialize publication and replacement, not the network request. A
+    // published generation must never be visible to another instance's
+    // cleanup/apply pass before this explicit install consumes it.
+    let _lock = UpdateLock::acquire()?;
+    let pending = stage_pending_update(&latest_version, &body)?;
 
     println!("Download complete. Installing...");
 
-    // Install directly - %LOCALAPPDATA%\Microsoft\WindowsApps is user-writable
-    do_install_update(&temp_file)
+    let target_path = get_install_path()?;
+    install_update_file(&pending.path, &target_path)?;
+    remove_pending_update(&pending);
+    print_update_success(&target_path);
+    Ok(())
 }
 
-/// Install an update from a downloaded file (called from elevated process)
-pub fn do_install_update(update_file: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-    let target_path = get_install_path()?;
-
-    // Ensure parent directory exists
+fn install_update_file(update_file: &Path, target_path: &Path) -> io::Result<()> {
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
-    // If target exists, use rename trick (Windows allows renaming running exe)
-    if target_path.exists() {
-        let backup_path = target_path.with_extension("exe.old");
-        let _ = fs::remove_file(&backup_path); // Remove old backup if exists
-
-        // Rename current exe to .old
-        fs::rename(&target_path, &backup_path)?;
-
-        // Copy new version
-        if let Err(e) = fs::copy(update_file, &target_path) {
-            // Failed - restore backup
-            let _ = fs::rename(&backup_path, &target_path);
-            return Err(e.into());
-        }
-
-        // Clean up backup - ignore errors as running process might lock it
-        let _ = fs::remove_file(&backup_path);
-    } else {
-        // No existing file, just copy
-        fs::copy(update_file, &target_path)?;
+    if !target_path.exists() {
+        fs::copy(update_file, target_path)?;
+        return Ok(());
     }
 
-    // Clean up temp file
-    let _ = fs::remove_file(update_file);
+    let backup_path = target_path.with_extension("exe.old");
+    let _ = fs::remove_file(&backup_path);
+    fs::rename(target_path, &backup_path)?;
 
-    // Get version of newly installed binary
+    if let Err(error) = fs::copy(update_file, target_path) {
+        let _ = fs::rename(&backup_path, target_path);
+        return Err(error);
+    }
+
+    // A running old executable may remain locked until this process exits.
+    let _ = fs::remove_file(backup_path);
+    Ok(())
+}
+
+fn print_update_success(target_path: &Path) {
     let version = get_installed_version().unwrap_or_else(|| "unknown".to_string());
-
     println!("Successfully updated to htop {}!", version);
     println!("Location: {}", target_path.display());
     println!("\nRestart htop to use the new version.");
+}
+
+fn remove_installed_update_file(update_file: &Path) {
+    let update_root = update_root_path();
+    let generation_dir = update_file.parent();
+    let is_managed_generation = generation_dir
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with("pending-"))
+        && generation_dir.and_then(Path::parent) == Some(update_root.as_path());
+    if is_managed_generation {
+        let _ = fs::remove_dir_all(generation_dir.expect("generation directory was checked"));
+    } else {
+        let _ = fs::remove_file(update_file);
+    }
+}
+
+/// Install an update from a downloaded file.
+pub fn do_install_update(update_file: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
+    let _lock = UpdateLock::acquire()?;
+    let target_path = get_install_path()?;
+    install_update_file(update_file, &target_path)?;
+    remove_installed_update_file(update_file);
+    print_update_success(&target_path);
     Ok(())
 }
 
 /// Update status for background updates
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum UpdateStatus {
     /// A newer version is available and has been downloaded
     Downloaded { version: String, path: PathBuf },
-    /// No update available or error occurred
-    None,
+    /// GitHub was reached successfully and no newer release exists
+    UpToDate,
+    /// The check or download failed; the application may retry later
+    Failed(String),
 }
 
 /// Check for updates and download if available (for background auto-update)
 /// Returns UpdateStatus indicating what happened
 pub fn check_and_download_update() -> UpdateStatus {
-    let temp_dir = std::env::temp_dir();
-    let temp_file = temp_dir.join("htop-win-update.exe");
-
-    // If update already downloaded and pending, report it without re-downloading
-    if temp_file.exists()
-        && let Ok(pending) = fs::read(&temp_file)
-    {
-        if validate_target_pe_executable(&pending).is_ok() {
-            // A non-empty pending update exists. Act only on a definitive answer
-            // from GitHub: report it if newer, delete it only if CONFIRMED stale.
-            // On a transient API failure, keep it — don't discard a valid,
-            // already-downloaded update just because the check momentarily failed.
-            match get_latest_release() {
-                Ok((latest_version, _)) => {
-                    let current_version = env!("CARGO_PKG_VERSION");
-                    if is_newer_version(&latest_version, current_version)
-                        && pending_metadata_matches(&latest_version)
-                    {
-                        return UpdateStatus::Downloaded {
-                            version: latest_version,
-                            path: temp_file,
-                        };
-                    }
-                    // Confirmed not newer than current -- the pending file is stale.
-                    let _ = fs::remove_file(&temp_file);
-                    let _ = fs::remove_file(update_meta_path());
-                }
-                Err(_) => {
-                    // Couldn't reach GitHub; preserve the pending update for retry.
-                    return UpdateStatus::None;
-                }
-            }
-        } else {
-            let _ = fs::remove_file(&temp_file);
-        }
-    }
-
     let current_version = env!("CARGO_PKG_VERSION");
-
     let (latest_version, download_url) = match get_latest_release() {
         Ok(v) => v,
-        Err(_) => return UpdateStatus::None,
+        Err(error) => return UpdateStatus::Failed(error.to_string()),
     };
 
     if !is_newer_version(&latest_version, current_version) {
-        return UpdateStatus::None;
-    }
-
-    match native_http_get(&download_url) {
-        Ok(body) if validate_target_pe_executable(&body).is_ok() => {
-            if fs::write(&temp_file, body).is_ok() {
-                write_update_metadata(&latest_version);
-                UpdateStatus::Downloaded {
-                    version: latest_version,
-                    path: temp_file,
+        if let Ok(_lock) = UpdateLock::acquire()
+            && let Ok(updates) = load_pending_updates()
+        {
+            for update in updates {
+                if !is_newer_version(&update.version, current_version) {
+                    remove_pending_update(&update);
                 }
-            } else {
-                UpdateStatus::None
             }
         }
-        _ => UpdateStatus::None,
+        return UpdateStatus::UpToDate;
     }
+
+    // Inspect existing generations only after the network request, under the
+    // mutex. A pre-request snapshot can be consumed by another instance while
+    // GitHub is in flight and must never be returned as if it still existed.
+    {
+        let _lock = match UpdateLock::acquire() {
+            Ok(lock) => lock,
+            Err(error) => {
+                return UpdateStatus::Failed(format!("Failed to inspect pending updates: {error}"));
+            }
+        };
+        match load_pending_updates() {
+            Ok(updates) => {
+                if let Some(update) = updates
+                    .into_iter()
+                    .find(|update| update.version == latest_version)
+                {
+                    return UpdateStatus::Downloaded {
+                        version: update.version,
+                        path: update.path,
+                    };
+                }
+            }
+            Err(error) => return UpdateStatus::Failed(error),
+        }
+    }
+
+    let body = match native_http_get(&download_url) {
+        Ok(body) => body,
+        Err(error) => return UpdateStatus::Failed(format!("Update download failed: {error}")),
+    };
+
+    // Recheck under the publication lock: another instance may have staged
+    // this release while the network request was in flight.
+    let _lock = match UpdateLock::acquire() {
+        Ok(lock) => lock,
+        Err(error) => {
+            return UpdateStatus::Failed(format!("Failed to stage update: {error}"));
+        }
+    };
+    match load_pending_updates() {
+        Ok(updates) => {
+            if let Some(update) = updates
+                .into_iter()
+                .find(|update| update.version == latest_version)
+            {
+                return UpdateStatus::Downloaded {
+                    version: update.version,
+                    path: update.path,
+                };
+            }
+        }
+        Err(error) => return UpdateStatus::Failed(error),
+    }
+    match stage_pending_update(&latest_version, &body) {
+        Ok(update) => UpdateStatus::Downloaded {
+            version: update.version,
+            path: update.path,
+        },
+        Err(error) => UpdateStatus::Failed(error),
+    }
+}
+
+fn pending_update_for_current_version() -> Result<Option<PendingUpdate>, String> {
+    let updates = load_pending_updates()?;
+    let pending = newest_pending_update(&updates);
+    for update in updates {
+        if pending
+            .as_ref()
+            .is_some_and(|pending| pending.path == update.path)
+        {
+            continue;
+        }
+        if !is_newer_version(&update.version, env!("CARGO_PKG_VERSION")) {
+            remove_pending_update(&update);
+        }
+    }
+    Ok(pending)
 }
 
 /// Spawn a background thread to check and download updates
@@ -625,87 +1071,37 @@ pub fn spawn_update_check() -> std::sync::mpsc::Receiver<UpdateStatus> {
 /// Check for and apply pending update on startup (call before UI starts)
 /// Returns true if an update was applied (caller should continue normally)
 pub fn apply_pending_update() -> bool {
-    let temp_dir = std::env::temp_dir();
-    let update_file = temp_dir.join("htop-win-update.exe");
-
-    // Get the currently running executable - this is what we need to update
     let current_exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(_) => return false,
     };
-
-    if !update_file.exists() {
-        // Clean up any old backup files from previous updates
-        let backup_path = current_exe.with_extension("exe.old");
-        // Only remove backup if it's not the running file (unlikely but safe)
-        let _ = fs::remove_file(&backup_path);
-        return false;
-    }
-
-    // Verify update file integrity before installing it over the working exe.
-    // The pending file may have been written by an older htop-win without
-    // download-time validation, so this gate must not rely on the downloader.
-    let pending_version = pending_metadata_version();
-    let current_version = env!("CARGO_PKG_VERSION");
-    match fs::read(&update_file) {
-        Ok(body)
-            if validate_target_pe_executable(&body).is_ok()
-                && pending_version
-                    .as_deref()
-                    .is_some_and(|version| is_newer_version(version, current_version)) => {}
-        Ok(_) => {
-            // Not a plausible executable — discard rather than install
-            let _ = fs::remove_file(&update_file);
-            let _ = fs::remove_file(update_meta_path());
-            return false;
-        }
-        Err(_) => return false,
-    }
-
-    let install_path = current_exe;
-
-    // If install path doesn't exist, just copy directly
-    if !install_path.exists() {
-        if fs::copy(&update_file, &install_path).is_ok() {
-            let _ = fs::remove_file(&update_file);
-            let _ = fs::remove_file(update_meta_path());
-            eprintln!("Update installed successfully!");
+    let _lock = match UpdateLock::acquire() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("Update pending (cannot acquire update lock: {error})");
             return true;
         }
-        return false;
-    }
-
-    // Rename current exe to .old (Windows allows renaming running exe)
-    let backup_path = install_path.with_extension("exe.old");
-    let _ = fs::remove_file(&backup_path); // Remove old backup if exists
-
-    if let Err(e) = fs::rename(&install_path, &backup_path) {
-        // Can't rename - keep update file for retry on next restart
-        eprintln!("Update pending (cannot rename running exe: {})", e);
-        return true; // Return true to skip re-download
-    }
-
-    // Copy new version to install location
-    if let Err(e) = fs::copy(&update_file, &install_path) {
-        // Failed to copy, restore backup
-        eprintln!("Update failed (copy error: {}), restoring backup", e);
-        if let Err(e2) = fs::rename(&backup_path, &install_path) {
-            eprintln!(
-                "CRITICAL: Failed to restore backup: {}. Working executable is at: {:?}",
-                e2, backup_path
-            );
+    };
+    let pending = match pending_update_for_current_version() {
+        Ok(Some(update)) => update,
+        Ok(None) => {
+            // Clean up any old backup files from previous updates.
+            let backup_path = current_exe.with_extension("exe.old");
+            let _ = fs::remove_file(&backup_path);
+            return false;
         }
-        // Keep update file for retry
-        return true; // Return true to skip re-download
+        Err(error) => {
+            eprintln!("Update pending (cannot inspect update files: {error})");
+            return true;
+        }
+    };
+
+    if let Err(error) = install_update_file(&pending.path, &current_exe) {
+        eprintln!("Update pending (installation failed: {error})");
+        return true;
     }
 
-    // Clean up update file ONLY on success
-    let _ = fs::remove_file(&update_file);
-    let _ = fs::remove_file(update_meta_path());
-
-    // Try to remove backup, but ignore error if locked (it's the running executable)
-    let _ = fs::remove_file(&backup_path);
-
+    remove_pending_update(&pending);
     eprintln!("Update applied successfully!");
     true
 }
@@ -722,7 +1118,12 @@ mod tests {
         body[1] = b'Z';
         body[0x3c..0x40].copy_from_slice(&0x80u32.to_le_bytes());
         body[0x80..0x84].copy_from_slice(b"PE\0\0");
+        body[0x84..0x86].copy_from_slice(&target_machine().to_le_bytes());
         body
+    }
+
+    fn test_directory(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("htop-win-test-{name}-{}", unique_generation_id()))
     }
 
     #[test]
@@ -774,8 +1175,135 @@ mod tests {
     fn test_is_newer_version() {
         assert!(is_newer_version("0.2.0", "0.1.10"));
         assert!(is_newer_version("0.10.0", "0.9.9"));
+        assert!(is_newer_version("1.0.0", "1.0.0-rc.1"));
+        assert!(is_newer_version("1.0.0-beta.11", "1.0.0-beta.2"));
         assert!(!is_newer_version("0.1.10", "0.2.0"));
         assert!(!is_newer_version("1.0.0", "1.0.0"));
+        assert!(!is_newer_version("1.0.0+build.2", "1.0.0+build.1"));
         assert!(!is_newer_version("garbage", "1.0.0"));
+
+        let precedence = [
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.beta",
+            "1.0.0-beta",
+            "1.0.0-beta.2",
+            "1.0.0-beta.11",
+            "1.0.0-rc.1",
+            "1.0.0",
+        ];
+        for versions in precedence.windows(2) {
+            assert!(is_newer_version(versions[1], versions[0]));
+        }
+    }
+
+    #[test]
+    fn test_parse_version_rejects_malformed_semver() {
+        for version in [
+            "1.2.3junk",
+            "01.2.3",
+            "1.02.3",
+            "1.2.03",
+            "1.2",
+            "1.2.3-01",
+            "1.2.3-",
+            "1.2.3+",
+            "vv1.2.3",
+        ] {
+            assert!(parse_version(version).is_none(), "accepted {version}");
+        }
+    }
+
+    #[test]
+    fn test_parse_version_accepts_prerelease_and_build_metadata() {
+        assert!(parse_version("1.2.3-beta.1+build.7").is_some());
+        assert!(parse_version("v1.2.3-rc.1").is_some());
+    }
+
+    #[test]
+    fn test_paths_refer_to_same_file_detects_hard_link() {
+        let directory = test_directory("same-file");
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.exe");
+        let alias = directory.join("alias.exe");
+        fs::write(&source, b"same file").unwrap();
+        fs::hard_link(&source, &alias).unwrap();
+
+        assert!(paths_refer_to_same_file(&source, &alias).unwrap());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn test_stage_pending_update_publishes_complete_pair() {
+        let root = test_directory("atomic-stage");
+        let update = stage_pending_update_in(&root, "1.2.3-beta.1+build.7", &synthetic_pe())
+            .expect("stage should succeed");
+
+        assert_eq!(
+            validate_pending_pair(
+                &update.path,
+                &update
+                    .generation_dir
+                    .as_ref()
+                    .unwrap()
+                    .join(UPDATE_METADATA_NAME),
+            )
+            .unwrap(),
+            "1.2.3-beta.1+build.7"
+        );
+        assert!(fs::read_dir(&root).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".stage-")
+        }));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_concurrent_stages_do_not_overwrite_each_other() {
+        let root = test_directory("concurrent-stage");
+        let body = synthetic_pe();
+        let handles = (0..4)
+            .map(|index| {
+                let root = root.clone();
+                let body = body.clone();
+                std::thread::spawn(move || {
+                    stage_pending_update_in(&root, &format!("1.2.{}", index + 3), &body)
+                        .expect("concurrent stage should succeed")
+                })
+            })
+            .collect::<Vec<_>>();
+        let updates = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(updates.len(), 4);
+        assert!(updates.iter().all(|update| update.path.exists()));
+        let mut paths = updates
+            .iter()
+            .map(|update| update.path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        assert_eq!(paths.len(), 4);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn test_invalid_generation_cleanup_preserves_valid_pending_update() {
+        let root = test_directory("preserve-valid");
+        let valid = stage_pending_update_in(&root, "1.2.3", &synthetic_pe()).unwrap();
+        let invalid = stage_pending_update_in(&root, "1.2.4", &synthetic_pe()).unwrap();
+        fs::write(&invalid.path, b"truncated").unwrap();
+
+        let updates = load_pending_generations(&root).unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].path, valid.path);
+        assert!(valid.path.exists());
+        assert!(!invalid.generation_dir.unwrap().exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }

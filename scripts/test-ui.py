@@ -228,7 +228,7 @@ class UITester:
             "Tasks": "Tasks: 245, 892 thr",
             "Uptime": "Uptime: 12:34:56",
             "Header": "  PID USER      PRI  NI  VIRT   RES   SHR S CPU% MEM%   TIME+  Command",
-            "Footer": "F1Help  F2Setup F3Search F4Filter F5Tree  F6Sort F7Pri F8Pri F9Kill F10Quit",
+            "Footer": "F1Help  F2Setup F3Search F4Filter F5Tree  F6Sort F7Pri F8Pri F9Force F10Quit",
         }
 
         all_passed = True

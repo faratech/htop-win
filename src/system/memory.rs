@@ -1,3 +1,5 @@
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use std::sync::OnceLock;
 
 /// Cached page size - never changes at runtime

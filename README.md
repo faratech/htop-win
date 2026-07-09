@@ -53,7 +53,7 @@ Windows Task Manager is fine, but power users deserve better. **htop-win** bring
 - **Tree view**: Visualize parent-child process relationships with collapsible branches
 - **Search & Filter**: Find processes instantly with live search
 - **Process tagging**: Select multiple processes for batch operations
-- **Kill processes**: Graceful termination or force kill
+- **Terminate processes**: Force terminate the selected process or tagged processes
 - **Priority control**: Change process priority class (Idle → Realtime)
 - **CPU affinity**: Pin processes to specific CPU cores
 
@@ -109,13 +109,15 @@ Download the latest release for your architecture:
 
 ### Install to PATH
 
-Run with administrator privileges to install globally:
+Run the downloaded executable as your normal user:
 
 ```powershell
 .\htop-win-amd64.exe --install
 ```
 
-This installs to `%LOCALAPPDATA%\Microsoft\WindowsApps\htop.exe`, making `htop` available from any terminal.
+This performs a per-user install to `%LOCALAPPDATA%\Microsoft\WindowsApps\htop.exe`,
+which is already on the user's `PATH`. Administrator privileges and UAC elevation
+are not required.
 
 ### Update
 
@@ -158,11 +160,14 @@ Options:
   -d, --delay <MS>          Refresh rate in milliseconds [default: 1500]
   -u, --user <USER>         Show only processes from this user
   -p, --pid <PID,...>       Show only these PIDs (comma-separated)
-  -s, --sort <COLUMN>       Sort by: pid, ppid, cpu, mem, time, command, user, threads
+  -s, --sort <COLUMN>       Sort by: pid, ppid, cpu/cpu%, mem/mem%/memory, time,
+                            command/cmd, user, threads/thr
   -t, --tree                Start in tree view mode
   -F, --filter <STRING>     Initial filter string
-  -H, --highlight <SECS>    Highlight new processes for N seconds
-  -n, --iterations <N>      Exit after N updates (for scripting)
+  -H, --highlight-changes <SECS>
+      --highlight <SECS>    Highlight new processes for N seconds
+  -n, --max-iterations <N>
+      --iterations <N>      Exit after N updates (for scripting)
       --benchmark[=<N>]     Run N iterations and print timing stats [default: 20]
       --benchmark-iterations <N>
                             Run benchmark mode with N iterations
@@ -170,8 +175,8 @@ Options:
       --no-color            Monochrome mode
       --no-mouse            Disable mouse support
       --no-meters           Hide header meters
-      --readonly            Disable kill/priority operations
-      --install             Install to PATH (requires admin)
+      --readonly            Disable process mutation operations
+      --install             Install per-user to PATH (no administrator required)
       --update              Check for and install updates
       --gpu-debug           Print GPU/NPU adapter diagnostics and exit
       --cpu-debug           Print CPU / processor-group diagnostics and exit
@@ -197,6 +202,11 @@ htop -F chrome
 
 # Monitor specific PIDs
 htop -p 1234,5678,9012
+
+# Benchmark with the default or an explicit iteration count
+htop --benchmark
+htop --benchmark=50
+htop --benchmark-iterations 50
 ```
 
 ---
@@ -227,7 +237,7 @@ htop -p 1234,5678,9012
 | `F6` / `<` `>` | Change sort column |
 | `F7` / `]` | Raise priority (opens dialog one class higher, Enter to apply) |
 | `F8` / `[` | Lower priority (opens dialog one class lower, Enter to apply) |
-| `F9` | Kill process |
+| `F9` | Force terminate process |
 | `F10` / `q` | Quit |
 
 ### Process Operations

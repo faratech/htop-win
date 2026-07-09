@@ -11,8 +11,8 @@
 // injects the version from Cargo.toml at compile time, so only Cargo.toml
 // needs bumping on release.
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     0,0,0,0
-PRODUCTVERSION  0,0,0,0
+FILEVERSION     0,2,7,0
+PRODUCTVERSION  0,2,7,0
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0
 FILEOS          VOS_NT_WINDOWS32
@@ -25,12 +25,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "htop-win contributors"
             VALUE "FileDescription",  "Interactive process viewer for Windows"
-            VALUE "FileVersion",      "0.0.0"
+            VALUE "FileVersion",      "0.2.7"
             VALUE "InternalName",     "htop-win"
             VALUE "LegalCopyright",   "MIT License"
             VALUE "OriginalFilename", "htop-win.exe"
             VALUE "ProductName",      "htop-win"
-            VALUE "ProductVersion",   "0.0.0"
+            VALUE "ProductVersion",   "0.2.7"
         END
     END
     BLOCK "VarFileInfo"

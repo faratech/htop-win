@@ -1,3 +1,5 @@
+#![cfg_attr(not(windows), allow(dead_code))]
+
 #[cfg(windows)]
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -7,7 +9,9 @@ use std::time::Duration;
 use super::native::{SystemProcess, filetime_to_unix};
 
 #[cfg(windows)]
-use windows::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, SetLastError, WIN32_ERROR};
+use windows::Win32::Foundation::{
+    CloseHandle, FILETIME, GetLastError, HANDLE, SetLastError, WIN32_ERROR,
+};
 #[cfg(windows)]
 use windows::Win32::Security::{
     AdjustTokenPrivileges, GetTokenInformation, LUID_AND_ATTRIBUTES, LookupAccountSidW,
@@ -23,12 +27,13 @@ use windows::Win32::System::Threading::IO_COUNTERS;
 #[cfg(windows)]
 use windows::Win32::System::Threading::{
     ABOVE_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS, GetCurrentProcess,
-    GetProcessInformation, GetProcessIoCounters, HIGH_PRIORITY_CLASS, IDLE_PRIORITY_CLASS,
-    IsWow64Process2, NORMAL_PRIORITY_CLASS, OpenProcess, OpenProcessToken,
-    PROCESS_MACHINE_INFORMATION, PROCESS_NAME_WIN32, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-    PROCESS_POWER_THROTTLING_STATE, PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION,
-    PROCESS_SET_INFORMATION, PROCESS_TERMINATE, ProcessMachineTypeInfo, ProcessPowerThrottling,
-    QueryFullProcessImageNameW, REALTIME_PRIORITY_CLASS, SetPriorityClass, TerminateProcess,
+    GetProcessInformation, GetProcessIoCounters, GetProcessTimes, HIGH_PRIORITY_CLASS,
+    IDLE_PRIORITY_CLASS, IsWow64Process2, NORMAL_PRIORITY_CLASS, OpenProcess, OpenProcessToken,
+    PROCESS_ACCESS_RIGHTS, PROCESS_MACHINE_INFORMATION, PROCESS_NAME_WIN32,
+    PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_STATE,
+    PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SET_INFORMATION,
+    PROCESS_TERMINATE, ProcessMachineTypeInfo, ProcessPowerThrottling, QueryFullProcessImageNameW,
+    REALTIME_PRIORITY_CLASS, SetPriorityClass, TerminateProcess,
 };
 #[cfg(windows)]
 use windows::core::PWSTR;
@@ -160,6 +165,127 @@ impl ProcessArch {
     }
 }
 
+/// Stable identity for a Windows process. PIDs are reusable, so process actions
+/// must pair them with the creation timestamp captured from the same snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ProcessIdentity {
+    pub pid: u32,
+    pub create_time_100ns: u64,
+}
+
+/// Metadata fields an enrichment pass is allowed to query. Canonical
+/// all-process passes use only their active filter/sort dependencies; visible
+/// rows request the full set.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessEnrichmentRequirements {
+    pub user: bool,
+    pub elevation: bool,
+    pub arch: bool,
+    pub efficiency: bool,
+    pub exe_path: bool,
+}
+
+impl ProcessEnrichmentRequirements {
+    const USER: u8 = 1 << 0;
+    const ELEVATION: u8 = 1 << 1;
+    const ARCH: u8 = 1 << 2;
+    const EFFICIENCY: u8 = 1 << 3;
+    const EXE_PATH: u8 = 1 << 4;
+
+    pub fn visible(fetch_exe_path: bool) -> Self {
+        Self {
+            user: true,
+            elevation: true,
+            arch: true,
+            efficiency: true,
+            exe_path: fetch_exe_path,
+        }
+    }
+
+    pub fn any(self) -> bool {
+        self.user || self.elevation || self.arch || self.efficiency || self.exe_path
+    }
+
+    pub fn bits(self) -> u8 {
+        (u8::from(self.user) * Self::USER)
+            | (u8::from(self.elevation) * Self::ELEVATION)
+            | (u8::from(self.arch) * Self::ARCH)
+            | (u8::from(self.efficiency) * Self::EFFICIENCY)
+            | (u8::from(self.exe_path) * Self::EXE_PATH)
+    }
+
+    pub fn from_bits(bits: u8) -> Self {
+        Self {
+            user: bits & Self::USER != 0,
+            elevation: bits & Self::ELEVATION != 0,
+            arch: bits & Self::ARCH != 0,
+            efficiency: bits & Self::EFFICIENCY != 0,
+            exe_path: bits & Self::EXE_PATH != 0,
+        }
+    }
+
+    pub fn contains(self, required: Self) -> bool {
+        self.bits() & required.bits() == required.bits()
+    }
+}
+
+#[cfg(windows)]
+#[inline]
+fn filetime_value(value: FILETIME) -> u64 {
+    ((value.dwHighDateTime as u64) << 32) | value.dwLowDateTime as u64
+}
+
+/// Open the process once, verify its creation time, and return that same handle
+/// for the requested operation. This closes the PID-reuse TOCTOU window that
+/// would remain if verification and mutation opened separate handles.
+#[cfg(windows)]
+fn open_verified_process(
+    identity: ProcessIdentity,
+    access: PROCESS_ACCESS_RIGHTS,
+) -> Result<HANDLE, String> {
+    if identity.create_time_100ns == 0 {
+        return Err(format!(
+            "Cannot verify process {} because its creation time is unavailable",
+            identity.pid
+        ));
+    }
+
+    unsafe {
+        let handle = OpenProcess(
+            access | PROCESS_QUERY_LIMITED_INFORMATION,
+            false,
+            identity.pid,
+        )
+        .map_err(|e| format!("Cannot open process: {e}"))?;
+        if handle.is_invalid() {
+            return Err(format!(
+                "Cannot open process {} (access denied or not found)",
+                identity.pid
+            ));
+        }
+
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        if let Err(error) =
+            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
+        {
+            let _ = CloseHandle(handle);
+            return Err(format!("Cannot verify process identity: {error}"));
+        }
+
+        if filetime_value(creation) != identity.create_time_100ns {
+            let _ = CloseHandle(handle);
+            return Err(format!(
+                "Process {} exited and its PID was reused",
+                identity.pid
+            ));
+        }
+        Ok(handle)
+    }
+}
+
 // ============================================================================
 // Helper functions to reduce code duplication
 // ============================================================================
@@ -208,7 +334,7 @@ fn query_exe_path(handle: HANDLE) -> String {
 
 /// Extract username from an already-opened token handle (avoids duplicate OpenProcess)
 #[cfg(windows)]
-fn get_user_from_token(token_handle: HANDLE, pid: u32) -> Option<Arc<str>> {
+fn get_user_from_token(token_handle: HANDLE) -> Option<Arc<str>> {
     unsafe {
         // Get token user info - first call to get required size
         let mut token_info_len: u32 = 0;
@@ -256,9 +382,6 @@ fn get_user_from_token(token_handle: HANDLE, pid: u32) -> Option<Arc<str>> {
             // Use interning to avoid UTF-16 conversion for common usernames
             let username = intern_username_utf16(&name[..name_len as usize]);
 
-            // Cache the result using unified cache
-            super::cache::CACHE.set_user(pid, username.clone());
-
             Some(username)
         } else {
             None
@@ -266,12 +389,14 @@ fn get_user_from_token(token_handle: HANDLE, pid: u32) -> Option<Arc<str>> {
     }
 }
 
-/// Get I/O counters for a specific process (on-demand, for ProcessInfo dialog)
+/// Get I/O counters for a specific process (on-demand, for ProcessInfo dialog).
+/// The handle is verified before it is queried so a reused PID cannot display
+/// data belonging to a different process.
 #[cfg(windows)]
-pub fn get_process_io_counters(pid: u32) -> (u64, u64) {
-    let handle = match open_process_query(pid) {
-        Some(h) => h,
-        None => return (0, 0),
+pub fn get_process_io_counters(identity: ProcessIdentity) -> (u64, u64) {
+    let handle = match open_verified_process(identity, PROCESS_QUERY_LIMITED_INFORMATION) {
+        Ok(h) => h,
+        Err(_) => return (0, 0),
     };
     unsafe {
         let mut io = IO_COUNTERS::default();
@@ -286,16 +411,16 @@ pub fn get_process_io_counters(pid: u32) -> (u64, u64) {
 }
 
 #[cfg(not(windows))]
-pub fn get_process_io_counters(_pid: u32) -> (u64, u64) {
+pub fn get_process_io_counters(_identity: ProcessIdentity) -> (u64, u64) {
     (0, 0)
 }
 
-/// Get executable path for a specific process (on-demand, for ProcessInfo dialog)
+/// Get executable path for a specific process (on-demand, for ProcessInfo dialog).
 #[cfg(windows)]
-pub fn get_process_exe_path(pid: u32) -> String {
-    let handle = match open_process_query(pid) {
-        Some(h) => h,
-        None => return String::new(),
+pub fn get_process_exe_path(identity: ProcessIdentity) -> String {
+    let handle = match open_verified_process(identity, PROCESS_QUERY_LIMITED_INFORMATION) {
+        Ok(h) => h,
+        Err(_) => return String::new(),
     };
     let result = query_exe_path(handle);
     unsafe {
@@ -305,14 +430,14 @@ pub fn get_process_exe_path(pid: u32) -> String {
 }
 
 #[cfg(not(windows))]
-pub fn get_process_exe_path(_pid: u32) -> String {
+pub fn get_process_exe_path(_identity: ProcessIdentity) -> String {
     String::new()
 }
 
 /// Enriched data from Windows API for visible processes
 #[cfg(windows)]
 struct EnrichedProcessData {
-    pid: u32,
+    identity: ProcessIdentity,
     shared_mem: u64,
     efficiency_mode: bool,
     /// True only when efficiency_mode was freshly queried this pass (handle opened
@@ -338,10 +463,22 @@ struct EnrichedProcessData {
 /// (shared_mem, efficiency_mode, is_elevated, arch, user, exe_path)
 /// Note: cpu_time and start_time come from NtQuerySystemInformation (in from_native) for ALL processes,
 /// so we don't query them here to maintain consistency between visible and non-visible processes.
-/// Call this for visible processes only to minimize Windows API calls
-/// Set fetch_exe_path=true only when show_program_path setting is enabled
+/// Call this for visible processes only to minimize Windows API calls.
+/// Set `fetch_exe_path=true` only when show_program_path is enabled.
 #[cfg(windows)]
 pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
+    enrich_processes_for(
+        processes,
+        ProcessEnrichmentRequirements::visible(fetch_exe_path),
+    );
+}
+
+/// Enrich only metadata explicitly required by a canonical filter or sort.
+#[cfg(windows)]
+pub fn enrich_processes_for(
+    processes: &mut [ProcessInfo],
+    requirements: ProcessEnrichmentRequirements,
+) {
     use super::cache::{CACHE, config};
     use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
 
@@ -352,7 +489,12 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
     let cache_snapshot: HashMap<u32, super::cache::ProcessCacheEntry> = CACHE.with_read(|cache| {
         processes
             .iter()
-            .filter_map(|p| cache.get(&p.pid).map(|e| (p.pid, e.clone())))
+            .filter_map(|process| {
+                cache
+                    .get(&process.pid)
+                    .filter(|entry| entry.create_time == process.create_time_100ns)
+                    .map(|entry| (process.pid, entry.clone()))
+            })
             .collect()
     });
     let now = std::time::Instant::now();
@@ -361,10 +503,11 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
     let enriched_data: Vec<EnrichedProcessData> = processes
         .iter()
         .map(|p| {
-            let pid = p.pid;
+            let identity = p.identity();
+            let pid = identity.pid;
             if pid == 0 || pid == 4 {
                 return EnrichedProcessData {
-                    pid,
+                    identity,
                     shared_mem: 0,
                     efficiency_mode: false,
                     efficiency_fresh: false,
@@ -392,7 +535,9 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             // Check if efficiency cache is still valid (within TTL)
             let efficiency_valid = cached_entry
                 .and_then(|e| e.efficiency_updated)
-                .map(|updated| now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS)
+                .map(|updated| {
+                    now.saturating_duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS
+                })
                 .unwrap_or(false);
             let cached_efficiency_mode = if efficiency_valid {
                 cached_entry.and_then(|e| e.efficiency_mode)
@@ -401,11 +546,11 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             };
 
             // Determine what we need to query
-            let need_arch = cached_arch.is_none();
-            let need_elevation = cached_elevation.is_none();
-            let need_user = cached_user.is_none();
-            let need_efficiency = !efficiency_valid;
-            let need_exe_path = fetch_exe_path
+            let need_arch = requirements.arch && cached_arch.is_none();
+            let need_elevation = requirements.elevation && cached_elevation.is_none();
+            let need_user = requirements.user && cached_user.is_none();
+            let need_efficiency = requirements.efficiency && !efficiency_valid;
+            let need_exe_path = requirements.exe_path
                 && cached_exe_path
                     .as_ref()
                     .map(|p| p.is_empty())
@@ -416,7 +561,7 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                 need_arch || need_elevation || need_user || need_efficiency || need_exe_path;
 
             let handle = if need_handle {
-                open_process_query(pid)
+                open_verified_process(identity, PROCESS_QUERY_LIMITED_INFORMATION).ok()
             } else {
                 None
             };
@@ -424,18 +569,18 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             // If we couldn't get a handle but need one, use cached data if available
             if need_handle && handle.is_none() {
                 let user = cached_user;
-                let efficiency_mode = cached_efficiency_mode.unwrap_or(false);
+                let efficiency_mode = cached_efficiency_mode.unwrap_or(p.efficiency_mode);
 
                 return EnrichedProcessData {
-                    pid,
+                    identity,
                     shared_mem: 0,
                     efficiency_mode,
                     efficiency_fresh: false, // served from cache (no handle)
                     arch_fresh: false,
                     exe_path_fresh: false,
                     elevation_fresh: false,
-                    is_elevated: cached_elevation.unwrap_or(false),
-                    arch: cached_arch.unwrap_or(ProcessArch::Native),
+                    is_elevated: cached_elevation.unwrap_or(p.is_elevated),
+                    arch: cached_arch.unwrap_or(p.arch),
                     user,
                     exe_path: cached_exe_path.unwrap_or_default(),
                 };
@@ -449,7 +594,7 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
 
             // Use cached exe_path or query if needed.
             let mut exe_path_fresh = false;
-            let exe_path = if fetch_exe_path {
+            let exe_path = if requirements.exe_path {
                 if let Some(path) = cached_exe_path.as_ref().filter(|p| !p.is_empty()) {
                     path.clone()
                 } else if let Some(h) = handle {
@@ -464,8 +609,10 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             };
 
             // Use cached efficiency mode or query if stale
-            let efficiency_mode = if let Some(mode) = cached_efficiency_mode {
-                mode
+            let (efficiency_mode, efficiency_fresh) = if let Some(mode) = cached_efficiency_mode {
+                (mode, false)
+            } else if !requirements.efficiency {
+                (p.efficiency_mode, false)
             } else if let Some(h) = handle {
                 unsafe {
                     let mut throttle_state = PROCESS_POWER_THROTTLING_STATE {
@@ -478,20 +625,32 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                         &mut throttle_state as *mut _ as *mut _,
                         std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
                     );
-                    result.is_ok()
-                        && (throttle_state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED)
-                            != 0
-                        && (throttle_state.ControlMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED)
-                            != 0
+                    if result.is_ok() {
+                        (
+                            (throttle_state.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED)
+                                != 0
+                                && (throttle_state.ControlMask
+                                    & PROCESS_POWER_THROTTLING_EXECUTION_SPEED)
+                                    != 0,
+                            true,
+                        )
+                    } else {
+                        // A query failure is unknown, not an authoritative
+                        // "disabled" result. Leave the cache stale so a later
+                        // refresh retries it.
+                        (p.efficiency_mode, false)
+                    }
                 }
             } else {
-                false
+                (p.efficiency_mode, false)
             };
 
             // Use cached architecture if available, otherwise query it. Query
-            // failures return Native for the visible row but are not cached.
+            // failures preserve the row's last known value and are not cached.
             let (arch, arch_fresh) = if let Some(arch) = cached_arch {
                 (arch, false)
+            } else if !requirements.arch {
+                (p.arch, false)
             } else if let Some(h) = handle {
                 unsafe {
                     let mut process_machine = IMAGE_FILE_MACHINE::default();
@@ -520,7 +679,7 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                                         (ProcessArch::Native, true)
                                     }
                                 } else {
-                                    (ProcessArch::Native, false)
+                                    (p.arch, false)
                                 }
                             } else {
                                 (ProcessArch::Native, true)
@@ -529,20 +688,20 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                             (ProcessArch::Native, true)
                         }
                     } else {
-                        (ProcessArch::Native, false)
+                        (p.arch, false)
                     }
                 }
             } else {
-                (ProcessArch::Native, false)
+                (p.arch, false)
             };
 
-            // Open token once for both elevation and user queries. Elevation is
-            // cached only when TokenElevation itself succeeds.
-            let (is_elevated, user, elevation_fresh) = if cached_elevation.is_some()
-                && cached_user.is_some()
-            {
+            // Open a token only if the active dependency requires a missing
+            // elevation or user value. A handle opened for path/architecture
+            // must not trigger unrelated token queries.
+            let token_needed = need_elevation || need_user;
+            let (is_elevated, user, elevation_fresh) = if !token_needed {
                 (
-                    cached_elevation.unwrap_or(false),
+                    cached_elevation.unwrap_or(p.is_elevated),
                     cached_user.clone(),
                     false,
                 )
@@ -552,7 +711,7 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                     if OpenProcessToken(h, TOKEN_QUERY, &mut token_handle).is_ok() {
                         let (elevated, elevation_fresh) = if let Some(elevated) = cached_elevation {
                             (elevated, false)
-                        } else {
+                        } else if need_elevation {
                             let mut elevation = TOKEN_ELEVATION::default();
                             let mut return_length: u32 = 0;
                             let elev_result = GetTokenInformation(
@@ -563,20 +722,31 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                                 &mut return_length,
                             )
                             .is_ok();
-                            (elev_result && elevation.TokenIsElevated != 0, elev_result)
+                            (
+                                if elev_result {
+                                    elevation.TokenIsElevated != 0
+                                } else {
+                                    p.is_elevated
+                                },
+                                elev_result,
+                            )
+                        } else {
+                            (p.is_elevated, false)
                         };
 
                         let user = if cached_user.is_some() {
                             cached_user.clone()
+                        } else if need_user {
+                            get_user_from_token(token_handle)
                         } else {
-                            get_user_from_token(token_handle, pid)
+                            None
                         };
 
                         let _ = CloseHandle(token_handle);
                         (elevated, user, elevation_fresh)
                     } else {
                         (
-                            cached_elevation.unwrap_or(false),
+                            cached_elevation.unwrap_or(p.is_elevated),
                             cached_user.clone(),
                             false,
                         )
@@ -584,7 +754,7 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                 }
             } else {
                 (
-                    cached_elevation.unwrap_or(false),
+                    cached_elevation.unwrap_or(p.is_elevated),
                     cached_user.clone(),
                     false,
                 )
@@ -597,11 +767,10 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
             }
 
             EnrichedProcessData {
-                pid,
+                identity,
                 shared_mem,
                 efficiency_mode,
-                // Fresh only when we actually opened a handle and queried it.
-                efficiency_fresh: need_efficiency && handle.is_some(),
+                efficiency_fresh,
                 arch_fresh,
                 exe_path_fresh,
                 elevation_fresh,
@@ -616,14 +785,19 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
     // Build lookup map once (used for both the cache update and the struct update
     // below). Previously the cache-update closure did a linear `find` per PID,
     // which was O(n^2) over the visible slice.
-    let data_map: HashMap<u32, &EnrichedProcessData> =
-        enriched_data.iter().map(|d| (d.pid, d)).collect();
+    let data_map: HashMap<u32, &EnrichedProcessData> = enriched_data
+        .iter()
+        .map(|data| (data.identity.pid, data))
+        .collect();
 
     // Update unified cache with newly queried data (single lock acquisition)
     {
-        let pids: Vec<u32> = enriched_data.iter().map(|d| d.pid).collect();
+        let pids: Vec<u32> = enriched_data.iter().map(|data| data.identity.pid).collect();
         CACHE.update_batch(&pids, |pid, entry| {
             if let Some(data) = data_map.get(&pid) {
+                if entry.create_time != data.identity.create_time_100ns {
+                    return;
+                }
                 if data.arch_fresh {
                     entry.arch = Some(data.arch);
                 }
@@ -632,6 +806,9 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
                 }
                 if data.elevation_fresh {
                     entry.is_elevated = Some(data.is_elevated);
+                }
+                if let Some(user) = data.user.as_ref() {
+                    entry.user = Some(user.clone());
                 }
                 // Only refresh the efficiency TTL when it was actually re-queried;
                 // bumping it on cache-served values would keep the 30s TTL from ever
@@ -652,6 +829,9 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
     // This caused a bug where rows appeared to "stop updating" when sorting changed which processes were visible.
     for proc in processes.iter_mut() {
         if let Some(data) = data_map.get(&proc.pid) {
+            if data.identity != proc.identity() {
+                continue;
+            }
             // Only update shared_mem if we got valid data. The raw process pass
             // already computes this from private working set; this fallback is
             // for entries that still have zero because the kernel value was not
@@ -680,9 +860,67 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
     }
 }
 
+/// Apply already-cached static metadata to a complete process snapshot.
+///
+/// This pass performs no process opens or other Windows syscalls. It gives
+/// filters and sorts a canonical view before the UI selects the smaller slice
+/// that warrants active enrichment.
+#[cfg(windows)]
+pub fn hydrate_processes_from_cache(processes: &mut [ProcessInfo]) {
+    use super::cache::{CACHE, config};
+
+    let now = std::time::Instant::now();
+    CACHE.with_read(|cache| {
+        for process in processes {
+            let Some(entry) = cache.get(&process.pid) else {
+                continue;
+            };
+            if entry.create_time == 0 || entry.create_time != process.create_time_100ns {
+                continue;
+            }
+
+            if let Some(user) = entry.user.as_ref()
+                && *user != process.user
+            {
+                process.user = user.clone();
+                process.user_lower = user.to_lowercase().into();
+            }
+            if let Some(is_elevated) = entry.is_elevated {
+                process.is_elevated = is_elevated;
+            }
+            if let Some(arch) = entry.arch {
+                process.arch = arch;
+            }
+            if let (Some(mode), Some(updated)) = (entry.efficiency_mode, entry.efficiency_updated)
+                && now.saturating_duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS
+            {
+                process.efficiency_mode = mode;
+            }
+            if let Some(path) = entry.exe_path.as_deref().filter(|path| !path.is_empty())
+                && path != &*process.exe_path
+            {
+                let path: Arc<str> = Arc::from(path);
+                process.command_lower = path.to_lowercase().into();
+                process.exe_path = path.clone();
+                process.command = path;
+            }
+        }
+    });
+}
+
+#[cfg(not(windows))]
+pub fn hydrate_processes_from_cache(_processes: &mut [ProcessInfo]) {}
+
 #[cfg(not(windows))]
 pub fn enrich_processes(_processes: &mut [ProcessInfo], _fetch_exe_path: bool) {
     // No-op on non-Windows
+}
+
+#[cfg(not(windows))]
+pub fn enrich_processes_for(
+    _processes: &mut [ProcessInfo],
+    _requirements: ProcessEnrichmentRequirements,
+) {
 }
 
 #[cfg(not(windows))]
@@ -770,6 +1008,15 @@ pub struct ProcessInfo {
 }
 
 impl ProcessInfo {
+    /// Return the stable identity captured with this process snapshot.
+    #[inline]
+    pub fn identity(&self) -> ProcessIdentity {
+        ProcessIdentity {
+            pid: self.pid,
+            create_time_100ns: self.create_time_100ns,
+        }
+    }
+
     /// Format CPU time as HH:MM:SS or MM:SS.ms
     pub fn format_cpu_time(&self) -> String {
         let secs = self.cpu_time.as_secs();
@@ -828,6 +1075,7 @@ impl ProcessInfo {
         use super::cache::{CACHE, config};
 
         let pid = proc.pid();
+        let create_time_100ns = proc.create_time();
         let now = std::time::Instant::now();
 
         // Read only this PID's cached fields under a short read lock, instead of
@@ -836,7 +1084,9 @@ impl ProcessInfo {
         // O(processes^2) string-cloning on boot / mass-spawn.
         let (is_elevated, arch, cached_exe_path, efficiency_mode, user) =
             CACHE.with_read(|cache| {
-                let cached_entry = cache.get(&pid);
+                let cached_entry = cache
+                    .get(&pid)
+                    .filter(|entry| entry.create_time == create_time_100ns);
 
                 let is_elevated = cached_entry.and_then(|e| e.is_elevated).unwrap_or(false);
                 let arch = cached_entry
@@ -850,7 +1100,8 @@ impl ProcessInfo {
                     .and_then(|e| {
                         if let (Some(mode), Some(updated)) =
                             (e.efficiency_mode, e.efficiency_updated)
-                            && now.duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS
+                            && now.saturating_duration_since(updated).as_millis()
+                                < config::EFFICIENCY_TTL_MS
                         {
                             return Some(mode);
                         }
@@ -884,7 +1135,6 @@ impl ProcessInfo {
             ((total_100ns % 10_000_000) * 100) as u32,
         );
 
-        let create_time_100ns = proc.create_time();
         let start_time = filetime_to_unix(create_time_100ns);
 
         // Parse name only here (allocation)
@@ -952,19 +1202,11 @@ impl ProcessInfo {
     }
 }
 
-/// Kill a process by PID
+/// Forcefully terminate a process after verifying its stable identity.
 #[cfg(windows)]
-pub fn kill_process(pid: u32, _signal: u32) -> Result<(), String> {
+pub fn kill_process(identity: ProcessIdentity) -> Result<(), String> {
     unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, false, pid)
-            .map_err(|e| format!("Cannot open process: {}", e))?;
-
-        if handle.is_invalid() {
-            return Err(format!(
-                "Cannot open process {} (access denied or not found)",
-                pid
-            ));
-        }
+        let handle = open_verified_process(identity, PROCESS_TERMINATE)?;
 
         let result = TerminateProcess(handle, 1);
         let _ = CloseHandle(handle);
@@ -975,15 +1217,10 @@ pub fn kill_process(pid: u32, _signal: u32) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-pub fn kill_process(pid: u32, signal: u32) -> Result<(), String> {
+pub fn kill_process(identity: ProcessIdentity) -> Result<(), String> {
     use std::process::Command;
-    let sig = match signal {
-        9 => "KILL",
-        15 => "TERM",
-        _ => "TERM",
-    };
     Command::new("kill")
-        .args(["-s", sig, &pid.to_string()])
+        .args(["-s", "KILL", &identity.pid.to_string()])
         .output()
         .map_err(|e| format!("Failed to kill process: {}", e))?;
     Ok(())
@@ -992,18 +1229,13 @@ pub fn kill_process(pid: u32, signal: u32) -> Result<(), String> {
 /// Set process priority class directly
 #[cfg(windows)]
 pub fn set_priority_class(
-    pid: u32,
+    identity: ProcessIdentity,
     priority: crate::app::WindowsPriorityClass,
 ) -> Result<(), String> {
     use crate::app::WindowsPriorityClass;
 
     unsafe {
-        let handle = OpenProcess(PROCESS_SET_INFORMATION, false, pid)
-            .map_err(|e| format!("Cannot open process: {}", e))?;
-
-        if handle.is_invalid() {
-            return Err(format!("Cannot open process {} (access denied)", pid));
-        }
+        let handle = open_verified_process(identity, PROCESS_SET_INFORMATION)?;
 
         // Map WindowsPriorityClass to Windows API constant
         let priority_class = match priority {
@@ -1025,7 +1257,7 @@ pub fn set_priority_class(
 
 #[cfg(not(windows))]
 pub fn set_priority_class(
-    pid: u32,
+    identity: ProcessIdentity,
     priority: crate::app::WindowsPriorityClass,
 ) -> Result<(), String> {
     use crate::app::WindowsPriorityClass;
@@ -1042,7 +1274,7 @@ pub fn set_priority_class(
     };
 
     Command::new("renice")
-        .args([&nice.to_string(), "-p", &pid.to_string()])
+        .args([&nice.to_string(), "-p", &identity.pid.to_string()])
         .output()
         .map_err(|e| format!("Failed to set priority: {}", e))?;
     Ok(())
@@ -1050,21 +1282,15 @@ pub fn set_priority_class(
 
 /// Set process efficiency mode (EcoQoS power throttling)
 #[cfg(windows)]
-pub fn set_efficiency_mode(pid: u32, enabled: bool) -> Result<(), String> {
-    use windows::Win32::Foundation::CloseHandle;
+pub fn set_efficiency_mode(identity: ProcessIdentity, enabled: bool) -> Result<(), String> {
     use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
-        PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE,
-        PROCESS_SET_INFORMATION, ProcessPowerThrottling, SetProcessInformation,
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        PROCESS_POWER_THROTTLING_STATE, PROCESS_SET_INFORMATION, ProcessPowerThrottling,
+        SetProcessInformation,
     };
 
     unsafe {
-        let handle = OpenProcess(PROCESS_SET_INFORMATION, false, pid)
-            .map_err(|e| format!("Cannot open process: {}", e))?;
-
-        if handle.is_invalid() {
-            return Err(format!("Cannot open process {} (access denied)", pid));
-        }
+        let handle = open_verified_process(identity, PROCESS_SET_INFORMATION)?;
 
         // Use both throttling flags like the working implementation in main.rs
         let control_mask = PROCESS_POWER_THROTTLING_EXECUTION_SPEED
@@ -1090,33 +1316,34 @@ pub fn set_efficiency_mode(pid: u32, enabled: bool) -> Result<(), String> {
     }
 
     // Update the cache immediately so UI reflects the change
-    update_efficiency_mode_cache(pid, enabled);
+    update_efficiency_mode_cache(identity, enabled);
 
     Ok(())
 }
 
 /// Update the efficiency mode cache for a specific PID
 #[cfg(windows)]
-fn update_efficiency_mode_cache(pid: u32, enabled: bool) {
-    super::cache::CACHE.set_efficiency_mode(pid, enabled);
+fn update_efficiency_mode_cache(identity: ProcessIdentity, enabled: bool) {
+    super::cache::CACHE.update_batch(&[identity.pid], |_, entry| {
+        if entry.create_time == identity.create_time_100ns {
+            entry.efficiency_mode = Some(enabled);
+            entry.efficiency_updated = Some(std::time::Instant::now());
+        }
+    });
 }
 
 #[cfg(not(windows))]
-pub fn set_efficiency_mode(_pid: u32, _enabled: bool) -> Result<(), String> {
+pub fn set_efficiency_mode(_identity: ProcessIdentity, _enabled: bool) -> Result<(), String> {
     Err("Efficiency mode is only available on Windows".to_string())
 }
 
 /// Get process CPU affinity mask
 #[cfg(windows)]
-pub fn get_process_affinity(pid: u32) -> Result<u64, String> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        GetProcessAffinityMask, OpenProcess, PROCESS_QUERY_INFORMATION,
-    };
+pub fn get_process_affinity(identity: ProcessIdentity) -> Result<u64, String> {
+    use windows::Win32::System::Threading::{GetProcessAffinityMask, PROCESS_QUERY_INFORMATION};
 
     unsafe {
-        let handle = OpenProcess(PROCESS_QUERY_INFORMATION, false, pid)
-            .map_err(|e| format!("Cannot open process: {}", e))?;
+        let handle = open_verified_process(identity, PROCESS_QUERY_INFORMATION)?;
         let mut process_mask: usize = 0;
         let mut system_mask: usize = 0;
         let result = GetProcessAffinityMask(handle, &mut process_mask, &mut system_mask);
@@ -1127,22 +1354,18 @@ pub fn get_process_affinity(pid: u32) -> Result<u64, String> {
 }
 
 #[cfg(not(windows))]
-pub fn get_process_affinity(_pid: u32) -> Result<u64, String> {
+pub fn get_process_affinity(_identity: ProcessIdentity) -> Result<u64, String> {
     // Not implemented for non-Windows
     Ok(u64::MAX)
 }
 
 /// Set process CPU affinity mask
 #[cfg(windows)]
-pub fn set_process_affinity(pid: u32, mask: u64) -> Result<(), String> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        OpenProcess, PROCESS_SET_INFORMATION, SetProcessAffinityMask,
-    };
+pub fn set_process_affinity(identity: ProcessIdentity, mask: u64) -> Result<(), String> {
+    use windows::Win32::System::Threading::{PROCESS_SET_INFORMATION, SetProcessAffinityMask};
 
     unsafe {
-        let handle = OpenProcess(PROCESS_SET_INFORMATION, false, pid)
-            .map_err(|e| format!("Cannot open process: {}", e))?;
+        let handle = open_verified_process(identity, PROCESS_SET_INFORMATION)?;
         let result = SetProcessAffinityMask(handle, mask as usize);
         let _ = CloseHandle(handle);
         result.map_err(|e| format!("Cannot set affinity: {}", e))?;
@@ -1151,7 +1374,7 @@ pub fn set_process_affinity(pid: u32, mask: u64) -> Result<(), String> {
 }
 
 #[cfg(not(windows))]
-pub fn set_process_affinity(_pid: u32, _mask: u64) -> Result<(), String> {
+pub fn set_process_affinity(_identity: ProcessIdentity, _mask: u64) -> Result<(), String> {
     // Not implemented for non-Windows
     Ok(())
 }

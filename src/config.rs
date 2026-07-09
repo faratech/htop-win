@@ -4,7 +4,7 @@ use crate::json::{self, Value};
 use crate::ui::colors::ColorScheme;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Meter display mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -117,7 +117,7 @@ pub struct Config {
     // Mouse settings
     pub mouse_enabled: bool,
 
-    // Readonly mode (no kill/priority operations)
+    // Readonly mode (no process mutation operations)
     pub readonly: bool,
 
     // Confirmation dialogs
@@ -274,14 +274,17 @@ impl Config {
     /// Save configuration to file
     pub fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(path) = Self::config_path() {
-            // Ensure directory exists
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            let content = json::to_string_pretty(&self.to_json());
-            fs::write(&path, content)?;
+            self.save_to_path(&path)?;
         }
+        Ok(())
+    }
+
+    fn save_to_path(&self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let content = json::to_string_pretty(&self.to_json());
+        fs::write(path, content)?;
         Ok(())
     }
 
@@ -601,6 +604,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn test_default_config() {
@@ -624,6 +628,21 @@ mod tests {
         assert_eq!(loaded.gpu_meter_mode, config.gpu_meter_mode);
         assert_eq!(loaded.show_npu_meter, config.show_npu_meter);
         assert_eq!(loaded.npu_meter_mode, config.npu_meter_mode);
+    }
+
+    #[test]
+    fn injected_save_path_reports_write_failure() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("htop-win-config-test-{unique}"));
+        fs::create_dir_all(&directory).unwrap();
+
+        // A directory cannot be replaced by a regular file, giving a
+        // deterministic failure even when tests run with elevated privileges.
+        assert!(Config::default().save_to_path(&directory).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

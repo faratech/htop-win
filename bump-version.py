@@ -13,13 +13,40 @@ PROJECT_DIR = Path(__file__).parent.resolve()
 CARGO_TOML = PROJECT_DIR / "Cargo.toml"
 RESOURCE_FILE = PROJECT_DIR / "media" / "htop.rc"
 
+SEMVER_RE = re.compile(
+    r"""
+    (0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)
+    (?:-
+        (?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)
+        (?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*
+    )?
+    (?:\+
+        [0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*
+    )?
+    """,
+    re.VERBOSE,
+)
+
+WINDOWS_VERSION_COMPONENT_MAX = 65535
+
 
 def parse_version(version_str: str) -> tuple[int, int, int]:
-    """Parse version string into tuple of (major, minor, patch)."""
-    match = re.match(r"(\d+)\.(\d+)\.(\d+)", version_str)
+    """Validate SemVer and return its numeric core."""
+    match = SEMVER_RE.fullmatch(version_str)
     if not match:
-        raise ValueError(f"Invalid version format: {version_str}")
-    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+        raise ValueError(f"Invalid SemVer: {version_str}")
+
+    core = tuple(int(match.group(index)) for index in range(1, 4))
+    oversized = next(
+        (component for component in core if component > WINDOWS_VERSION_COMPONENT_MAX),
+        None,
+    )
+    if oversized is not None:
+        raise ValueError(
+            f"Version component {oversized} exceeds the Windows resource limit "
+            f"of {WINDOWS_VERSION_COMPONENT_MAX}"
+        )
+    return core
 
 
 def get_current_version() -> str:
@@ -36,13 +63,16 @@ def bump_version(current: str, bump_type: str) -> str:
     major, minor, patch = parse_version(current)
 
     if bump_type == "major":
-        return f"{major + 1}.0.0"
+        bumped = f"{major + 1}.0.0"
     elif bump_type == "minor":
-        return f"{major}.{minor + 1}.0"
+        bumped = f"{major}.{minor + 1}.0"
     elif bump_type == "patch":
-        return f"{major}.{minor}.{patch + 1}"
+        bumped = f"{major}.{minor}.{patch + 1}"
     else:
         raise ValueError(f"Invalid bump type: {bump_type}")
+
+    parse_version(bumped)
+    return bumped
 
 
 def update_cargo_toml(old_version: str, new_version: str) -> bool:
@@ -133,16 +163,15 @@ def main():
 
     current_version = get_current_version()
 
-    if args.set:
-        # Validate the provided version
-        try:
+    try:
+        if args.set is not None:
             parse_version(args.set)
-        except ValueError as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-        new_version = args.set
-    else:
-        new_version = bump_version(current_version, args.bump_type)
+            new_version = args.set
+        else:
+            new_version = bump_version(current_version, args.bump_type)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
 
     print(f"Version: {current_version} -> {new_version}")
 

@@ -152,20 +152,22 @@ fn print_help() {
     println!("  -d, --delay <MS>             Refresh rate in milliseconds (default: 1500)");
     println!("  -u, --user <USER>            Show only processes owned by USER");
     println!("  -t, --tree                   Start in tree view mode");
-    println!("  -s, --sort <COLUMN>          Sort by: pid, cpu, mem, time, command, user");
+    println!("  -s, --sort <COLUMN>          Sort by: pid, ppid, cpu/cpu%, mem/mem%/memory,");
+    println!("                               time, command/cmd, user, threads/thr");
     println!("      --no-mouse               Disable mouse support");
     println!("      --no-color               Use monochrome mode");
     println!("  -p, --pid <PID,...>          Show only specific PIDs (comma-separated)");
     println!("  -F, --filter <FILTER>        Initial filter string");
     println!("  -n, --max-iterations <N>     Exit after N updates (alias: --iterations)");
     println!("      --no-meters              Hide header meters");
-    println!("      --benchmark [N]          Run N iterations (default 20) and print timing stats");
-    println!("      --readonly               Disable kill/priority operations");
+    println!("      --benchmark[=<N>]        Run N iterations (default 20) and print timing stats");
+    println!("      --benchmark-iterations <N>  Alias with a separate iteration value");
+    println!("      --readonly               Disable process mutation operations");
     println!("      --inefficient            Disable Efficiency Mode (run at normal priority)");
     println!(
         "  -H, --highlight-changes <S>  Highlight process changes (seconds; alias: --highlight)"
     );
-    println!("      --install                Install to PATH (requires admin, will prompt UAC)");
+    println!("      --install                Install for the current user and add it to PATH");
     println!("      --update                 Check for updates and install if available");
     println!("  -f, --force                  Force install/update even if same version");
     println!("      --gpu-debug              Print GPU/NPU adapter diagnostics and exit");
@@ -352,6 +354,32 @@ fn restore_terminal() {
     let _ = execute!(stdout, cursor::Show);
 }
 
+fn load_session_config(args: &Args) -> (Config, bool) {
+    // Load this before terminal setup because mouse capture is itself a
+    // persisted setting, not merely an in-app rendering preference.
+    let first_run = !Config::config_path().is_some_and(|path| path.exists());
+    let mut config = Config::load();
+    apply_config_overrides(&mut config, args);
+
+    (config, first_run)
+}
+
+fn apply_config_overrides(config: &mut Config, args: &Args) {
+    if let Some(delay) = args.delay {
+        config.refresh_rate_ms = delay.max(100);
+    }
+    if args.tree {
+        config.tree_view_default = true;
+    }
+    if args.no_color {
+        config.color_scheme = ui::colors::ColorScheme::Monochrome;
+    }
+    if let Some(delay) = args.highlight_changes {
+        config.highlight_new_processes = true;
+        config.highlight_duration_ms = delay.saturating_mul(1000);
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = match parse_args() {
         Ok(args) => args,
@@ -409,16 +437,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Only succeeds when running as Administrator
     system::enable_debug_privilege();
 
+    let (config, first_run) = load_session_config(&args);
+    let mouse_enabled = config.mouse_enabled && !args.no_mouse;
+
     // Restore the terminal before the default panic handler prints, so the
     // message lands on the normal screen instead of the soon-to-vanish
     // alternate one. Panic hooks still run before abort() under the release
     // profile's panic = "abort". (In debug builds a background-thread panic
     // restores while the UI thread keeps drawing; in release the process
-    // aborts immediately, so the hook's view is exact.)
+    // aborts immediately, so the hook's view is exact. In debug builds, make a
+    // background panic process-fatal too; continuing the UI after its collector
+    // or updater died would leave a deceptively frozen application.)
+    let main_thread = std::thread::current().id();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let background_panic = std::thread::current().id() != main_thread;
         restore_terminal();
         default_hook(info);
+        if background_panic {
+            std::process::abort();
+        }
     }));
 
     // Setup terminal. If this very first step fails there is nothing to
@@ -426,7 +464,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // restore_terminal() call below.
     enable_raw_mode()?;
 
-    let (result, bench_stats, process_count) = run_tui(&args, update_just_applied);
+    let (result, bench_stats, process_count) =
+        run_tui(&args, update_just_applied, config, first_run, mouse_enabled);
 
     // Restore terminal — the one restore point for both Ok and error returns
     restore_terminal();
@@ -453,6 +492,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_tui(
     args: &Args,
     update_just_applied: bool,
+    config: Config,
+    first_run: bool,
+    mouse_enabled: bool,
 ) -> (
     Result<(), Box<dyn std::error::Error>>,
     Option<BenchmarkStats>,
@@ -463,6 +505,9 @@ fn run_tui(
     let result = run_tui_inner(
         args,
         update_just_applied,
+        config,
+        first_run,
+        mouse_enabled,
         &mut bench_stats,
         &mut process_count,
     );
@@ -474,15 +519,18 @@ fn run_tui(
 fn run_tui_inner(
     args: &Args,
     update_just_applied: bool,
+    config: Config,
+    first_run: bool,
+    mouse_enabled: bool,
     bench_stats: &mut Option<BenchmarkStats>,
     process_count: &mut usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
-    if args.no_mouse {
-        execute!(stdout, EnterAlternateScreen)?;
-    } else {
+    if mouse_enabled {
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         MOUSE_CAPTURE_ENABLED.store(true, Ordering::Relaxed);
+    } else {
+        execute!(stdout, EnterAlternateScreen)?;
     }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
@@ -492,34 +540,9 @@ fn run_tui_inner(
         let _ = event::read();
     }
 
-    // Load configuration from file (or use defaults). Remember whether a
-    // config existed: on first run the default columns are augmented with
-    // GPU/NPU columns once hardware detection has run (first snapshot).
-    let first_run = !Config::config_path().is_some_and(|p| p.exists());
-    let mut config = Config::load();
-
-    // Apply command-line overrides
-    if let Some(delay) = args.delay {
-        // Clamp to the same 100ms floor the config-file path enforces (config.rs),
-        // otherwise `--delay 0` drives both the collector thread and the main loop
-        // into a 100% CPU busy-loop.
-        config.refresh_rate_ms = delay.max(100);
-    }
-    if args.tree {
-        config.tree_view_default = true;
-    }
-    if args.no_color {
-        config.color_scheme = ui::colors::ColorScheme::Monochrome;
-    }
-    if args.readonly {
-        config.readonly = true;
-    }
-    if let Some(delay) = args.highlight_changes {
-        config.highlight_new_processes = true;
-        config.highlight_duration_ms = delay * 1000;
-    }
-
-    let mut app = App::new(config.clone());
+    let mut app = App::new(config);
+    app.set_runtime_readonly(args.readonly);
+    app.update_checked = update_just_applied;
 
     // Apply user filter from CLI
     if let Some(ref user) = args.user {
@@ -571,7 +594,10 @@ fn run_tui_inner(
     }
 
     // Spawn background data collector and wait for initial snapshot
-    let (collector, data_rx) = data::DataCollector::spawn(app.config.refresh_rate_ms);
+    let (collector, data_rx) = data::DataCollector::spawn_with_enrichment(
+        app.config.refresh_rate_ms,
+        app.canonical_enrichment_requirements(),
+    );
     if let Ok(snapshot) = data_rx.recv() {
         app.apply_snapshot(snapshot);
     }
@@ -597,7 +623,6 @@ fn run_tui_inner(
     let result = run_app(
         &mut terminal,
         &mut app,
-        &config,
         bench_stats.as_mut(),
         update_rx,
         data_rx,
@@ -606,7 +631,9 @@ fn run_tui_inner(
 
     // Persist any config change still pending from the debounced hot paths
     // (meter clicks / arrow-key meter cycling).
-    app.flush_config();
+    if !app.retry_config_save() && result.is_ok() {
+        return Err("Failed to save configuration".into());
+    }
 
     result
 }
@@ -614,16 +641,17 @@ fn run_tui_inner(
 fn run_app(
     terminal: &mut Terminal,
     app: &mut App,
-    _config: &Config,
     mut bench_stats: Option<&mut BenchmarkStats>,
     update_rx: std::sync::mpsc::Receiver<installer::UpdateStatus>,
-    data_rx: std::sync::mpsc::Receiver<data::SystemSnapshot>,
+    data_rx: data::SnapshotReceiver,
     collector: &data::DataCollector,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_tick = Instant::now();
     let mut needs_redraw = true;
 
     loop {
+        collector.set_enrichment_requirements(app.canonical_enrichment_requirements());
+
         // Read tick rate from app.config so it updates dynamically
         let tick_rate = Duration::from_millis(app.config.refresh_rate_ms);
 
@@ -660,7 +688,9 @@ fn run_app(
                     needs_redraw = true;
                 }
                 Event::Mouse(mouse) => {
-                    input::handle_mouse_event(app, mouse);
+                    if input::handle_mouse_event(app, mouse) {
+                        return Ok(());
+                    }
                     // Sync shared state with background collector
                     collector.paused.store(app.paused, Ordering::Relaxed);
                     collector
@@ -689,26 +719,24 @@ fn run_app(
                         Instant::now(),
                     ));
                 }
-                installer::UpdateStatus::None => {
+                installer::UpdateStatus::UpToDate => {
                     app.status_message = Some((
                         format!("v{} Up-to-date!", env!("CARGO_PKG_VERSION")),
                         Instant::now(),
                     ));
                 }
+                installer::UpdateStatus::Failed(error) => {
+                    app.status_message =
+                        Some((format!("Update check failed: {error}"), Instant::now()));
+                }
             }
             needs_redraw = true;
         }
 
-        // Apply latest system data from background collector (drain to newest)
+        // The collector's capacity-one slot has already discarded superseded
+        // snapshots, so one non-blocking receive is always the newest state.
         {
-            let mut latest = None;
-            while let Ok(snapshot) = data_rx.try_recv() {
-                // Recycle superseded snapshots' process vecs
-                if let Some(prev) = latest.replace(snapshot) {
-                    let _ = collector.recycle_tx.send(prev.processes);
-                }
-            }
-            if let Some(snapshot) = latest {
+            if let Ok(snapshot) = data_rx.try_recv() {
                 if let Some(stats) = bench_stats.as_mut() {
                     stats.record_refresh(snapshot.refresh_duration);
                 }
@@ -742,5 +770,23 @@ fn run_app(
             // zero-duration poll timeout (which drives CPU usage up).
             last_tick = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_readonly_is_not_written_into_persisted_config() {
+        let args = Args {
+            readonly: true,
+            ..Args::default()
+        };
+        let mut config = Config::default();
+
+        apply_config_overrides(&mut config, &args);
+
+        assert!(!config.readonly);
     }
 }

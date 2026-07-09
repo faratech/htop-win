@@ -1,7 +1,11 @@
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 mod cpu;
 #[cfg(windows)]
 mod d3dkmt;
 #[cfg(not(windows))]
+#[allow(dead_code)]
 mod d3dkmt {
     use std::collections::HashMap;
 
@@ -76,8 +80,9 @@ pub use memory::{MemoryInfo, format_bytes};
 #[allow(unused_imports)]
 pub use process::ProcessArch;
 pub use process::{
-    ProcessInfo, enable_debug_privilege, enrich_processes, get_process_affinity,
-    get_process_exe_path, get_process_io_counters, kill_process, set_efficiency_mode,
+    ProcessEnrichmentRequirements, ProcessIdentity, ProcessInfo, enable_debug_privilege,
+    enrich_processes, enrich_processes_for, get_process_affinity, get_process_exe_path,
+    get_process_io_counters, hydrate_processes_from_cache, kill_process, set_efficiency_mode,
     set_priority_class, set_process_affinity,
 };
 
@@ -110,14 +115,13 @@ pub struct SystemMetrics {
     // NPU (None when no MCDM compute-only adapter exists)
     pub npu: Option<NpuInfo>,
     // Previous values for rate calculation
-    prev_net_rx: u64,
-    prev_net_tx: u64,
-    prev_net_sample: std::time::Instant,
-    prev_disk_read: u64,
-    prev_disk_write: u64,
+    prev_network: Option<HashMap<u64, NetworkCounters>>,
+    prev_net_sample: Option<Instant>,
     // Native process enumeration state
-    prev_total_cpu_time: u64,
-    last_native_refresh: std::time::Instant,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    logical_processor_count: usize,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    last_native_refresh: Instant,
 }
 
 impl Default for SystemMetrics {
@@ -143,13 +147,10 @@ impl Default for SystemMetrics {
             battery_charging: false,
             gpu: None,
             npu: None,
-            prev_net_rx: 0,
-            prev_net_tx: 0,
-            prev_net_sample: std::time::Instant::now(),
-            prev_disk_read: 0,
-            prev_disk_write: 0,
-            prev_total_cpu_time: 0,
-            last_native_refresh: std::time::Instant::now(),
+            prev_network: None,
+            prev_net_sample: None,
+            logical_processor_count: active_logical_processor_count(),
+            last_native_refresh: Instant::now(),
         }
     }
 }
@@ -205,10 +206,16 @@ fn get_hostname() -> String {
         .unwrap_or_else(|_| "unknown".to_string())
 }
 
-/// Network interface statistics
-struct NetworkStats {
+/// Cumulative counters for one network interface.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NetworkCounters {
     rx_bytes: u64,
     tx_bytes: u64,
+}
+
+/// Network interface statistics keyed by the Windows interface LUID.
+struct NetworkStats {
+    interfaces: HashMap<u64, NetworkCounters>,
 }
 
 #[inline]
@@ -220,48 +227,146 @@ fn bytes_per_second(delta: u64, elapsed_secs: f64) -> u64 {
     }
 }
 
+/// Convert a wall-clock sample interval into total CPU capacity in the same
+/// 100-nanosecond units used by SYSTEM_PROCESS_INFORMATION.
+#[inline]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn cpu_capacity_100ns(elapsed: Duration, logical_processor_count: usize) -> u64 {
+    let capacity = elapsed
+        .as_nanos()
+        .saturating_mul(logical_processor_count.max(1) as u128)
+        / 100;
+    capacity.min(u64::MAX as u128) as u64
+}
+
+#[inline]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn process_cpu_percentage(time_delta: u64, capacity_delta: u64) -> f32 {
+    if capacity_delta == 0 {
+        0.0
+    } else {
+        ((time_delta as f64 / capacity_delta as f64 * 100.0) as f32).clamp(0.0, 100.0)
+    }
+}
+
+#[cfg(windows)]
+fn active_logical_processor_count() -> usize {
+    use windows::Win32::System::Threading::{
+        GetActiveProcessorCount, GetActiveProcessorGroupCount,
+    };
+
+    let count = unsafe {
+        let groups = GetActiveProcessorGroupCount();
+        (0..groups)
+            .map(|group| GetActiveProcessorCount(group) as usize)
+            .sum::<usize>()
+    };
+    count.max(1)
+}
+
+#[cfg(not(windows))]
+fn active_logical_processor_count() -> usize {
+    std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+}
+
+/// Calculate totals and rates without allowing new, removed, or reset
+/// interfaces to contribute lifetime counters to the interval rate.
+fn network_totals_and_rates(
+    current: &HashMap<u64, NetworkCounters>,
+    previous: Option<&HashMap<u64, NetworkCounters>>,
+    elapsed_secs: f64,
+) -> (u64, u64, u64, u64) {
+    let mut total_rx = 0u64;
+    let mut total_tx = 0u64;
+    let mut delta_rx = 0u64;
+    let mut delta_tx = 0u64;
+
+    for (identity, counters) in current {
+        total_rx = total_rx.saturating_add(counters.rx_bytes);
+        total_tx = total_tx.saturating_add(counters.tx_bytes);
+
+        if let Some(old) = previous.and_then(|interfaces| interfaces.get(identity)) {
+            if counters.rx_bytes >= old.rx_bytes {
+                delta_rx = delta_rx.saturating_add(counters.rx_bytes - old.rx_bytes);
+            }
+            if counters.tx_bytes >= old.tx_bytes {
+                delta_tx = delta_tx.saturating_add(counters.tx_bytes - old.tx_bytes);
+            }
+        }
+    }
+
+    (
+        total_rx,
+        total_tx,
+        bytes_per_second(delta_rx, elapsed_secs),
+        bytes_per_second(delta_tx, elapsed_secs),
+    )
+}
+
+#[inline]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn aggregate_io_rates(io_rates: &HashMap<u32, (u64, u64)>) -> (u64, u64) {
+    io_rates.values().fold((0u64, 0u64), |totals, rates| {
+        (
+            totals.0.saturating_add(rates.0),
+            totals.1.saturating_add(rates.1),
+        )
+    })
+}
+
+#[inline]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_displayed_task(pid: u32) -> bool {
+    pid != 0
+}
+
 /// Get network I/O stats using native Windows IP Helper API
 #[cfg(windows)]
-fn get_network_stats() -> NetworkStats {
+fn get_network_stats() -> Option<NetworkStats> {
     use windows::Win32::Foundation::WIN32_ERROR;
     use windows::Win32::NetworkManagement::IpHelper::{
         FreeMibTable, GetIfTable2, IF_TYPE_SOFTWARE_LOOPBACK, MIB_IF_TABLE2,
     };
     use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 
-    let mut total_rx: u64 = 0;
-    let mut total_tx: u64 = 0;
+    let mut interfaces = HashMap::new();
 
     unsafe {
         let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
-        if GetIfTable2(&mut table) == WIN32_ERROR(0) && !table.is_null() {
-            let num_entries = (*table).NumEntries as usize;
-            let entries = std::slice::from_raw_parts((*table).Table.as_ptr(), num_entries);
-
-            for entry in entries {
-                // Skip loopback and non-operational interfaces
-                if entry.OperStatus == IfOperStatusUp && entry.Type != IF_TYPE_SOFTWARE_LOOPBACK {
-                    total_rx += entry.InOctets;
-                    total_tx += entry.OutOctets;
-                }
-            }
-
-            FreeMibTable(table as *const _);
+        if GetIfTable2(&mut table) != WIN32_ERROR(0) || table.is_null() {
+            return None;
         }
+
+        let num_entries = (*table).NumEntries as usize;
+        let entries = std::slice::from_raw_parts((*table).Table.as_ptr(), num_entries);
+
+        for entry in entries {
+            // Skip loopback and non-operational interfaces. Omitting a down
+            // interface also discards its baseline so reconnecting starts at 0.
+            if entry.OperStatus == IfOperStatusUp && entry.Type != IF_TYPE_SOFTWARE_LOOPBACK {
+                interfaces.insert(
+                    entry.InterfaceLuid.Value,
+                    NetworkCounters {
+                        rx_bytes: entry.InOctets,
+                        tx_bytes: entry.OutOctets,
+                    },
+                );
+            }
+        }
+
+        FreeMibTable(table as *const _);
     }
 
-    NetworkStats {
-        rx_bytes: total_rx,
-        tx_bytes: total_tx,
-    }
+    Some(NetworkStats { interfaces })
 }
 
 #[cfg(not(windows))]
-fn get_network_stats() -> NetworkStats {
-    NetworkStats {
-        rx_bytes: 0,
-        tx_bytes: 0,
-    }
+fn get_network_stats() -> Option<NetworkStats> {
+    Some(NetworkStats {
+        interfaces: HashMap::new(),
+    })
 }
 
 impl SystemMetrics {
@@ -283,19 +388,23 @@ impl SystemMetrics {
         }
 
         // Update network I/O using native API
-        {
-            let net_stats = get_network_stats();
-            let now = std::time::Instant::now();
-            let elapsed = now.duration_since(self.prev_net_sample).as_secs_f64();
-            self.net_rx_rate =
-                bytes_per_second(net_stats.rx_bytes.saturating_sub(self.prev_net_rx), elapsed);
-            self.net_tx_rate =
-                bytes_per_second(net_stats.tx_bytes.saturating_sub(self.prev_net_tx), elapsed);
-            self.prev_net_sample = now;
-            self.prev_net_rx = net_stats.rx_bytes;
-            self.prev_net_tx = net_stats.tx_bytes;
-            self.net_rx_bytes = net_stats.rx_bytes;
-            self.net_tx_bytes = net_stats.tx_bytes;
+        if let Some(net_stats) = get_network_stats() {
+            let now = Instant::now();
+            let elapsed = self
+                .prev_net_sample
+                .map(|sample| now.duration_since(sample).as_secs_f64())
+                .unwrap_or(0.0);
+            let (rx_bytes, tx_bytes, rx_rate, tx_rate) = network_totals_and_rates(
+                &net_stats.interfaces,
+                self.prev_network.as_ref(),
+                elapsed,
+            );
+            self.net_rx_bytes = rx_bytes;
+            self.net_tx_bytes = tx_bytes;
+            self.net_rx_rate = rx_rate;
+            self.net_tx_rate = tx_rate;
+            self.prev_network = Some(net_stats.interfaces);
+            self.prev_net_sample = Some(now);
         }
 
         // Update battery status
@@ -338,43 +447,34 @@ impl SystemMetrics {
     pub fn update_processes_native(&mut self, processes: &mut Vec<ProcessInfo>) {
         use self::cache::CACHE;
         use self::native::{calculate_process_rates, with_process_list};
-        use std::collections::{HashMap, HashSet};
-
-        // Periodically clean up stale PIDs from caches
-        if CACHE.should_cleanup() {
-            let current_pids: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
-            self::process::cleanup_stale_caches(&current_pids);
-        }
+        use std::collections::HashSet;
 
         // On query failure (None), keep the previous process list and baselines
         // untouched rather than blanking the table for a frame.
         let _ = with_process_list(|proc_list| {
             // Update time tracking for CPU delta calculation
-            let now = std::time::Instant::now();
-            let disk_elapsed = now.duration_since(self.last_native_refresh).as_secs_f64();
+            let now = Instant::now();
+            let cpu_capacity = cpu_capacity_100ns(
+                now.duration_since(self.last_native_refresh),
+                self.logical_processor_count,
+            );
             self.last_native_refresh = now;
 
-            // First pass: Calculate totals and CPU percentages
-            let mut total_cpu_time: u64 = 0;
+            // First pass: calculate process and cumulative I/O totals.
             let mut tasks_total = 0;
             let mut threads_total = 0;
             let mut total_disk_read: u64 = 0;
             let mut total_disk_write: u64 = 0;
 
             for proc in proc_list.iter() {
-                total_cpu_time += proc.kernel_time() + proc.user_time();
-                tasks_total += 1;
+                tasks_total += usize::from(is_displayed_task(proc.pid()));
                 threads_total += proc.thread_count() as usize;
-                total_disk_read += proc.read_bytes();
-                total_disk_write += proc.write_bytes();
+                total_disk_read = total_disk_read.saturating_add(proc.read_bytes());
+                total_disk_write = total_disk_write.saturating_add(proc.write_bytes());
             }
 
-            // Calculate delta (100-nanosecond units)
-            let cpu_delta = total_cpu_time.saturating_sub(self.prev_total_cpu_time);
-            self.prev_total_cpu_time = total_cpu_time;
-
             // Get CPU percentages and I/O rates based on cache deltas
-            let rates = calculate_process_rates(&proc_list, cpu_delta);
+            let rates = calculate_process_rates(&proc_list, cpu_capacity);
 
             // Update global stats
             self.tasks_total = tasks_total;
@@ -384,16 +484,7 @@ impl SystemMetrics {
             self.tasks_sleeping = 0;
             self.threads_total = threads_total;
 
-            self.disk_read_rate = bytes_per_second(
-                total_disk_read.saturating_sub(self.prev_disk_read),
-                disk_elapsed,
-            );
-            self.disk_write_rate = bytes_per_second(
-                total_disk_write.saturating_sub(self.prev_disk_write),
-                disk_elapsed,
-            );
-            self.prev_disk_read = total_disk_read;
-            self.prev_disk_write = total_disk_write;
+            (self.disk_read_rate, self.disk_write_rate) = aggregate_io_rates(&rates.io_rates);
             self.disk_read_bytes = total_disk_read;
             self.disk_write_bytes = total_disk_write;
 
@@ -469,6 +560,12 @@ impl SystemMetrics {
             if !new_processes.is_empty() {
                 processes.append(&mut new_processes);
             }
+
+            // Only a successful kernel query may evict cached identities. The
+            // input vector can legitimately be empty while awaiting UI reuse.
+            if CACHE.should_cleanup() {
+                self::process::cleanup_stale_caches(&seen_pids);
+            }
         });
     }
 
@@ -483,5 +580,103 @@ impl SystemMetrics {
         self.disk_write_bytes = 0;
         self.disk_read_rate = 0;
         self.disk_write_rate = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn counters(rx_bytes: u64, tx_bytes: u64) -> NetworkCounters {
+        NetworkCounters { rx_bytes, tx_bytes }
+    }
+
+    #[test]
+    fn cpu_capacity_uses_all_logical_processors() {
+        assert_eq!(
+            cpu_capacity_100ns(Duration::from_secs(1), 128),
+            1_280_000_000
+        );
+        assert_eq!(cpu_capacity_100ns(Duration::ZERO, 128), 0);
+        assert_eq!(
+            cpu_capacity_100ns(Duration::from_secs(u64::MAX), 128),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn process_cpu_percentage_is_bounded_and_zero_safe() {
+        assert_eq!(process_cpu_percentage(250, 1_000), 25.0);
+        assert_eq!(process_cpu_percentage(1, 0), 0.0);
+        assert_eq!(process_cpu_percentage(2_000, 1_000), 100.0);
+    }
+
+    #[test]
+    fn network_first_sample_and_new_interfaces_start_at_zero() {
+        let first = HashMap::from([(1, counters(10_000, 20_000))]);
+        assert_eq!(
+            network_totals_and_rates(&first, None, 1.0),
+            (10_000, 20_000, 0, 0)
+        );
+
+        let second = HashMap::from([(1, counters(10_500, 20_250)), (2, counters(99_000, 88_000))]);
+        assert_eq!(
+            network_totals_and_rates(&second, Some(&first), 0.5),
+            (109_500, 108_250, 1_000, 500)
+        );
+    }
+
+    #[test]
+    fn network_interface_churn_and_counter_resets_do_not_spike() {
+        let before_disconnect =
+            HashMap::from([(1, counters(1_000, 2_000)), (2, counters(5_000, 6_000))]);
+        let disconnected = HashMap::from([(2, counters(5_100, 6_200))]);
+        assert_eq!(
+            network_totals_and_rates(&disconnected, Some(&before_disconnect), 1.0),
+            (5_100, 6_200, 100, 200)
+        );
+
+        let reconnected =
+            HashMap::from([(1, counters(50_000, 60_000)), (2, counters(5_200, 6_300))]);
+        assert_eq!(
+            network_totals_and_rates(&reconnected, Some(&disconnected), 1.0),
+            (55_200, 66_300, 100, 100)
+        );
+
+        let reset = HashMap::from([(1, counters(10, 20)), (2, counters(5_300, 6_400))]);
+        assert_eq!(
+            network_totals_and_rates(&reset, Some(&reconnected), 1.0),
+            (5_310, 6_420, 100, 100)
+        );
+    }
+
+    #[test]
+    fn disk_aggregate_saturates_and_excludes_no_current_rate() {
+        let rates = HashMap::from([(10, (100, 200)), (20, (300, 400))]);
+        assert_eq!(aggregate_io_rates(&rates), (400, 600));
+
+        let overflowing = HashMap::from([(10, (u64::MAX, u64::MAX)), (20, (1, 1))]);
+        assert_eq!(aggregate_io_rates(&overflowing), (u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn system_idle_process_is_not_a_displayed_task() {
+        assert!(!is_displayed_task(0));
+        assert!(is_displayed_task(4));
+    }
+
+    #[test]
+    fn enrichment_requirement_bits_round_trip_and_compare_coverage() {
+        let required = ProcessEnrichmentRequirements {
+            user: true,
+            exe_path: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            ProcessEnrichmentRequirements::from_bits(required.bits()),
+            required
+        );
+        assert!(ProcessEnrichmentRequirements::visible(true).contains(required));
+        assert!(!ProcessEnrichmentRequirements::default().contains(required));
     }
 }

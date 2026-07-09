@@ -66,9 +66,13 @@ def get_env_for_target(target_name: str) -> dict:
     return env
 
 
-def run_command(cmd: list, env: dict = None, cwd: Path = None) -> bool:
+def run_command(
+    cmd: list, env: dict = None, cwd: Path = None, dry_run: bool = False
+) -> bool:
     """Run a command and return success status."""
     print(f"\n>>> Running: {' '.join(cmd)}")
+    if dry_run:
+        return True
     try:
         subprocess.run(
             cmd,
@@ -82,39 +86,61 @@ def run_command(cmd: list, env: dict = None, cwd: Path = None) -> bool:
         return False
 
 
-def check_prerequisites() -> bool:
-    """Check that required tools are available."""
-    print("Checking prerequisites...")
+def check_prerequisites(target_names: list[str], dry_run: bool = False) -> bool:
+    """Check only the tools required by the requested targets."""
+    print(f"Checking prerequisites for: {', '.join(target_names)}")
+    if dry_run:
+        return True
 
-    # Check cargo
-    if shutil.which("cargo") is None:
-        print("Error: cargo not found")
-        return False
+    missing = False
 
-    # Check x64 mingw
-    if shutil.which("x86_64-w64-mingw32-gcc") is None:
-        print("Error: x86_64-w64-mingw32-gcc not found")
-        print("Install with: apt install gcc-mingw-w64-x86-64")
-        return False
+    for tool in ("cargo", "rustup"):
+        if shutil.which(tool) is None:
+            print(f"Error: {tool} not found")
+            missing = True
 
-    # Check llvm-mingw for ARM64
-    aarch64_clang = LLVM_MINGW / "aarch64-w64-mingw32-clang"
-    if not aarch64_clang.exists():
-        print(f"Error: llvm-mingw not found at {LLVM_MINGW}")
-        print("ARM64 builds will not be available")
-        return False
+    if "x64" in target_names:
+        x64_tools = (
+            "x86_64-w64-mingw32-gcc",
+            "x86_64-w64-mingw32-ar",
+            "x86_64-w64-mingw32-windres",
+        )
+        for tool in x64_tools:
+            if shutil.which(tool) is None:
+                print(f"Error: {tool} not found")
+                missing = True
+        if any(shutil.which(tool) is None for tool in x64_tools):
+            print(
+                "Install with: apt install gcc-mingw-w64-x86-64 "
+                "binutils-mingw-w64-x86-64"
+            )
 
-    print("All prerequisites met.")
-    return True
+    if "arm64" in target_names:
+        arm64_tools = (
+            "aarch64-w64-mingw32-clang",
+            "llvm-ar",
+            "aarch64-w64-mingw32-windres",
+        )
+        for tool in arm64_tools:
+            if not (LLVM_MINGW / tool).exists():
+                print(f"Error: {tool} not found in {LLVM_MINGW}")
+                missing = True
+        if any(not (LLVM_MINGW / tool).exists() for tool in arm64_tools):
+            print("Install the ARM64 LLVM-MinGW toolchain before building ARM64")
+
+    if not missing:
+        print("All prerequisites met.")
+    return not missing
 
 
-def ensure_targets() -> bool:
-    """Ensure Rust targets are installed."""
+def ensure_targets(target_names: list[str], dry_run: bool = False) -> bool:
+    """Ensure only the requested Rust targets are installed."""
     print("\nEnsuring Rust targets are installed...")
 
-    for name, target in TARGETS.items():
+    for name in target_names:
+        target = TARGETS[name]
         cmd = ["rustup", "target", "add", target["triple"]]
-        if not run_command(cmd):
+        if not run_command(cmd, dry_run=dry_run):
             print(f"Failed to add target {target['triple']}")
             return False
 
@@ -152,7 +178,9 @@ def copy_to_output(target_name: str) -> Path | None:
     return final_path
 
 
-def build_target(target_name: str, jobs: int = None) -> bool:
+def build_target(
+    target_name: str, jobs: int = None, dry_run: bool = False
+) -> bool:
     """Build for a specific target.
 
     Args:
@@ -173,10 +201,10 @@ def build_target(target_name: str, jobs: int = None) -> bool:
 
     cmd = ["cargo", "build", "--release", "--target", triple, "-j", str(num_jobs)]
 
-    return run_command(cmd, env=env, cwd=PROJECT_DIR)
+    return run_command(cmd, env=env, cwd=PROJECT_DIR, dry_run=dry_run)
 
 
-def check_target(target_name: str) -> bool:
+def check_target(target_name: str, dry_run: bool = False) -> bool:
     """Check (compile without linking) for a specific target."""
     target = TARGETS[target_name]
     triple = target["triple"]
@@ -188,7 +216,7 @@ def check_target(target_name: str) -> bool:
     env = get_env_for_target(target_name)
     cmd = ["cargo", "check", "--target", triple]
 
-    return run_command(cmd, env=env, cwd=PROJECT_DIR)
+    return run_command(cmd, env=env, cwd=PROJECT_DIR, dry_run=dry_run)
 
 
 def get_system_memory_gb() -> float:
@@ -230,9 +258,15 @@ def main():
         default=None,
         help=f"Number of parallel jobs (default: {CPU_COUNT} - all CPUs)"
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print selected target commands without executing them",
+    )
 
     args = parser.parse_args()
     jobs = args.jobs
+    target_names = list(TARGETS) if args.action == "build-all" else [args.target]
 
     # Display system info
     mem_gb = get_system_memory_gb()
@@ -246,22 +280,25 @@ def main():
     print(f"  Output directory: {OUTPUT_DIR}")
 
     # Check prerequisites
-    if not check_prerequisites():
+    if not check_prerequisites(target_names, dry_run=args.dry_run):
         sys.exit(1)
 
     if args.action == "check":
-        if not ensure_targets():
+        if not ensure_targets(target_names, dry_run=args.dry_run):
             sys.exit(1)
-        if not check_target(args.target):
+        if not check_target(args.target, dry_run=args.dry_run):
             sys.exit(1)
-        print(f"\n{args.target} check passed!")
+        print(f"\n{args.target} {'dry run complete' if args.dry_run else 'check passed'}!")
 
     elif args.action == "build":
-        if not ensure_targets():
+        if not ensure_targets(target_names, dry_run=args.dry_run):
             sys.exit(1)
-        if not build_target(args.target, jobs):
+        if not build_target(args.target, jobs, dry_run=args.dry_run):
             sys.exit(1)
 
+        if args.dry_run:
+            print(f"\n{args.target} dry run complete!")
+            return
         output = copy_to_output(args.target)
         if output:
             print(f"\nBuild successful!")
@@ -272,12 +309,18 @@ def main():
             sys.exit(1)
 
     elif args.action == "build-all":
-        if not ensure_targets():
+        if not ensure_targets(target_names, dry_run=args.dry_run):
             sys.exit(1)
 
         results = {}
-        for target_name in TARGETS:
-            results[target_name] = build_target(target_name, jobs)
+        for target_name in target_names:
+            results[target_name] = build_target(
+                target_name, jobs, dry_run=args.dry_run
+            )
+
+        if args.dry_run:
+            print("\nAll-target dry run complete!")
+            return
 
         print(f"\n{'='*60}")
         print("Build Summary")

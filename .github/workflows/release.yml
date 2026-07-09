@@ -20,7 +20,84 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.source.outputs.tag }}
+      sha: ${{ steps.source.outputs.sha }}
+      version: ${{ steps.source.outputs.version }}
+      prerelease: ${{ steps.source.outputs.prerelease }}
+
+    steps:
+      - name: Checkout repository history
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Resolve and validate release source
+        id: source
+        shell: bash
+        env:
+          SELECTED_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          TAG="$SELECTED_TAG"
+          if ! git check-ref-format "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Invalid release tag: $TAG" >&2
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet "refs/tags/$TAG"; then
+            echo "Release tag does not exist: $TAG" >&2
+            exit 1
+          fi
+
+          SHA="$(git rev-parse --verify "refs/tags/$TAG^{commit}")"
+          git checkout --detach "$SHA"
+          PACKAGE_VERSION="$(cargo metadata --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "htop-win") | .version')"
+
+          TAG="$TAG" PACKAGE_VERSION="$PACKAGE_VERSION" python3 - <<'PY'
+          import os
+          import re
+
+          tag = os.environ["TAG"]
+          package_version = os.environ["PACKAGE_VERSION"]
+          if not tag.startswith("v"):
+              raise SystemExit(f"Release tag must start with 'v': {tag}")
+
+          tag_version = tag[1:]
+          semver = re.compile(
+              r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+              r"(?:-(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
+              r"(?:\.(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*))*)?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
+          )
+          match = semver.fullmatch(tag_version)
+          if match is None:
+              raise SystemExit(f"Release tag is not strict SemVer: {tag}")
+          if any(int(component) > 65535 for component in match.groups()[:3]):
+              raise SystemExit(
+                  f"Release tag {tag} exceeds the Windows resource component limit of 65535"
+              )
+          if tag_version != package_version:
+              raise SystemExit(
+                  f"Tag/package version mismatch: {tag_version} != {package_version}"
+              )
+          PY
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+          VERSION_WITHOUT_BUILD="${PACKAGE_VERSION%%+*}"
+          if [[ "$VERSION_WITHOUT_BUILD" == *-* ]]; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Release source: $TAG ($SHA), package $PACKAGE_VERSION" >> "$GITHUB_STEP_SUMMARY"
+
   build:
+    needs: prepare
     strategy:
       matrix:
         include:
@@ -35,7 +112,18 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Verify release source
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          echo "Building ${{ needs.prepare.outputs.tag }} from $EXPECTED_SHA" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -47,10 +135,21 @@ jobs:
 
       - name: Rename binary
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+          RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+          BUILD_TARGET: ${{ matrix.target }}
         run: |
           $src = "target/${{ matrix.target }}/release/htop-win.exe"
           $dst = "htop-win-${{ matrix.arch }}.exe"
           Copy-Item $src $dst
+          [ordered]@{
+            tag = $env:RELEASE_TAG
+            sha = $env:RELEASE_SHA
+            version = $env:RELEASE_VERSION
+            target = $env:BUILD_TARGET
+          } | ConvertTo-Json | Set-Content -NoNewline "htop-win-${{ matrix.arch }}.source.json"
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v4
@@ -61,17 +160,20 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
-          name: htop-win-${{ matrix.arch }}
-          path: htop-win-${{ matrix.arch }}.exe
+          name: htop-win-${{ matrix.arch }}-${{ needs.prepare.outputs.sha }}
+          path: |
+            htop-win-${{ matrix.arch }}.exe
+            htop-win-${{ matrix.arch }}.source.json
 
   release:
-    needs: build
+    needs: [prepare, build]
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
+          ref: ${{ needs.prepare.outputs.sha }}
           fetch-depth: 0  # Need full history to access tag annotations
 
       - name: Download all artifacts
@@ -80,33 +182,29 @@ jobs:
           path: artifacts
           merge-multiple: true
 
-      - name: Determine tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ inputs.tag }}" >> $GITHUB_OUTPUT
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          fi
-
       - name: Get tag message
         id: tag_message
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          EXPECTED_SHA: ${{ needs.prepare.outputs.sha }}
         run: |
-          TAG="${{ steps.tag.outputs.tag }}"
-          # Get the tag annotation message (excludes the tag name line)
-          MESSAGE=$(git tag -l --format='%(contents)' "$TAG")
-          # Write to file to preserve newlines
-          echo "$MESSAGE" > release_notes.md
+          set -euo pipefail
+          test "$(git rev-parse --verify "refs/tags/$TAG^{commit}")" = "$EXPECTED_SHA"
+          git for-each-ref --format='%(contents)' "refs/tags/$TAG" > release_notes.md
           echo "Generated release notes for $TAG"
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: htop-win ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ needs.prepare.outputs.sha }}
+          name: htop-win ${{ needs.prepare.outputs.tag }}
           draft: false
-          prerelease: false
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
           files: |
             artifacts/htop-win-amd64.exe
+            artifacts/htop-win-amd64.source.json
             artifacts/htop-win-arm64.exe
+            artifacts/htop-win-arm64.source.json
           body_path: release_notes.md

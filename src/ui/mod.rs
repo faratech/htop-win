@@ -97,7 +97,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         DialogState::Filter { .. } => dialogs::draw_filter(frame, app),
         DialogState::SortSelect { .. } => dialogs::draw_sort_select(frame, app),
         DialogState::Kill { .. } => dialogs::draw_kill_confirm(frame, app),
-        DialogState::SignalSelect { .. } => dialogs::draw_signal_select(frame, app),
         DialogState::Priority { .. } => dialogs::draw_priority(frame, app),
         DialogState::Setup { .. } => dialogs::draw_setup(frame, app),
         DialogState::ProcessInfo { .. } => dialogs::draw_process_info(frame, app),

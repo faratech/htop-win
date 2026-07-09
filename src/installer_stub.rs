@@ -3,7 +3,8 @@ use std::path::PathBuf;
 #[derive(Clone)]
 pub enum UpdateStatus {
     Downloaded { version: String, path: PathBuf },
-    None,
+    UpToDate,
+    Failed(String),
 }
 
 pub fn install_to_path(_force: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -20,6 +21,6 @@ pub fn apply_pending_update() -> bool {
 
 pub fn spawn_update_check() -> std::sync::mpsc::Receiver<UpdateStatus> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let _ = tx.send(UpdateStatus::None);
+    let _ = tx.send(UpdateStatus::UpToDate);
     rx
 }

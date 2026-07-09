@@ -344,28 +344,7 @@ fn write_value(out: &mut String, value: &Value, indent: usize) {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         Value::Number(n) => out.push_str(&n.to_string()),
-        Value::String(s) => {
-            use std::fmt::Write as _;
-            out.push('"');
-            for c in s.chars() {
-                match c {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    '\x08' => out.push_str("\\b"),
-                    '\x0c' => out.push_str("\\f"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '\t' => out.push_str("\\t"),
-                    // Remaining control chars must be escaped too — raw ones
-                    // are invalid JSON (write! to a String cannot fail).
-                    c if (c as u32) < 0x20 => {
-                        let _ = write!(out, "\\u{:04x}", c as u32);
-                    }
-                    c => out.push(c),
-                }
-            }
-            out.push('"');
-        }
+        Value::String(s) => write_json_string(out, s),
         Value::Array(arr) => {
             if arr.is_empty() {
                 out.push_str("[]");
@@ -399,9 +378,8 @@ fn write_value(out: &mut String, value: &Value, indent: usize) {
                     for _ in 0..indent + 2 {
                         out.push(' ');
                     }
-                    out.push('"');
-                    out.push_str(key);
-                    out.push_str("\": ");
+                    write_json_string(out, key);
+                    out.push_str(": ");
                     write_value(out, value, indent + 2);
                     if i < keys.len() - 1 {
                         out.push(',');
@@ -415,6 +393,30 @@ fn write_value(out: &mut String, value: &Value, indent: usize) {
             }
         }
     }
+}
+
+fn write_json_string(out: &mut String, value: &str) {
+    use std::fmt::Write as _;
+
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\x08' => out.push_str("\\b"),
+            '\x0c' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            // Remaining control chars must be escaped too; raw ones are
+            // invalid JSON (write! to a String cannot fail).
+            c if (c as u32) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 #[cfg(test)]
@@ -510,6 +512,26 @@ mod tests {
     fn test_serializer_escapes_control_chars() {
         let serialized = to_string_pretty(&Value::String("\x01".to_string()));
         assert_eq!(serialized, "\"\\u0001\"");
+    }
+
+    #[test]
+    fn test_object_key_escape_roundtrip() {
+        let keys = [
+            "quote\"key",
+            "backslash\\key",
+            "line\nbreak",
+            "control\x01key",
+            "unicode-\u{2603}",
+        ];
+        let original = Value::Object(
+            keys.into_iter()
+                .enumerate()
+                .map(|(index, key)| (key.to_string(), Value::Number(index as i64)))
+                .collect(),
+        );
+
+        let serialized = to_string_pretty(&original);
+        assert_eq!(parse(&serialized), Some(original));
     }
 
     #[test]

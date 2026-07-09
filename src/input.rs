@@ -83,6 +83,12 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // F10 is the global quit command advertised by the footer. Handle it
+    // before dialog/error dispatch so every keyboard path behaves identically.
+    if key.code == KeyCode::F(10) {
+        return app.handle_function_key(10);
+    }
+
     // Clear error on any key press
     if app.last_error.is_some() {
         app.clear_error();
@@ -96,7 +102,6 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         DialogState::Filter { .. } => handle_filter_keys(app, key),
         DialogState::SortSelect { .. } => handle_sort_select_keys(app, key),
         DialogState::Kill { .. } => handle_kill_keys(app, key),
-        DialogState::SignalSelect { .. } => handle_signal_select_keys(app, key),
         DialogState::Priority { .. } => handle_priority_keys(app, key),
         DialogState::Setup { .. } => handle_setup_keys(app, key),
         DialogState::ProcessInfo { .. } => handle_process_info_keys(app, key),
@@ -113,6 +118,10 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
 fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
     use crate::app::FocusRegion;
 
+    if key.code != KeyCode::Char('u') {
+        app.cancel_pending_user_select();
+    }
+
     // Check for max iterations exit
     if let Some(max) = app.max_iterations
         && app.iteration_count >= max
@@ -122,7 +131,7 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         // Quit
-        KeyCode::F(10) | KeyCode::Char('q') | KeyCode::Char('Q') => return true,
+        KeyCode::Char('q') | KeyCode::Char('Q') => return true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
 
         // Tab: switch screen tabs (like htop's Main/I/O tabs)
@@ -269,19 +278,19 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
 
         // Function keys
         KeyCode::F(1) | KeyCode::Char('?') => {
-            app.dialog = DialogState::Help { scroll: 0 };
+            app.handle_function_key(1);
         }
         KeyCode::F(2) | KeyCode::Char('S') => {
-            app.dialog = DialogState::Setup { selected: 0 };
+            app.handle_function_key(2);
         }
         KeyCode::F(3) | KeyCode::Char('/') => {
-            app.start_search();
+            app.handle_function_key(3);
         }
         KeyCode::F(4) | KeyCode::Char('\\') => {
-            app.start_filter();
+            app.handle_function_key(4);
         }
         KeyCode::F(5) | KeyCode::Char('t') => {
-            app.toggle_tree_view();
+            app.handle_function_key(5);
         }
         // Sort column menu (F6, >, ., <, ,)
         KeyCode::F(6)
@@ -289,23 +298,18 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
         | KeyCode::Char('.')
         | KeyCode::Char('<')
         | KeyCode::Char(',') => {
-            let columns = SortColumn::all();
-            let index = columns
-                .iter()
-                .position(|c| *c == app.sort_column)
-                .unwrap_or(0);
-            app.dialog = DialogState::SortSelect { index };
+            app.handle_function_key(6);
         }
         // Higher priority (F7, ])
         KeyCode::F(7) | KeyCode::Char(']') => {
-            app.enter_priority_mode(1);
+            app.handle_function_key(7);
         }
         // Lower priority (F8, [)
         KeyCode::F(8) | KeyCode::Char('[') => {
-            app.enter_priority_mode(-1);
+            app.handle_function_key(8);
         }
         KeyCode::F(9) => {
-            app.enter_kill_mode();
+            app.handle_function_key(9);
         }
         KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.enter_kill_mode();
@@ -348,7 +352,7 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
 
 fn handle_help_keys(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
-        KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') | KeyCode::F(10) => {
+        KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') => {
             app.dialog = DialogState::None;
         }
         other => {
@@ -365,14 +369,14 @@ fn handle_help_keys(app: &mut App, key: KeyEvent) -> bool {
 fn handle_search_keys(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => {
-            app.exit_mode();
+            app.cancel_dialog();
         }
         KeyCode::Enter => {
-            app.apply_search();
+            app.update_search_from_dialog(false);
             app.dialog = DialogState::None;
         }
         KeyCode::F(3) => {
-            app.apply_search();
+            app.update_search_from_dialog(false);
             app.find_next();
         }
         KeyCode::Backspace => {
@@ -412,7 +416,7 @@ fn handle_search_keys(app: &mut App, key: KeyEvent) -> bool {
 fn handle_filter_keys(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
         KeyCode::Esc => {
-            app.exit_mode();
+            app.cancel_dialog();
         }
         KeyCode::Enter => {
             app.apply_filter();
@@ -489,42 +493,20 @@ fn handle_kill_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         // Confirm: Enter, y, Y, Space
         KeyCode::Enter | KeyCode::Char(' ') => {
-            // Kill process with SIGTERM equivalent (15)
             if !app.tagged_pids.is_empty() {
-                app.kill_tagged(15);
+                app.kill_tagged();
             } else {
-                app.kill_target_process(15);
+                app.kill_target_process();
             }
             app.dialog = DialogState::None;
         }
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            // Kill process with SIGTERM equivalent (15)
             if !app.tagged_pids.is_empty() {
-                app.kill_tagged(15);
+                app.kill_tagged();
             } else {
-                app.kill_target_process(15);
+                app.kill_target_process();
             }
             app.dialog = DialogState::None;
-        }
-        KeyCode::Char('9') => {
-            // SIGKILL equivalent
-            if !app.tagged_pids.is_empty() {
-                app.kill_tagged(9);
-            } else {
-                app.kill_target_process(9);
-            }
-            app.dialog = DialogState::None;
-        }
-        KeyCode::Tab => {
-            // Switch to signal select dialog
-            if let DialogState::Kill { pid, name, command } = std::mem::take(&mut app.dialog) {
-                app.dialog = DialogState::SignalSelect {
-                    index: 0,
-                    pid,
-                    name,
-                    command,
-                };
-            }
         }
         _ => {}
     }
@@ -618,8 +600,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Esc | KeyCode::F(2) => {
-            app.save_config();
-            app.dialog = DialogState::None;
+            app.close_setup();
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             // Toggle the selected setting or open its submenu
@@ -638,49 +619,61 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                         2000 => 5000,
                         _ => 100,
                     };
+                    app.mark_config_dirty();
                 }
                 SetupItem::CpuMeterMode => {
                     app.config.cpu_meter_mode = cycle_meter_mode(app.config.cpu_meter_mode);
                     app.ensure_meter_visible(item);
+                    app.mark_config_dirty();
                 }
                 SetupItem::MemoryMeterMode => {
                     app.config.memory_meter_mode = cycle_meter_mode(app.config.memory_meter_mode);
                     app.ensure_meter_visible(item);
+                    app.mark_config_dirty();
                 }
                 SetupItem::GpuMeterMode => {
                     // Meter only appears on GPU machines
                     app.config.gpu_meter_mode = cycle_meter_mode(app.config.gpu_meter_mode);
                     app.ensure_meter_visible(item);
+                    app.mark_config_dirty();
                 }
                 SetupItem::NpuMeterMode => {
                     // Meter only appears on NPU machines
                     app.config.npu_meter_mode = cycle_meter_mode(app.config.npu_meter_mode);
                     app.ensure_meter_visible(item);
+                    app.mark_config_dirty();
                 }
                 SetupItem::ShowKernelThreads => {
                     app.config.show_kernel_threads = !app.config.show_kernel_threads;
                     app.needs_process_update = true;
+                    app.mark_config_dirty();
                 }
                 SetupItem::ShowUserThreads => {
                     app.config.show_user_threads = !app.config.show_user_threads;
                     app.needs_process_update = true;
+                    app.mark_config_dirty();
                 }
                 SetupItem::ShowProgramPath => {
                     app.config.show_program_path = !app.config.show_program_path;
                     app.needs_process_update = true;
+                    app.mark_config_dirty();
                 }
                 SetupItem::HighlightNewProcesses => {
                     app.config.highlight_new_processes = !app.config.highlight_new_processes;
+                    app.mark_config_dirty();
                 }
                 SetupItem::HighlightLargeNumbers => {
                     app.config.highlight_large_numbers = !app.config.highlight_large_numbers;
+                    app.mark_config_dirty();
                 }
                 SetupItem::TreeView => {
                     app.toggle_tree_view();
                     app.config.tree_view_default = app.tree_view;
+                    app.mark_config_dirty();
                 }
                 SetupItem::ConfirmKill => {
                     app.config.confirm_kill = !app.config.confirm_kill;
+                    app.mark_config_dirty();
                 }
                 SetupItem::ColorScheme => {
                     let schemes = ColorScheme::all();
@@ -697,21 +690,14 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     app.enter_gpu_select_mode();
                 }
                 SetupItem::ResetAllSettings => {
-                    app.config.reset_to_defaults();
-                    app.reset_screen_tabs();
-                    app.update_theme();
-                    app.update_visible_columns_cache();
-                    app.save_config();
-                    app.status_message = Some((
-                        "Settings reset to defaults".to_string(),
-                        std::time::Instant::now(),
-                    ));
+                    app.reset_settings();
                 }
             }
         }
         KeyCode::Left | KeyCode::Right => {
             // Allow left/right to adjust values for some settings
             let forward = key.code == KeyCode::Right;
+            let mut changed = false;
             match SetupItem::ALL.get(selected) {
                 Some(SetupItem::RefreshRate) => {
                     app.config.refresh_rate_ms = if forward {
@@ -735,6 +721,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                             _ => 5000,
                         }
                     };
+                    changed = true;
                 }
                 Some(SetupItem::CpuMeterMode) => {
                     app.config.cpu_meter_mode = if forward {
@@ -743,6 +730,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                         cycle_meter_mode_rev(app.config.cpu_meter_mode)
                     };
                     app.ensure_meter_visible(SetupItem::CpuMeterMode);
+                    changed = true;
                 }
                 Some(SetupItem::MemoryMeterMode) => {
                     app.config.memory_meter_mode = if forward {
@@ -751,6 +739,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                         cycle_meter_mode_rev(app.config.memory_meter_mode)
                     };
                     app.ensure_meter_visible(SetupItem::MemoryMeterMode);
+                    changed = true;
                 }
                 Some(SetupItem::GpuMeterMode) => {
                     app.config.gpu_meter_mode = if forward {
@@ -759,6 +748,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                         cycle_meter_mode_rev(app.config.gpu_meter_mode)
                     };
                     app.ensure_meter_visible(SetupItem::GpuMeterMode);
+                    changed = true;
                 }
                 Some(SetupItem::NpuMeterMode) => {
                     app.config.npu_meter_mode = if forward {
@@ -767,8 +757,12 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                         cycle_meter_mode_rev(app.config.npu_meter_mode)
                     };
                     app.ensure_meter_visible(SetupItem::NpuMeterMode);
+                    changed = true;
                 }
                 _ => {}
+            }
+            if changed {
+                app.mark_config_dirty();
             }
         }
         // Up/Down/j/k/PgUp/PgDn/Home/End move the selection.
@@ -783,45 +777,12 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
 
 fn handle_process_info_keys(app: &mut App, key: KeyEvent) -> bool {
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') | KeyCode::F(10) => {
+        KeyCode::Esc | KeyCode::Char('q') => {
             app.dialog = DialogState::None;
         }
         _ => {
             if let DialogState::ProcessInfo { ref mut scroll, .. } = app.dialog {
                 handle_scroll_keys(scroll, key.code);
-            }
-        }
-    }
-    false
-}
-
-fn handle_signal_select_keys(app: &mut App, key: KeyEvent) -> bool {
-    use crate::ui::dialogs::{get_signal_by_index, signal_count};
-
-    match key.code {
-        KeyCode::Esc => {
-            // Go back to Kill dialog, moving target data
-            if let DialogState::SignalSelect {
-                pid, name, command, ..
-            } = std::mem::take(&mut app.dialog)
-            {
-                app.dialog = DialogState::Kill { pid, name, command };
-            }
-        }
-        KeyCode::Enter => {
-            if let DialogState::SignalSelect { index, .. } = app.dialog {
-                let signal = get_signal_by_index(index);
-                if !app.tagged_pids.is_empty() {
-                    app.kill_tagged(signal);
-                } else {
-                    app.kill_target_process(signal);
-                }
-            }
-            app.dialog = DialogState::None;
-        }
-        other => {
-            if let DialogState::SignalSelect { ref mut index, .. } = app.dialog {
-                handle_list_nav(index, signal_count(), other);
             }
         }
     }
@@ -879,7 +840,9 @@ fn handle_color_scheme_keys(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Esc => {
-            app.dialog = DialogState::Setup { selected: 12 };
+            app.dialog = DialogState::Setup {
+                selected: SetupItem::ColorScheme.index(),
+            };
         }
         KeyCode::Enter => {
             if let DialogState::ColorScheme { index } = app.dialog
@@ -887,9 +850,12 @@ fn handle_color_scheme_keys(app: &mut App, key: KeyEvent) -> bool {
             {
                 app.config.color_scheme = *scheme;
                 app.update_theme();
+                app.mark_config_dirty();
                 app.save_config();
             }
-            app.dialog = DialogState::Setup { selected: 12 };
+            app.dialog = DialogState::Setup {
+                selected: SetupItem::ColorScheme.index(),
+            };
         }
         other => {
             if let DialogState::ColorScheme { ref mut index } = app.dialog {
@@ -907,7 +873,9 @@ fn handle_gpu_select_keys(app: &mut App, key: KeyEvent) -> bool {
     };
     match key.code {
         KeyCode::Esc => {
-            app.dialog = DialogState::Setup { selected: 15 };
+            app.dialog = DialogState::Setup {
+                selected: SetupItem::GpuMeterAdapter.index(),
+            };
         }
         KeyCode::Enter => {
             // Index 0 = Auto (None); otherwise the (index-1)th adapter name.
@@ -918,8 +886,11 @@ fn handle_gpu_select_keys(app: &mut App, key: KeyEvent) -> bool {
             };
             app.config.gpu_meter_adapter = choice;
             crate::system::set_gpu_selection(app.config.gpu_meter_adapter.clone());
+            app.mark_config_dirty();
             app.save_config();
-            app.dialog = DialogState::Setup { selected: 15 };
+            app.dialog = DialogState::Setup {
+                selected: SetupItem::GpuMeterAdapter.index(),
+            };
         }
         other => {
             if let DialogState::GpuSelect { ref mut index, .. } = app.dialog {
@@ -952,7 +923,9 @@ fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
 
     match key.code {
         KeyCode::Esc => {
-            app.dialog = DialogState::Setup { selected: 13 };
+            app.dialog = DialogState::Setup {
+                selected: SetupItem::ConfigureColumns.index(),
+            };
         }
         KeyCode::Up | KeyCode::Char('k') => {
             if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -1000,8 +973,9 @@ fn handle_column_config_keys(app: &mut App, key: KeyEvent) -> bool {
                 && let Some(col) = all_columns.get(index)
             {
                 let col_name = col.name().to_string();
-                app.toggle_column_in_active_tab(&col_name);
-                app.save_config();
+                if app.toggle_column_in_active_tab(&col_name) {
+                    app.save_config();
+                }
             }
         }
         // Home/End/PgUp/PgDn (Up/Down/j/k are handled above with Shift-reorder).
@@ -1076,17 +1050,29 @@ fn handle_affinity_keys(app: &mut App, key: KeyEvent) -> bool {
 }
 
 /// Handle mouse events with unified element detection
-pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
+pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> bool {
     use crate::app::UIAction;
     use std::time::Instant;
 
     let x = mouse.column;
     let y = mouse.row;
 
+    if matches!(mouse.kind, MouseEventKind::Down(_)) {
+        app.cancel_pending_user_select();
+    }
+
+    // Registered footer keys are global controls and must win over a modal's
+    // outside-click behavior. This makes mouse F10 and keyboard F10 identical.
+    if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+        && let Some(crate::app::UIElement::FunctionKey(key)) = app.ui_bounds.element_at(x, y)
+    {
+        return app.handle_function_key(key);
+    }
+
     if let Some((_, time)) = app.last_error {
         if time.elapsed() < std::time::Duration::from_secs(5) {
             app.clear_error();
-            return;
+            return false;
         }
         app.clear_error();
     }
@@ -1120,8 +1106,7 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
 
             // Dialogs route through the unified click handler.
             if is_in_dialog {
-                handle_dialog_click(app, x, y, is_double_click);
-                return;
+                return handle_dialog_click(app, x, y, is_double_click);
             }
 
             let action = if is_double_click {
@@ -1130,21 +1115,21 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
                 UIAction::Click
             };
 
-            handle_element_action(app, x, y, action);
+            return handle_element_action(app, x, y, action);
         }
         MouseEventKind::Down(MouseButton::Right) => {
             // Right-click in dialog mode closes the dialog (like Escape)
             if is_in_dialog {
-                app.dialog = DialogState::None;
-                return;
+                app.cancel_dialog();
+                return false;
             }
-            handle_element_action(app, x, y, UIAction::RightClick);
+            return handle_element_action(app, x, y, UIAction::RightClick);
         }
         MouseEventKind::Down(MouseButton::Middle) => {
             if is_in_dialog {
-                return;
+                return false;
             }
-            handle_element_action(app, x, y, UIAction::MiddleClick);
+            return handle_element_action(app, x, y, UIAction::MiddleClick);
         }
         MouseEventKind::ScrollUp => {
             if is_in_dialog {
@@ -1171,6 +1156,7 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) {
         }
         _ => {}
     }
+    false
 }
 
 /// True if `(x, y)` lies within `r` (inclusive of its top-left, exclusive of
@@ -1191,7 +1177,6 @@ fn dialog_nav_len(app: &App) -> usize {
         DialogState::UserSelect { users, .. } => users.len() + 1,
         DialogState::ColorScheme { .. } => crate::ui::colors::ColorScheme::all().len(),
         DialogState::GpuSelect { names, .. } => names.len() + 1, // +1 for Auto
-        DialogState::SignalSelect { .. } => crate::ui::dialogs::signal_count(),
         DialogState::Affinity { .. } => app.system_metrics.cpu.core_usage.len().min(64),
         _ => 0,
     }
@@ -1204,7 +1189,6 @@ fn dialog_selection_mut(dialog: &mut DialogState) -> Option<&mut usize> {
         DialogState::SortSelect { index }
         | DialogState::ColorScheme { index }
         | DialogState::ColumnConfig { index }
-        | DialogState::SignalSelect { index, .. }
         | DialogState::GpuSelect { index, .. }
         | DialogState::UserSelect { index, .. } => Some(index),
         DialogState::Setup { selected } | DialogState::Affinity { selected, .. } => Some(selected),
@@ -1250,24 +1234,24 @@ fn move_dialog_selection(app: &mut App, down: bool) {
 /// the dialog closes it, a click on the border is ignored, and a click on a
 /// selectable list row selects it (a double-click also activates it, as if Enter
 /// were pressed).
-fn handle_dialog_click(app: &mut App, x: u16, y: u16, double: bool) {
+fn handle_dialog_click(app: &mut App, x: u16, y: u16, double: bool) -> bool {
     // Hit-test dialog geometry before any modal action. Destructive dialogs must
     // not treat outside/blank clicks as confirmation.
     let Some(area) = app.dialog_area else {
-        app.dialog = DialogState::None;
-        return;
+        app.cancel_dialog();
+        return false;
     };
     if !rect_contains(area, x, y) {
-        app.dialog = DialogState::None;
-        return;
+        app.cancel_dialog();
+        return false;
     }
 
     // Inside the border but on it (or on a content/scrollable dialog): do nothing.
     let Some(inner) = app.dialog_inner else {
-        return;
+        return false;
     };
     if !rect_contains(inner, x, y) {
-        return;
+        return false;
     }
 
     // Confirmation-style dialogs: only a double-click on the explicit
@@ -1275,38 +1259,39 @@ fn handle_dialog_click(app: &mut App, x: u16, y: u16, double: bool) {
     // Keyboard Enter/Y remains the normal single-action confirmation path.
     if let DialogState::Kill { .. } = app.dialog {
         if !double || kill_confirmation_row(app, inner) != Some(y) {
-            return;
+            return false;
         }
         if !app.tagged_pids.is_empty() {
-            app.kill_tagged(15);
+            app.kill_tagged();
         } else {
-            app.kill_target_process(15);
+            app.kill_target_process();
         }
         app.dialog = DialogState::None;
-        return;
+        return false;
     }
 
     // Map the clicked row to a selectable item. Header rows (above) and footer
     // rows (below the visible selectable rows) aren't selectable.
     let row = (y - inner.y) as usize;
     if row < app.dialog_header_rows {
-        return;
+        return false;
     }
     let scroll_row = row - app.dialog_header_rows;
     if scroll_row >= app.dialog_scroll_rows {
-        return;
+        return false;
     }
     let nav_value = app.dialog_list_offset + scroll_row;
 
     if !select_dialog_row(app, nav_value) {
-        return; // clicked a blank/footer row — no selectable item there
+        return false; // clicked a blank/footer row — no selectable item there
     }
 
     // Single click selects only; double-click also activates (like Enter).
     if double {
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
-        let _ = handle_key_event(app, enter);
+        return handle_key_event(app, enter);
     }
+    false
 }
 
 fn kill_confirmation_row(app: &App, inner: crate::terminal::Rect) -> Option<u16> {
@@ -1337,7 +1322,7 @@ fn select_dialog_row(app: &mut App, nav_value: usize) -> bool {
 }
 
 /// Handle an action on a UI element at the given position
-fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAction) {
+fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAction) -> bool {
     use crate::app::{UIAction, UIElement};
 
     // Get the element at this position
@@ -1412,13 +1397,14 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
             }
 
             // Process row double click - open process info, or toggle tag branch in tree mode
-            (UIElement::ProcessRow { index, pid }, UIAction::DoubleClick) => {
+            (UIElement::ProcessRow { index, pid: _ }, UIAction::DoubleClick) => {
                 let actual_index = app.scroll_offset + index;
                 if actual_index < app.displayed_processes.len() {
                     app.selected_index = actual_index;
                     if app.tree_view {
                         // In tree mode, double-click toggles tag for entire branch
-                        app.toggle_tag_branch(*pid);
+                        let identity = app.displayed_processes[actual_index].identity();
+                        app.toggle_tag_branch(identity);
                     } else {
                         // In normal mode, open process info dialog
                         app.enter_process_info_mode();
@@ -1427,15 +1413,16 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
             }
 
             // Process row right click - tag process
-            (UIElement::ProcessRow { index, pid }, UIAction::RightClick) => {
+            (UIElement::ProcessRow { index, pid: _ }, UIAction::RightClick) => {
                 let actual_index = app.scroll_offset + index;
                 if actual_index < app.displayed_processes.len() {
                     app.selected_index = actual_index;
                     // Toggle tag on the process
-                    if app.tagged_pids.contains(pid) {
-                        app.tagged_pids.remove(pid);
+                    let identity = app.displayed_processes[actual_index].identity();
+                    if app.tagged_pids.contains(&identity) {
+                        app.tagged_pids.remove(&identity);
                     } else {
-                        app.tagged_pids.insert(*pid);
+                        app.tagged_pids.insert(identity);
                     }
                 }
             }
@@ -1465,7 +1452,7 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
 
             // Function key click - trigger the key
             (UIElement::FunctionKey(key), UIAction::Click) => {
-                handle_function_key(app, *key);
+                return app.handle_function_key(*key);
             }
 
             // Header blank-area double-click deliberately does nothing:
@@ -1481,11 +1468,7 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
             _ => {}
         }
     }
-}
-
-/// Handle function key press (F1-F10) - delegates to App::handle_function_key
-fn handle_function_key(app: &mut App, key: u8) {
-    app.handle_function_key(key);
+    false
 }
 
 #[cfg(test)]
@@ -1496,6 +1479,10 @@ mod tests {
 
     fn test_app() -> App {
         App::new(Config::default())
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
     }
 
     #[test]
@@ -1606,5 +1593,94 @@ mod tests {
         handle_mouse_event(&mut app, blank);
         assert!(app.show_header);
         assert_eq!(app.config.cpu_meter_mode, MeterMode::Graph);
+    }
+
+    #[test]
+    fn global_f10_and_mouse_footer_f10_both_quit() {
+        let mut app = test_app();
+        app.dialog = DialogState::Help { scroll: 0 };
+        assert!(handle_key_event(&mut app, press(KeyCode::F(10))));
+
+        app.ui_bounds.add_function_key(10, 0, 0, 8);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(handle_mouse_event(&mut app, click));
+    }
+
+    #[test]
+    fn shared_f6_dispatch_preselects_active_sort() {
+        let mut app = test_app();
+        app.sort_column = SortColumn::Mem;
+        assert!(!handle_key_event(&mut app, press(KeyCode::F(6))));
+        let DialogState::SortSelect { index } = app.dialog else {
+            panic!("expected sort dialog");
+        };
+        assert_eq!(SortColumn::all()[index], SortColumn::Mem);
+    }
+
+    #[test]
+    fn gpu_selector_returns_to_its_setup_row() {
+        let mut app = test_app();
+        app.dialog = DialogState::GpuSelect {
+            index: 0,
+            names: Vec::new(),
+        };
+        assert!(!handle_key_event(&mut app, press(KeyCode::Esc)));
+        assert!(matches!(
+            app.dialog,
+            DialogState::Setup { selected }
+                if selected == SetupItem::GpuMeterAdapter.index()
+        ));
+        assert_ne!(
+            SetupItem::GpuMeterAdapter.index(),
+            SetupItem::ResetAllSettings.index()
+        );
+    }
+
+    #[test]
+    fn another_command_cancels_pending_user_picker() {
+        let mut app = test_app();
+        app.enter_user_select_mode();
+        assert!(app.canonical_enrichment_requirements().user);
+
+        assert!(!handle_key_event(&mut app, press(KeyCode::F(1))));
+        assert!(matches!(app.dialog, DialogState::Help { .. }));
+        assert!(!app.canonical_enrichment_requirements().user);
+    }
+
+    #[test]
+    fn escape_rolls_back_live_search_and_filter_edits() {
+        let mut app = test_app();
+        app.search_string = "before".to_string();
+        app.search_string_lower = "before".to_string();
+        app.start_search();
+        app.input_char('x');
+        app.apply_search();
+        assert_eq!(app.search_string, "beforex");
+        assert!(!handle_key_event(&mut app, press(KeyCode::Esc)));
+        assert_eq!(app.search_string, "before");
+
+        app.filter_string = "old".to_string();
+        app.filter_string_lower = "old".to_string();
+        app.start_filter();
+        app.input_char('x');
+        app.apply_filter();
+        assert_eq!(app.filter_string, "oldx");
+        assert!(!handle_key_event(&mut app, press(KeyCode::Esc)));
+        assert_eq!(app.filter_string, "old");
+    }
+
+    #[test]
+    fn setup_mutations_are_marked_dirty_immediately() {
+        let mut app = test_app();
+        app.dialog = DialogState::Setup {
+            selected: SetupItem::ConfirmKill.index(),
+        };
+        assert!(!handle_key_event(&mut app, press(KeyCode::Enter)));
+        assert!(app.config_dirty);
     }
 }

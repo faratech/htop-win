@@ -220,8 +220,10 @@ pub struct ProcessRates {
     pub io_rates: HashMap<u32, (u64, u64)>, // (read_rate, write_rate)
 }
 
-/// Calculate CPU percentages and I/O rates for all processes using cache deltas
-pub fn calculate_process_rates(list: &SystemProcessList, total_cpu_delta: u64) -> ProcessRates {
+/// Calculate CPU percentages and I/O rates for all processes using cache deltas.
+/// `cpu_capacity_delta` is monotonic wall time multiplied by all logical CPUs,
+/// expressed in the same 100-nanosecond units as each process CPU counter.
+pub fn calculate_process_rates(list: &SystemProcessList, cpu_capacity_delta: u64) -> ProcessRates {
     use super::cache::CACHE;
 
     let now = std::time::Instant::now();
@@ -247,9 +249,9 @@ pub fn calculate_process_rates(list: &SystemProcessList, total_cpu_delta: u64) -
 
                 if entry.create_time == create_time
                     && now > entry.cpu_time_updated
-                    && total_cpu_delta > 0
+                    && cpu_capacity_delta > 0
                 {
-                    (time_delta as f64 / total_cpu_delta as f64 * 100.0) as f32
+                    super::process_cpu_percentage(time_delta, cpu_capacity_delta)
                 } else {
                     0.0
                 }

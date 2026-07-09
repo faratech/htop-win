@@ -389,7 +389,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .take(app.visible_height)
         .map(|(idx, proc)| {
             let is_selected = idx == app.selected_index;
-            let is_tagged = app.tagged_pids.contains(&proc.pid);
+            let is_tagged = app.tagged_pids.contains(&proc.identity());
             let matches_search = proc.matches_search;
 
             // Tree prefix for tree view (avoid allocation when not in tree mode)

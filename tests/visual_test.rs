@@ -217,12 +217,14 @@ fn f7_f8_preselect_stepped_priority_class() {
     // F7 aims one class higher, F8 one lower (htop's Nice -/Nice + keys).
     app.enter_priority_mode(1);
     let DialogState::Priority {
-        class_index, pid, ..
+        class_index,
+        identity,
+        ..
     } = &app.dialog
     else {
         panic!("expected priority dialog");
     };
-    assert_eq!(*pid, 200);
+    assert_eq!(identity.pid, 200);
     assert_eq!(*class_index, 3);
 
     app.dialog = DialogState::None;

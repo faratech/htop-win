@@ -231,19 +231,6 @@ fn render_list_dialog(
     app.dialog_scroll_rows = scroll_height.min(scrollable_len);
 }
 
-/// Windows signal names and values
-const SIGNALS: &[(u32, &str, &str)] = &[
-    (15, "SIGTERM", "Terminate gracefully"),
-    (9, "SIGKILL", "Force terminate"),
-    (1, "SIGHUP", "Hangup"),
-    (2, "SIGINT", "Interrupt (Ctrl+C)"),
-    (3, "SIGQUIT", "Quit"),
-    (6, "SIGABRT", "Abort"),
-    (14, "SIGALRM", "Alarm clock"),
-    (18, "SIGCONT", "Continue"),
-    (19, "SIGSTOP", "Stop"),
-];
-
 /// Draw help dialog
 pub fn draw_help(frame: &mut Frame, app: &mut App) {
     let DialogState::Help { scroll } = &mut app.dialog else {
@@ -279,7 +266,7 @@ pub fn draw_help(frame: &mut Frame, app: &mut App) {
         "    F6, >, ., <, ,     Select sort column",
         "    F7, ]              Raise priority (dialog, Enter to apply)",
         "    F8, [              Lower priority (dialog, Enter to apply)",
-        "    F9                 Kill selected/tagged process(es)",
+        "    F9                 Force terminate selected/tagged process(es)",
         "    F10, q, Q          Quit",
         "",
         "  ─────────────────────────────────────────────────────────────",
@@ -293,7 +280,7 @@ pub fn draw_help(frame: &mut Frame, app: &mut App) {
         "    u                  Filter by user (show user list)",
         "    F                  Toggle follow mode (track selected PID)",
         "    Note: Tagged processes show a yellow ● indicator and are",
-        "          killed together when pressing F9. Count in status bar.",
+        "          force terminated together with F9. Count in status bar.",
         "",
         "  ─────────────────────────────────────────────────────────────",
         "  TREE VIEW (when enabled with F5)",
@@ -340,8 +327,8 @@ pub fn draw_help(frame: &mut Frame, app: &mut App) {
         "  ─────────────────────────────────────────────────────────────",
         "    Click process      Select process",
         "    Double-click       Open process details (or tag branch in tree mode)",
-        "    Right-click        Tag/untag process (for batch kill)",
-        "    Middle-click       Open kill dialog for process",
+        "    Right-click        Tag/untag process (for batch termination)",
+        "    Middle-click       Open force-terminate dialog for process",
         "    Click header       Sort by column",
         "    Click meter        Cycle meter mode (Bar/Text/Graph)",
         "    Click F-key        Trigger function key action",
@@ -362,7 +349,7 @@ pub fn draw_help(frame: &mut Frame, app: &mut App) {
         "    --no-mouse         Disable mouse support",
         "    --no-color         Monochrome mode",
         "    --no-meters        Hide header meters",
-        "    --readonly         Disable kill/priority operations",
+        "    --readonly         Disable process mutation operations",
         "",
         "  ─────────────────────────────────────────────────────────────",
         "  GENERAL",
@@ -531,9 +518,15 @@ pub fn draw_sort_select(frame: &mut Frame, app: &mut App) {
 
 /// Draw kill confirmation dialog
 pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
-    let DialogState::Kill { pid, name, command } = &app.dialog else {
+    let DialogState::Kill {
+        identity,
+        name,
+        command,
+    } = &app.dialog
+    else {
         return;
     };
+    let pid = identity.pid;
     let tagged_count = app.tagged_pids.len();
 
     // Determine dialog height based on tagged processes
@@ -550,7 +543,7 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
     if tagged_count > 0 {
         // Multiple processes - show list
         lines.push(Line::from(Span::styled(
-            format!("Kill {} tagged processes?", tagged_count),
+            format!("Force terminate {} tagged processes?", tagged_count),
             Style::default()
                 .fg(theme.failed_read)
                 .add_modifier(Modifier::BOLD),
@@ -558,7 +551,7 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
         lines.push(Line::from(""));
 
         // List tagged processes (show up to 8)
-        for (shown, tagged_pid) in app.tagged_pids.iter().enumerate() {
+        for (shown, tagged_identity) in app.tagged_pids.iter().enumerate() {
             if shown >= 8 {
                 lines.push(Line::from(Span::styled(
                     format!("  ... and {} more", tagged_count - 8),
@@ -570,12 +563,12 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
             let proc_name = app
                 .displayed_processes
                 .iter()
-                .find(|p| p.pid == *tagged_pid)
+                .find(|p| p.identity() == *tagged_identity)
                 .map(|p| &*p.name)
                 .unwrap_or("(unknown)");
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  {} ", tagged_pid),
+                    format!("  {} ", tagged_identity.pid),
                     Style::default().fg(theme.meter_value_warn),
                 ),
                 Span::styled(proc_name, Style::default().fg(theme.text)),
@@ -584,7 +577,7 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
     } else {
         // Single process
         lines.push(Line::from(Span::styled(
-            "Kill this process?",
+            "Force terminate this process?",
             Style::default()
                 .fg(theme.failed_read)
                 .add_modifier(Modifier::BOLD),
@@ -625,7 +618,7 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
     let dialog = Paragraph::new(lines)
         .block(
             Block::default()
-                .title(" Kill Process ")
+                .title(" Force Terminate Process ")
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(theme.failed_read))
                 .style(Style::default().bg(theme.background)),
@@ -643,7 +636,7 @@ pub fn draw_priority(frame: &mut Frame, app: &mut App) {
 
     let DialogState::Priority {
         class_index,
-        pid,
+        identity,
         name,
         ..
     } = &app.dialog
@@ -651,7 +644,8 @@ pub fn draw_priority(frame: &mut Frame, app: &mut App) {
         return;
     };
     let class_index = *class_index;
-    let pid = *pid;
+    let identity = *identity;
+    let pid = identity.pid;
     let process_info = format!("PID: {} - {}", pid, name);
     let classes = WindowsPriorityClass::all();
     let area = centered_rect_fixed(55, (classes.len() + 8) as u16, frame.area());
@@ -660,7 +654,7 @@ pub fn draw_priority(frame: &mut Frame, app: &mut App) {
     // background re-sort can move a different process under the cursor while the
     // dialog is open, which would otherwise display a mismatched flag.
     let efficiency_mode = app
-        .process_by_pid(pid)
+        .process_by_identity(identity)
         .map(|p| p.efficiency_mode)
         .unwrap_or(false);
 
@@ -992,42 +986,6 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Draw signal selection dialog
-pub fn draw_signal_select(frame: &mut Frame, app: &mut App) {
-    let DialogState::SignalSelect {
-        index, pid, name, ..
-    } = &app.dialog
-    else {
-        return;
-    };
-    let index = *index;
-    let title = format!(" Send Signal to {} ({}) ", name, pid);
-    let theme = &app.theme;
-    let area = centered_rect_fixed(40, (SIGNALS.len() + 4) as u16, frame.area());
-
-    let items: Vec<ListItem> = SIGNALS
-        .iter()
-        .enumerate()
-        .map(|(idx, (num, sig_name, desc))| {
-            let style = item_style(idx == index, theme);
-            ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:2} ", num), style),
-                Span::styled(format!("{:<10}", sig_name), style),
-                Span::styled(desc.to_string(), style),
-            ]))
-        })
-        .collect();
-
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.failed_read))
-        .style(Style::default().bg(theme.background));
-
-    let style = Style::default().fg(theme.text).bg(theme.background);
-    render_list_dialog(frame, app, area, block, style, items, index, 0, 0);
-}
-
 /// Draw user selection dialog
 pub fn draw_user_select(frame: &mut Frame, app: &mut App) {
     let DialogState::UserSelect { index, users } = &app.dialog else {
@@ -1066,15 +1024,15 @@ pub fn draw_user_select(frame: &mut Frame, app: &mut App) {
 
 /// Draw environment variables dialog
 pub fn draw_environment(frame: &mut Frame, app: &mut App) {
-    let DialogState::Environment { pid, .. } = &app.dialog else {
+    let DialogState::Environment { identity, .. } = &app.dialog else {
         return;
     };
-    let pid = *pid;
+    let identity = *identity;
     let area = centered_rect(80, 80, frame.area());
     let theme = app.theme.clone();
 
     let content = app
-        .process_by_pid(pid)
+        .process_by_identity(identity)
         .map(|proc| {
             format!(
                 "Environment Variables for {} (PID: {})\n\n\
@@ -1191,26 +1149,16 @@ pub fn draw_gpu_select(frame: &mut Frame, app: &mut App) {
     render_list_dialog(frame, app, area, block, style, items, index, 0, 0);
 }
 
-/// Get signal value by index
-pub fn get_signal_by_index(index: usize) -> u32 {
-    SIGNALS.get(index).map(|(val, _, _)| *val).unwrap_or(15)
-}
-
-/// Get number of signals
-pub fn signal_count() -> usize {
-    SIGNALS.len()
-}
-
 /// Draw wrapped command display dialog
 pub fn draw_command_wrap(frame: &mut Frame, app: &mut App) {
-    let DialogState::CommandWrap { pid, .. } = &app.dialog else {
+    let DialogState::CommandWrap { identity, .. } = &app.dialog else {
         return;
     };
-    let pid = *pid;
+    let identity = *identity;
     let area = centered_rect(80, 70, frame.area());
     let theme = app.theme.clone();
 
-    let text_lines = if let Some(proc) = app.process_by_pid(pid) {
+    let text_lines = if let Some(proc) = app.process_by_identity(identity) {
         let mut lines = vec![
             format!("Process: {} (PID: {})", proc.name, proc.pid),
             String::new(),
@@ -1319,21 +1267,21 @@ pub fn draw_affinity(frame: &mut Frame, app: &mut App) {
     let DialogState::Affinity {
         mask,
         selected,
-        pid,
+        identity,
     } = &app.dialog
     else {
         return;
     };
     let mask = *mask;
     let selected = *selected;
-    let pid = *pid;
+    let identity = *identity;
     let cpu_count = app.system_metrics.cpu.core_usage.len();
     let height = (cpu_count + 4).min(20) as u16;
     let area = centered_rect_fixed(35, height, frame.area());
 
     // Display the captured target, matching the process apply_affinity() acts on.
     let proc_name = app
-        .process_by_pid(pid)
+        .process_by_identity(identity)
         .map(|p| format!("{} (PID: {})", p.name, p.pid))
         .unwrap_or_else(|| "Unknown".to_string());
 
