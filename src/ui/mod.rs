@@ -132,7 +132,11 @@ fn draw_tab_bar(frame: &mut Frame, app: &mut App, area: Rect) {
     for (i, tab) in app.screen_tabs.iter().enumerate() {
         let is_active = i == app.active_tab;
         let label = format!("[{}]", tab.name);
-        let label_width = label.len() as u16;
+        // Measure in display cells, not bytes: tab names are user-editable
+        // and may contain multi-byte characters, which would otherwise
+        // register a click region wider than the drawn label.
+        let label_width =
+            unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
 
         if is_active {
             // Active tab: same as htop - bold with selection colors

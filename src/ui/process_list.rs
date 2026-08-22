@@ -1,5 +1,5 @@
 use crate::terminal::{
-    Block, Borders, Cell, Color, Constraint, Frame, Line, Modifier, Rect, Row, Span, Style, Table,
+    Block, Borders, Cell, Constraint, Frame, Line, Modifier, Rect, Row, Span, Style, Table,
 };
 
 use crate::app::{App, SortColumn};
@@ -980,8 +980,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                     .bg(theme.background)
                     .add_modifier(Modifier::BOLD)
             } else if is_new_process {
-                // htop: PROCESS_NEW = ColorPair(Black, Green) - black text on green bg
-                Style::default().fg(Color::Black).bg(theme.new_process)
+                // htop: PROCESS_NEW = ColorPair(Black, Green). Only the green
+                // background is applied here: every cell span carries its own
+                // per-column foreground, which overrides any row-level fg.
+                Style::default().bg(theme.new_process)
             } else {
                 Style::default().bg(theme.background)
             };

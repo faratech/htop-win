@@ -683,8 +683,9 @@ pub fn draw_priority(frame: &mut Frame, app: &mut App) {
         })
         .collect();
 
-    // Add separator and efficiency mode option (rendered inline after the
-    // classes; they are not selectable, so they stay out of the scroll range).
+    // Add separator, efficiency mode option, and key hint as pinned footer
+    // rows (not selectable, so they stay out of the scroll range and remain
+    // visible even when the class list scrolls on short terminals).
     items.push(ListItem::new(Line::from("")));
     let efficiency_status = if efficiency_mode { "ON 🌿" } else { "OFF" };
     items.push(ListItem::new(Line::from(vec![
@@ -698,6 +699,10 @@ pub fn draw_priority(frame: &mut Frame, app: &mut App) {
             }),
         ),
     ])));
+    items.push(ListItem::new(Line::from(Span::styled(
+        "↑↓ select, E efficiency, Enter apply, Esc cancel",
+        Style::default().fg(theme.text_dim),
+    ))));
 
     let block = Block::default()
         .title(format!(" Set Priority: {} ", process_info))
@@ -706,13 +711,7 @@ pub fn draw_priority(frame: &mut Frame, app: &mut App) {
         .style(Style::default().bg(theme.background));
 
     let style = Style::default().fg(theme.text).bg(theme.background);
-    render_list_dialog(frame, app, area, block, style, items, class_index, 0, 0);
-
-    // Draw footer hint on the dialog's bottom inner row.
-    let hint_area = Rect::new(area.x + 1, area.y + area.height - 2, area.width - 2, 1);
-    let hint = Paragraph::new("↑↓ select, E efficiency, Enter apply, Esc cancel")
-        .style(Style::default().fg(theme.text_dim).bg(theme.background));
-    frame.render_widget(hint, hint_area);
+    render_list_dialog(frame, app, area, block, style, items, class_index, 0, 3);
 }
 
 /// Draw setup menu

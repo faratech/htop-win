@@ -89,6 +89,14 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         return app.handle_function_key(10);
     }
 
+    // Ctrl+C is the conventional emergency exit; treat it as global as F10.
+    // Previously it was only reachable from the normal-mode handler, so a
+    // stale error banner or an open text dialog could swallow it — and the
+    // banner outlives its 5-second display until some key clears it.
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return true;
+    }
+
     // Clear error on any key press
     if app.last_error.is_some() {
         app.clear_error();
