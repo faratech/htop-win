@@ -1632,6 +1632,10 @@ impl App {
 
     /// Update displayed processes based on filter and sort
     pub fn update_displayed_processes(&mut self) {
+        // Capture who is selected before `displayed_processes` is replaced, so
+        // the selection can be re-found by identity after the re-sort below.
+        let selected_identity = self.selected_process().map(ProcessInfo::identity);
+
         self.refresh_adapter_collection_flags();
 
         // Use cached lowercase filter string
@@ -1746,6 +1750,20 @@ impl App {
         }
 
         self.displayed_processes = processes;
+
+        // Follow the previously selected process through this rebuild: the list
+        // reshuffles on every refresh under the default CPU% sort, so a bare
+        // row index leaves the highlight — and Enter/F9/priority actions — on
+        // whatever process drifted into that position. Fall back to the clamp
+        // below when the selected process no longer exists.
+        if let Some(identity) = selected_identity
+            && let Some(idx) = self
+                .displayed_processes
+                .iter()
+                .position(|p| p.identity() == identity)
+        {
+            self.selected_index = idx;
+        }
 
         // Clamp selection and scroll immediately after replacing the list, before
         // enrichment uses scroll_offset to choose the visible slice.
@@ -3062,6 +3080,52 @@ mod tests {
         };
         app.update_displayed_processes();
         assert_eq!(app.displayed_processes[0].pid, 1);
+    }
+
+    #[test]
+    fn selection_follows_its_process_through_a_resort() {
+        // Regression: the highlight was glued to a row index while the default
+        // CPU% sort reshuffled rows every refresh, so actions landed on
+        // whichever process drifted under the cursor.
+        let mut app = App::new(Config::default());
+        let mut low = process(1, 0);
+        low.cpu_percent = 1.0;
+        let mut hot = process(2, 0);
+        hot.cpu_percent = 50.0;
+        let mut mid = process(3, 0);
+        mid.cpu_percent = 5.0;
+        app.processes = vec![low, hot, mid];
+
+        app.update_displayed_processes();
+        assert_eq!(
+            app.selected_index,
+            0,
+            "fresh list should keep the default top-row selection"
+        );
+        app.selected_index = 2;
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(1));
+
+        // Next refresh: the selected process spikes to the top of the sort.
+        app.processes[0].cpu_percent = 90.0;
+        app.update_displayed_processes();
+        assert_eq!(app.displayed_processes[0].pid, 1);
+        assert_eq!(
+            app.selected_process().map(|p| p.pid),
+            Some(1),
+            "highlight must follow the same process across the re-sort"
+        );
+    }
+
+    #[test]
+    fn selection_clamps_when_the_selected_process_exits() {
+        let mut app = App::new(Config::default());
+        app.processes = vec![process(1, 0), process(2, 0)];
+        app.update_displayed_processes();
+        app.selected_index = 1;
+
+        app.processes = vec![process(1, 0)];
+        app.update_displayed_processes();
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(1));
     }
 
     #[test]
