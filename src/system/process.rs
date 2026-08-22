@@ -10,7 +10,8 @@ use super::native::{SystemProcess, filetime_to_unix};
 
 #[cfg(windows)]
 use windows::Win32::Foundation::{
-    CloseHandle, FILETIME, GetLastError, HANDLE, SetLastError, WIN32_ERROR,
+    CloseHandle, ERROR_INSUFFICIENT_BUFFER, FILETIME, GetLastError, HANDLE, SetLastError,
+    WIN32_ERROR,
 };
 #[cfg(windows)]
 use windows::Win32::Security::{
@@ -36,7 +37,7 @@ use windows::Win32::System::Threading::{
     REALTIME_PRIORITY_CLASS, SetPriorityClass, TerminateProcess,
 };
 #[cfg(windows)]
-use windows::core::PWSTR;
+use windows::core::{HRESULT, PWSTR};
 
 /// Enable SeDebugPrivilege to access process information for service accounts
 /// This allows reading tokens for NETWORK SERVICE, LOCAL SERVICE, etc.
@@ -347,6 +348,37 @@ fn query_exe_path(handle: HANDLE) -> String {
     }
 }
 
+/// Next `(name_capacity, domain_capacity)` in TCHARs for a retried
+/// `LookupAccountSidW` call after it reported `ERROR_INSUFFICIENT_BUFFER`.
+///
+/// On that error the API stores the required length (in TCHARs, including the
+/// terminating null) in each size argument, but a side whose buffer was already
+/// large enough may be left at its input value, so each capacity takes the
+/// maximum of the old and reported size. Returns `None` when the report cannot
+/// be trusted - nothing reported, no growth over what we already had, or an
+/// implausibly huge value - so callers bail out instead of looping forever or
+/// over-allocating.
+fn lookup_account_retry_sizes(
+    old_name_cap: u32,
+    old_domain_cap: u32,
+    name_needed: u32,
+    domain_needed: u32,
+) -> Option<(u32, u32)> {
+    // Real account and domain names are far below this; treat anything larger
+    // as garbage rather than trusting it for an allocation.
+    const MAX_CHARS: u32 = 32768;
+    if name_needed > MAX_CHARS || domain_needed > MAX_CHARS {
+        return None;
+    }
+    let new_name_cap = name_needed.max(old_name_cap);
+    let new_domain_cap = domain_needed.max(old_domain_cap);
+    if new_name_cap <= old_name_cap && new_domain_cap <= old_domain_cap {
+        return None; // No growth: retrying with these sizes would fail the same way.
+    }
+    // Room for the terminating null whether or not the reported size included it.
+    Some((new_name_cap + 1, new_domain_cap + 1))
+}
+
 /// Extract username from an already-opened token handle (avoids duplicate OpenProcess)
 #[cfg(windows)]
 fn get_user_from_token(token_handle: HANDLE) -> Option<Arc<str>> {
@@ -376,30 +408,50 @@ fn get_user_from_token(token_handle: HANDLE) -> Option<Arc<str>> {
 
         let token_user = &*(token_info.as_ptr() as *const TOKEN_USER);
 
-        // Look up the account name from the SID
-        let mut name_len: u32 = 256;
-        let mut domain_len: u32 = 256;
-        let mut name: Vec<u16> = vec![0; name_len as usize];
-        let mut domain: Vec<u16> = vec![0; domain_len as usize];
+        // Look up the account name from the SID. Both the name and the domain
+        // buffers have to fit in a single call, so start from a generous guess
+        // and on ERROR_INSUFFICIENT_BUFFER retry once with the sizes the API
+        // reported instead of losing the owner name for long account/domain
+        // names. Any other error (access denied, unknown SID, ...) is permanent.
+        let mut name_cap: u32 = 256;
+        let mut domain_cap: u32 = 256;
         let mut sid_type = SID_NAME_USE::default();
 
-        if LookupAccountSidW(
-            None,
-            token_user.User.Sid,
-            Some(PWSTR(name.as_mut_ptr())),
-            &mut name_len,
-            Some(PWSTR(domain.as_mut_ptr())),
-            &mut domain_len,
-            &mut sid_type,
-        )
-        .is_ok()
-        {
-            // Use interning to avoid UTF-16 conversion for common usernames
-            let username = intern_username_utf16(&name[..name_len as usize]);
+        loop {
+            let mut name: Vec<u16> = vec![0; name_cap as usize];
+            let mut domain: Vec<u16> = vec![0; domain_cap as usize];
+            let mut name_len = name_cap;
+            let mut domain_len = domain_cap;
 
-            Some(username)
-        } else {
-            None
+            match LookupAccountSidW(
+                None,
+                token_user.User.Sid,
+                Some(PWSTR(name.as_mut_ptr())),
+                &mut name_len,
+                Some(PWSTR(domain.as_mut_ptr())),
+                &mut domain_len,
+                &mut sid_type,
+            ) {
+                Ok(()) => {
+                    // Use interning to avoid UTF-16 conversion for common usernames
+                    return Some(intern_username_utf16(&name[..name_len as usize]));
+                }
+                Err(err) => {
+                    if err.code() != HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) {
+                        return None;
+                    }
+                    // Capacities only ever grow here and are clamped by
+                    // `lookup_account_retry_sizes`, which returns `None` when
+                    // the API reports nothing new, so this loop terminates.
+                    match lookup_account_retry_sizes(name_cap, domain_cap, name_len, domain_len) {
+                        Some((next_name_cap, next_domain_cap)) => {
+                            name_cap = next_name_cap;
+                            domain_cap = next_domain_cap;
+                        }
+                        None => return None,
+                    }
+                }
+            }
         }
     }
 }
@@ -1427,4 +1479,47 @@ pub fn set_process_affinity(identity: ProcessIdentity, mask: u64) -> Result<(), 
 pub fn set_process_affinity(_identity: ProcessIdentity, _mask: u64) -> Result<(), String> {
     // Not implemented for non-Windows
     Ok(())
+}
+
+#[cfg(test)]
+mod lookup_account_retry_tests {
+    use super::lookup_account_retry_sizes;
+
+    #[test]
+    fn grows_both_buffers_and_leaves_null_room() {
+        assert_eq!(
+            lookup_account_retry_sizes(256, 256, 300, 20),
+            Some((301, 257))
+        );
+        assert_eq!(lookup_account_retry_sizes(16, 16, 20, 24), Some((21, 25)));
+    }
+
+    #[test]
+    fn ignores_reports_smaller_than_current_capacity() {
+        // A failure can never be satisfied by shrinking a buffer.
+        assert_eq!(lookup_account_retry_sizes(256, 256, 8, 8), None);
+    }
+
+    #[test]
+    fn keeps_the_side_that_was_already_big_enough() {
+        // Only the domain buffer was undersized, so its size argument moved.
+        assert_eq!(lookup_account_retry_sizes(256, 16, 0, 30), Some((257, 31)));
+    }
+
+    #[test]
+    fn bails_when_no_size_is_reported() {
+        assert_eq!(lookup_account_retry_sizes(256, 256, 0, 0), None);
+    }
+
+    #[test]
+    fn bails_when_nothing_grows() {
+        // API echoed our input sizes back: a retry cannot succeed.
+        assert_eq!(lookup_account_retry_sizes(64, 64, 64, 64), None);
+    }
+
+    #[test]
+    fn bails_on_implausible_size_instead_of_allocating_it() {
+        assert_eq!(lookup_account_retry_sizes(256, 256, u32::MAX, 10), None);
+        assert_eq!(lookup_account_retry_sizes(256, 256, 10, u32::MAX), None);
+    }
 }
