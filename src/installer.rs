@@ -39,17 +39,67 @@ pub fn get_installed_version() -> Option<String> {
         return None;
     }
 
-    let output = std::process::Command::new(&install_path)
-        .arg("--version")
-        .output()
-        .ok()?;
+    read_pe_file_version(&install_path)
+}
 
+/// Read the embedded VS_VERSIONINFO FileVersion without executing the binary.
+/// The previous approach ran `htop.exe --version`, which both blocked
+/// indefinitely on a wedged executable at the install path and executed
+/// whatever file happened to occupy it.
+#[cfg(windows)]
+fn read_pe_file_version(path: &std::path::Path) -> Option<String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let path_pcwstr = PCWSTR(wide.as_ptr());
+    unsafe {
+        let size = GetFileVersionInfoSizeW(path_pcwstr, None);
+        if size == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; size as usize];
+        if GetFileVersionInfoW(path_pcwstr, None, size, data.as_mut_ptr() as *mut _).is_err() {
+            return None;
+        }
+        let fixed: *mut VS_FIXEDFILEINFO = std::ptr::null_mut();
+        let mut len = 0u32;
+        if !VerQueryValueW(
+            data.as_ptr() as *const _,
+            windows::core::w!("\\"),
+            &mut fixed.cast() as *mut *mut _,
+            &mut len,
+        )
+        .as_bool()
+            || fixed.is_null()
+        {
+            return None;
+        }
+        let v = &*fixed;
+        // Cargo versions here are three-part; the fourth (build) field is
+        // padding set by the resource compiler.
+        Some(format!(
+            "{}.{}.{}",
+            v.dwFileVersionMS >> 16,
+            v.dwFileVersionMS & 0xffff,
+            v.dwFileVersionLS >> 16
+        ))
+    }
+}
+
+/// Non-Windows fallback: shells out, as before (development builds only).
+#[cfg(not(windows))]
+fn read_pe_file_version(path: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new(path).arg("--version").output().ok()?;
     let version_output = String::from_utf8_lossy(&output.stdout);
-    // Parse "htop-win X.Y.Z" to get version
-    version_output
-        .split_whitespace()
-        .last()
-        .map(|s| s.to_string())
+    version_output.split_whitespace().last().map(|s| s.to_string())
 }
 
 /// Install htop-win to a PATH directory so it can be run from anywhere
@@ -94,8 +144,10 @@ pub fn install_to_path(force: bool) -> Result<(), Box<dyn std::error::Error>> {
         println!("Installing htop {} to PATH...", current_version);
     }
 
-    // Copy the binary
-    fs::copy(&current_exe, &target_path)?;
+    // Install via the same rename-aside helper the self-update path uses:
+    // Windows refuses to open a running executable's image for write, so a
+    // plain copy onto the installed exe fails while any htop is running.
+    install_update_file(&current_exe, &target_path)?;
 
     println!("Successfully installed htop {}!", current_version);
     println!("Location: {}", target_path.display());
