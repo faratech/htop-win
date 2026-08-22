@@ -213,13 +213,27 @@ impl Layout {
         // Second pass: distribute remaining to flexible constraints (Min and Fill)
         if flex_count > 0 && remaining > 0 {
             let per_flex = remaining / flex_count;
+            let mut extra = remaining % flex_count;
             for (i, constraint) in self.constraints.iter().enumerate() {
                 match constraint {
                     Constraint::Min(_) | Constraint::Fill(_) => {
                         sizes[i] += per_flex;
+                        // Hand out the floor-division remainder one cell at a
+                        // time so flex elements together absorb all of it.
+                        if extra > 0 {
+                            sizes[i] += 1;
+                            extra -= 1;
+                        }
                     }
                     _ => {}
                 }
+            }
+        } else if remaining > 0 {
+            // All constraints fixed (Length/Percentage/Ratio/Max): floor division
+            // in the first pass can still leave space. Give it to the last element
+            // so the children cover the parent area exactly.
+            if let Some(last) = sizes.last_mut() {
+                *last += remaining;
             }
         }
 
@@ -1721,13 +1735,24 @@ impl<'a> Table<'a> {
         // Second pass: distribute remaining to flexible columns (Min and Fill)
         if flex_count > 0 && remaining > 0 {
             let per_flex = remaining / flex_count;
+            let mut extra = remaining % flex_count;
             for (i, constraint) in self.widths.iter().enumerate() {
                 match constraint {
                     Constraint::Min(_) | Constraint::Fill(_) => {
                         widths[i] += per_flex;
+                        if extra > 0 {
+                            widths[i] += 1;
+                            extra -= 1;
+                        }
                     }
                     _ => {}
                 }
+            }
+        } else if remaining > 0 {
+            // All columns fixed: hand floor-division loss to the last column so
+            // the table uses the full width.
+            if let Some(last) = widths.last_mut() {
+                *last += remaining;
             }
         }
 
@@ -2219,5 +2244,66 @@ mod tests {
         // At position 0 the thumb starts at the top of the track.
         assert_eq!(buf.get(0, 0).unwrap().symbol, thumb);
         assert_ne!(buf.get(0, 11).unwrap().symbol, thumb);
+    }
+
+    #[test]
+    fn layout_all_fixed_constraints_cover_the_parent_area() {
+        // Regression: with only fixed constraints the floor-division loss was
+        // dropped entirely, leaving a dead background strip along the edge
+        // (e.g. the CPU meter grid of Ratio(1, cols) columns).
+        let area = Rect::new(0, 0, 101, 10);
+        let rects = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(area);
+        let total: u16 = rects.iter().map(|r| r.width).sum();
+        assert_eq!(total, 101);
+
+        // Same property when the loss is larger than one cell.
+        let rects = Layout::horizontal([Constraint::Ratio(1, 4); 4]).split(area);
+        let total: u16 = rects.iter().map(|r| r.width).sum();
+        assert_eq!(total, 101);
+        // Children tile the parent without gaps.
+        let mut x = 0;
+        for rect in &rects {
+            assert_eq!(rect.x, x);
+            x += rect.width;
+        }
+    }
+
+    #[test]
+    fn layout_flex_elements_absorb_remainder() {
+        // Regression: remaining % flex_count cells were discarded, so two flex
+        // columns over an odd width came up one cell short of the parent.
+        let area = Rect::new(0, 0, 25, 5);
+        let rects = Layout::horizontal([Constraint::Min(10), Constraint::Min(10)]).split(area);
+        let total: u16 = rects.iter().map(|r| r.width).sum();
+        assert_eq!(total, 25);
+        // Each flex element keeps at least its minimum.
+        for rect in &rects {
+            assert!(rect.width >= 10);
+        }
+    }
+
+    #[test]
+    fn table_column_widths_use_the_full_width() {
+        // Regression: same remainder-dropping algorithm as Layout::split left
+        // the last table columns unused on non-divisible widths.
+        let table = Table::new(
+            Vec::<Row>::new(),
+            [Constraint::Ratio(1, 3); 3],
+        )
+        .column_spacing(0);
+        let widths = table.get_column_widths(101);
+        assert_eq!(widths.iter().sum::<u16>(), 101);
+    }
+
+    #[test]
+    fn table_flex_columns_absorb_remainder() {
+        let table = Table::new(
+            Vec::<Row>::new(),
+            [Constraint::Min(10), Constraint::Min(10)],
+        )
+        .column_spacing(0);
+        let widths = table.get_column_widths(25);
+        assert_eq!(widths.iter().sum::<u16>(), 25);
+        assert!(widths.iter().all(|&w| w >= 10));
     }
 }
