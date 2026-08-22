@@ -19,6 +19,8 @@ pub mod config {
     pub const CLEANUP_INTERVAL: u32 = 10;
     /// Efficiency mode TTL in milliseconds
     pub const EFFICIENCY_TTL_MS: u128 = 30_000;
+    /// How long a failed metadata query suppresses retries (negative cache TTL)
+    pub const QUERY_FAILURE_TTL_MS: u128 = 15_000;
     /// Exe status check interval in seconds
     pub const EXE_STATUS_TTL_SECS: u64 = 10;
     /// Maximum exe status cache entries before clear
@@ -54,6 +56,11 @@ pub struct ProcessCacheEntry {
     // Efficiency mode (TTL-based refresh)
     pub efficiency_mode: Option<bool>,
     pub efficiency_updated: Option<Instant>,
+
+    // Negative cache: when a metadata query (OpenProcess or a per-fact query
+    // behind it) failed, the fact is "unknown", not authoritative — so it is
+    // retried only after QUERY_FAILURE_TTL_MS instead of every refresh.
+    pub query_failed_at: Option<Instant>,
 }
 
 impl Default for ProcessCacheEntry {
@@ -72,6 +79,7 @@ impl Default for ProcessCacheEntry {
             exe_path: None,
             efficiency_mode: None,
             efficiency_updated: None,
+            query_failed_at: None,
         }
     }
 }
@@ -134,6 +142,7 @@ impl ProcessCache {
                     entry.exe_path = None;
                     entry.efficiency_mode = None;
                     entry.efficiency_updated = None;
+                    entry.query_failed_at = None;
                     entry.prev_io_read = 0;
                     entry.prev_io_write = 0;
                 }

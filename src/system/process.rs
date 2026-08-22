@@ -309,25 +309,40 @@ pub(crate) fn open_process_query(pid: u32) -> Option<HANDLE> {
 #[cfg(windows)]
 #[inline]
 fn query_exe_path(handle: HANDLE) -> String {
+    use windows::core::HRESULT;
+    use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+
     unsafe {
         let mut capacity = 1024usize;
         loop {
             let mut buffer = vec![0u16; capacity];
             let mut size = buffer.len() as u32;
-            if QueryFullProcessImageNameW(
+            match QueryFullProcessImageNameW(
                 handle,
                 PROCESS_NAME_WIN32,
                 PWSTR(buffer.as_mut_ptr()),
                 &mut size,
-            )
-            .is_ok()
-            {
-                return String::from_utf16_lossy(&buffer[..size as usize]);
+            ) {
+                Ok(()) => {
+                    return String::from_utf16_lossy(&buffer[..size as usize]);
+                }
+                Err(err) => {
+                    // Only an undersized buffer can be fixed by retrying with a
+                    // bigger one; access denied and friends fail permanently, so
+                    // stop instead of burning five more calls (~126 KB of
+                    // transient allocations) per protected process.
+                    if err.code() != HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) {
+                        return String::new();
+                    }
+                    // On this error the API reports the required length in
+                    // `size`; jump straight to it instead of blind doubling.
+                    let needed = size as usize;
+                    if needed <= capacity || needed > 32768 {
+                        return String::new();
+                    }
+                    capacity = needed;
+                }
             }
-            if capacity >= 32768 {
-                return String::new();
-            }
-            capacity *= 2;
         }
     }
 }
@@ -453,6 +468,10 @@ struct EnrichedProcessData {
     exe_path_fresh: bool,
     /// True only when TokenElevation returned an authoritative elevation result.
     elevation_fresh: bool,
+    /// True when this pass needed a fact and could not obtain it (OpenProcess
+    /// denied, or a per-fact query failed). Drives the negative-cache timestamp
+    /// so the next QUERY_FAILURE_TTL_MS of refreshes skip the doomed retries.
+    query_failed: bool,
     is_elevated: bool,
     arch: ProcessArch,
     user: Option<Arc<str>>,
@@ -514,6 +533,7 @@ pub fn enrich_processes_for(
                     arch_fresh: true,
                     exe_path_fresh: true,
                     elevation_fresh: true,
+                    query_failed: false,
                     is_elevated: pid == 4, // System process is elevated
                     arch: ProcessArch::Native,
                     user: Some(Arc::from(SYSTEM_STR)),
@@ -545,16 +565,28 @@ pub fn enrich_processes_for(
                 None
             };
 
+            // Negative cache: if a query for this PID failed within the TTL,
+            // the facts are "unknown but recently tried" — skip the doomed
+            // retries (OpenProcess + failing syscalls) until it lapses. Facts
+            // that succeeded are cached normally and unaffected.
+            let query_suppressed = cached_entry
+                .and_then(|e| e.query_failed_at)
+                .map(|at| now.saturating_duration_since(at).as_millis() < config::QUERY_FAILURE_TTL_MS)
+                .unwrap_or(false);
+
             // Determine what we need to query
-            let need_arch = requirements.arch && cached_arch.is_none();
-            let need_elevation = requirements.elevation && cached_elevation.is_none();
-            let need_user = requirements.user && cached_user.is_none();
-            let need_efficiency = requirements.efficiency && !efficiency_valid;
+            let need_arch = requirements.arch && cached_arch.is_none() && !query_suppressed;
+            let need_elevation =
+                requirements.elevation && cached_elevation.is_none() && !query_suppressed;
+            let need_user = requirements.user && cached_user.is_none() && !query_suppressed;
+            let need_efficiency =
+                requirements.efficiency && !efficiency_valid && !query_suppressed;
             let need_exe_path = requirements.exe_path
                 && cached_exe_path
                     .as_ref()
                     .map(|p| p.is_empty())
-                    .unwrap_or(true);
+                    .unwrap_or(true)
+                && !query_suppressed;
 
             // Skip OpenProcess entirely if we have all cached data and don't need times
             let need_handle =
@@ -579,6 +611,7 @@ pub fn enrich_processes_for(
                     arch_fresh: false,
                     exe_path_fresh: false,
                     elevation_fresh: false,
+                    query_failed: need_handle,
                     is_elevated: cached_elevation.unwrap_or(p.is_elevated),
                     arch: cached_arch.unwrap_or(p.arch),
                     user,
@@ -766,6 +799,15 @@ pub fn enrich_processes_for(
                 }
             }
 
+            // A needed fact that did not resolve this pass means its query
+            // failed (each *_fresh flag is set only on authoritative results),
+            // so arm the negative cache for this PID.
+            let query_failed = (need_exe_path && !exe_path_fresh)
+                || (need_arch && !arch_fresh)
+                || (need_elevation && !elevation_fresh)
+                || (need_user && user.is_none())
+                || (need_efficiency && !efficiency_fresh);
+
             EnrichedProcessData {
                 identity,
                 shared_mem,
@@ -774,6 +816,7 @@ pub fn enrich_processes_for(
                 arch_fresh,
                 exe_path_fresh,
                 elevation_fresh,
+                query_failed,
                 is_elevated,
                 arch,
                 user,
@@ -817,6 +860,13 @@ pub fn enrich_processes_for(
                     entry.efficiency_mode = Some(data.efficiency_mode);
                     entry.efficiency_updated = Some(std::time::Instant::now());
                 }
+                // Negative cache: stamp the failure for this pass, or clear a
+                // stale one once every needed fact resolved without error.
+                entry.query_failed_at = if data.query_failed {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
             }
         });
     }

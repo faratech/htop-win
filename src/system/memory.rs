@@ -137,13 +137,14 @@ impl MemoryInfo {
 
                     (used, cache, buffers, 0)
                 } else {
-                    // Fallback without detailed breakdown
-                    // Estimate cache as the difference between available and a small free estimate
-                    let estimated_cache = available.saturating_sub(available / 10);
+                    // Fallback without the detailed breakdown: report the system
+                    // file cache from GetPerformanceInfo as the cache segment.
+                    // (The old estimate here claimed 90% of all available RAM
+                    // was "cached", wildly overstating that meter segment.)
                     let buffers = system_cache.min(in_use / 10);
                     let used = in_use.saturating_sub(buffers);
 
-                    (used, estimated_cache, buffers, 0)
+                    (used, system_cache, buffers, 0)
                 };
 
                 // Get actual page file usage using NtQuerySystemInformation
