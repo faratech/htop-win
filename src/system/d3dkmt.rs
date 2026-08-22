@@ -565,6 +565,12 @@ pub fn refresh() -> AdapterSnapshot {
 
     if !state.detected || state.needs_reenumeration {
         let old = std::mem::take(&mut state.adapters);
+        // Flattened (LUID, node-count) sequence of the old adapter set: the
+        // per-process baselines below are indexed by this layout.
+        let old_layout: Vec<(u32, i32, u32)> = old
+            .iter()
+            .map(|a| (a.luid.LowPart, a.luid.HighPart, a.node_count))
+            .collect();
         let (mut adapters, luids, pending) = detect_adapters();
         // Preserve per-adapter utilization baselines for adapters that survived
         // the re-detection (matched by LUID), so a re-enumeration triggered by a
@@ -592,9 +598,18 @@ pub fn refresh() -> AdapterSnapshot {
         state.last_topology_check = Some(now);
         // Keep last_sample so surviving adapters retain utilization continuity
         // (a counter reset clamps to 0% for one tick via running_time_to_percent).
-        // The per-process node layout may have shifted, so reset those baselines.
-        state.last_proc_sample = None;
-        state.prev_proc_running.clear();
+        // Reset the per-process baselines only when the flattened layout they
+        // are indexed by actually changed — a pending-adapter retry that finds
+        // the same adapters must not blank per-process GPU%/NPU% for a tick.
+        let new_layout: Vec<(u32, i32, u32)> = state
+            .adapters
+            .iter()
+            .map(|a| (a.luid.LowPart, a.luid.HighPart, a.node_count))
+            .collect();
+        if new_layout != old_layout {
+            state.last_proc_sample = None;
+            state.prev_proc_running.clear();
+        }
     }
     if state.adapters.is_empty() {
         state.last_snapshot = AdapterSnapshot::default();
