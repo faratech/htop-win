@@ -136,6 +136,32 @@ struct AdapterState {
     last_snapshot: AdapterSnapshot,
 }
 
+/// Per-adapter fields the per-process sweep needs, copied out of
+/// `TrackedAdapter` so the syscall loop can run without the state lock held.
+#[derive(Clone, Copy)]
+struct ProcAdapterDesc {
+    class: AdapterClass,
+    luid: LUID,
+    node_count: u32,
+    segment_count: u32,
+}
+
+/// Delta baselines checked out of `ADAPTER_STATE` for one per-process pass:
+/// mutated lock-free during the sweep, then moved back under the lock.
+struct ProcSweepState {
+    adapters: Vec<ProcAdapterDesc>,
+    /// (pid, create time) -> previous RunningTime per node, flattened across
+    /// adapters in enumeration order.
+    prev_proc_running: HashMap<(u32, u64), Vec<i64>>,
+}
+
+/// Total flattened node slots across a sweep snapshot — the length of every
+/// per-process baseline vector.
+#[inline]
+fn total_node_slots(adapters: &[ProcAdapterDesc]) -> usize {
+    adapters.iter().map(|a| a.node_count as usize).sum()
+}
+
 /// Re-check adapter topology this often: catches drivers installed or removed
 /// while running. One enumeration syscall when nothing changed.
 const TOPOLOGY_CHECK_INTERVAL: Duration = Duration::from_secs(30);
@@ -646,44 +672,73 @@ pub fn refresh() -> AdapterSnapshot {
 /// Per-process GPU/NPU stats for the given PIDs. A class is only queried when
 /// its adapters exist and its `set_*_process_stats_enabled(true)` gate is on;
 /// with both gates off this returns an empty map without opening any handles.
+///
+/// Locking: `ADAPTER_STATE` is held only to run the gate bookkeeping and check
+/// the delta baselines out, then again briefly to move them back. The sweep
+/// itself — one handle open plus several D3DKMTQueryStatistics calls per
+/// process — runs unlocked, so UI-thread readers (`gpu_names`) are stalled for
+/// microseconds instead of for the whole sweep. That is safe because this
+/// function and [`refresh`] both run sequentially on the data-collector
+/// thread: nothing can mutate the checked-out baselines in between, and
+/// UI-thread readers never write them.
 pub fn process_stats(processes: &[(u32, u64)]) -> HashMap<u32, ProcAdapterStats> {
-    let mut guard = ADAPTER_STATE.lock().unwrap();
-    let Some(state) = guard.as_mut() else {
-        return HashMap::new();
+    // Phase 1 (locked): gate bookkeeping + baseline checkout.
+    let (mut sweep, gpu_enabled, npu_enabled, elapsed) = {
+        let mut guard = ADAPTER_STATE.lock().unwrap();
+        let Some(state) = guard.as_mut() else {
+            return HashMap::new();
+        };
+
+        let gpu_enabled = GPU_PROCESS_STATS_ENABLED.load(Ordering::Relaxed)
+            && state.adapters.iter().any(|a| a.class == AdapterClass::Gpu);
+        let npu_enabled = NPU_PROCESS_STATS_ENABLED.load(Ordering::Relaxed)
+            && state.adapters.iter().any(|a| a.class == AdapterClass::Npu);
+
+        // Nodes of a disabled class keep stale RunningTime baselines, so any gate
+        // change restarts delta tracking from a clean first sample.
+        if (gpu_enabled, npu_enabled) != state.prev_proc_gates {
+            state.prev_proc_gates = (gpu_enabled, npu_enabled);
+            state.prev_proc_running.clear();
+            state.last_proc_sample = None;
+        }
+        if !gpu_enabled && !npu_enabled {
+            return HashMap::new();
+        }
+
+        let now = Instant::now();
+        let elapsed = state
+            .last_proc_sample
+            .map(|t| now.duration_since(t).as_secs_f64());
+        state.last_proc_sample = Some(now);
+
+        let adapters = state
+            .adapters
+            .iter()
+            .map(|a| ProcAdapterDesc {
+                class: a.class,
+                luid: a.luid,
+                node_count: a.node_count,
+                segment_count: a.segment_count,
+            })
+            .collect();
+        (
+            ProcSweepState {
+                adapters,
+                // Checked out (not cloned): phase 3 moves the updated map back.
+                prev_proc_running: std::mem::take(&mut state.prev_proc_running),
+            },
+            gpu_enabled,
+            npu_enabled,
+            elapsed,
+        )
     };
 
-    let gpu_enabled = GPU_PROCESS_STATS_ENABLED.load(Ordering::Relaxed)
-        && state.adapters.iter().any(|a| a.class == AdapterClass::Gpu);
-    let npu_enabled = NPU_PROCESS_STATS_ENABLED.load(Ordering::Relaxed)
-        && state.adapters.iter().any(|a| a.class == AdapterClass::Npu);
-
-    // Nodes of a disabled class keep stale RunningTime baselines, so any gate
-    // change restarts delta tracking from a clean first sample.
-    if (gpu_enabled, npu_enabled) != state.prev_proc_gates {
-        state.prev_proc_gates = (gpu_enabled, npu_enabled);
-        state.prev_proc_running.clear();
-        state.last_proc_sample = None;
-    }
-    if !gpu_enabled && !npu_enabled {
-        return HashMap::new();
-    }
-
-    let now = Instant::now();
-    let elapsed = state
-        .last_proc_sample
-        .map(|t| now.duration_since(t).as_secs_f64());
-    state.last_proc_sample = Some(now);
-
-    // Split borrows so adapters and the baseline map can be used together.
-    let AdapterState {
-        adapters,
-        prev_proc_running,
-        ..
-    } = state;
     // Baseline slots cover every node of every adapter so the flattened
     // indices stay stable regardless of which classes are queried.
-    let total_nodes: usize = adapters.iter().map(|a| a.node_count as usize).sum();
+    let total_nodes = total_node_slots(&sweep.adapters);
 
+    // Phase 2 (unlocked): open a handle per process and run its statistics
+    // queries against the checked-out state.
     let mut result = HashMap::with_capacity(processes.len());
     let mut current_keys = HashSet::with_capacity(processes.len());
     for &(pid, create_time) in processes {
@@ -697,15 +752,16 @@ pub fn process_stats(processes: &[(u32, u64)]) -> HashMap<u32, ProcAdapterStats>
         };
 
         // A PID seen for the first time only sets baselines (reports 0%).
-        let fresh = !prev_proc_running.contains_key(&key);
-        let prev = prev_proc_running
+        let fresh = !sweep.prev_proc_running.contains_key(&key);
+        let prev = sweep
+            .prev_proc_running
             .entry(key)
             .or_insert_with(|| vec![0; total_nodes]);
 
         let mut entry = ProcAdapterStats::default();
         let mut node_index = 0;
         let mut sampled_running_time = false;
-        for adapter in adapters.iter() {
+        for adapter in sweep.adapters.iter() {
             let class_enabled = match adapter.class {
                 AdapterClass::Gpu => gpu_enabled,
                 AdapterClass::Npu => npu_enabled,
@@ -776,7 +832,14 @@ pub fn process_stats(processes: &[(u32, u64)]) -> HashMap<u32, ProcAdapterStats>
     }
 
     // Prune baselines for PIDs that died or could no longer be opened.
-    prev_proc_running.retain(|key, _| current_keys.contains(key));
+    sweep.prev_proc_running.retain(|key, _| current_keys.contains(key));
+
+    // Phase 3 (locked): move the updated baselines back. The state cannot have
+    // been recreated or re-laid-out meanwhile: only refresh() (same collector
+    // thread) writes it, and it is sequenced before/after this call.
+    if let Some(state) = ADAPTER_STATE.lock().unwrap().as_mut() {
+        state.prev_proc_running = sweep.prev_proc_running;
+    }
 
     result
 }
@@ -1050,5 +1113,55 @@ mod tests {
         assert_eq!(utf16_to_string(&buf), "Intel(R) AI Boost");
         let no_nul: Vec<u16> = "NPU".encode_utf16().collect();
         assert_eq!(utf16_to_string(&no_nul), "NPU");
+    }
+
+    fn desc(class: AdapterClass, nodes: u32, luid_low: u32) -> super::ProcAdapterDesc {
+        super::ProcAdapterDesc {
+            class,
+            luid: windows::Win32::Foundation::LUID {
+                LowPart: luid_low,
+                HighPart: 0,
+            },
+            node_count: nodes,
+            segment_count: 1,
+        }
+    }
+
+    /// The per-process sweep walks one shared `node_index` across the snapshot,
+    /// advancing past whole disabled adapters and by one per queried node. Every
+    /// gate combination that reaches the sweep must touch each baseline slot
+    /// exactly once, so baselines stay aligned when the gates flip.
+    #[test]
+    fn test_proc_sweep_flattened_indices_cover_all_slots() {
+        use super::{AdapterClass as C, total_node_slots};
+        // GPU(3 nodes), NPU(2), GPU(4) -> 9 slots whatever is enabled.
+        let adapters = [
+            desc(C::Gpu, 3, 1),
+            desc(C::Npu, 2, 2),
+            desc(C::Gpu, 4, 1),
+        ];
+        assert_eq!(total_node_slots(&adapters), 9);
+        for (gpu_enabled, npu_enabled) in [(true, true), (true, false), (false, true)] {
+            let mut seen = vec![0usize; 9];
+            let mut node_index = 0;
+            for adapter in &adapters {
+                let enabled = match adapter.class {
+                    C::Gpu => gpu_enabled,
+                    C::Npu => npu_enabled,
+                };
+                if !enabled {
+                    node_index += adapter.node_count as usize;
+                    continue;
+                }
+                for _ in 0..adapter.node_count {
+                    seen[node_index] += 1;
+                    node_index += 1;
+                }
+            }
+            assert!(
+                seen.iter().all(|&c| c == 1),
+                "gates=({gpu_enabled},{npu_enabled}) saw {seen:?}"
+            );
+        }
     }
 }
