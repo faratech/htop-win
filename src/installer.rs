@@ -1120,47 +1120,102 @@ pub fn spawn_update_check() -> std::sync::mpsc::Receiver<UpdateStatus> {
     rx
 }
 
+/// Result of the startup pass over staged updates.
+///
+/// `apply_pending_update` collapses this into a bool whose only meaning to its
+/// caller is "the running executable was just replaced": the session then skips
+/// its background update check because the stale binary would re-download what
+/// it just installed, and suppresses further update notices. Everything that is
+/// not a completed installation must report false, otherwise a transient
+/// problem such as losing the race for the update mutex would silence update
+/// checks for the whole session.
+enum PendingUpdateOutcome {
+    /// An update was installed over the running executable.
+    Applied,
+    /// No staged update existed.
+    NothingPending,
+    /// The pass could not be completed; the caller must run its normal update
+    /// check instead of assuming the running binary is up to date.
+    Incomplete(String),
+}
+
+impl PendingUpdateOutcome {
+    fn update_just_applied(&self) -> bool {
+        matches!(self, Self::Applied)
+    }
+}
+
+/// Apply the staged update, requiring the caller to hold [`UpdateLock`] so a
+/// concurrent instance cannot observe or consume the generation mid-install.
+fn apply_pending_update_locked(current_exe: &Path) -> PendingUpdateOutcome {
+    match pending_update_for_current_version() {
+        Ok(Some(pending)) => match install_update_file(&pending.path, current_exe) {
+            Ok(()) => {
+                remove_pending_update(&pending);
+                PendingUpdateOutcome::Applied
+            }
+            Err(error) => {
+                PendingUpdateOutcome::Incomplete(format!("installation failed: {error}"))
+            }
+        },
+        Ok(None) => {
+            // Clean up any old backup files from previous updates.
+            let backup_path = current_exe.with_extension("exe.old");
+            let _ = fs::remove_file(&backup_path);
+            PendingUpdateOutcome::NothingPending
+        }
+        Err(error) => PendingUpdateOutcome::Incomplete(format!(
+            "cannot inspect update files: {error}"
+        )),
+    }
+}
+
 /// Check for and apply pending update on startup (call before UI starts)
-/// Returns true if an update was applied (caller should continue normally)
+///
+/// Returns true only when an update was actually applied this session, telling
+/// the caller to skip its own update check because the running binary is older
+/// than the one now on disk. Lock timeouts, unreadable state and failed
+/// installations all return false so the session still checks for updates.
 pub fn apply_pending_update() -> bool {
     let current_exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(_) => return false,
     };
-    let _lock = match UpdateLock::acquire() {
-        Ok(lock) => lock,
-        Err(error) => {
-            eprintln!("Update pending (cannot acquire update lock: {error})");
-            return true;
-        }
-    };
-    let pending = match pending_update_for_current_version() {
-        Ok(Some(update)) => update,
-        Ok(None) => {
-            // Clean up any old backup files from previous updates.
-            let backup_path = current_exe.with_extension("exe.old");
-            let _ = fs::remove_file(&backup_path);
-            return false;
-        }
-        Err(error) => {
-            eprintln!("Update pending (cannot inspect update files: {error})");
-            return true;
-        }
+    let outcome = match UpdateLock::acquire() {
+        // Held across inspection, installation and publication.
+        Ok(_lock) => apply_pending_update_locked(&current_exe),
+        Err(error) => PendingUpdateOutcome::Incomplete(format!(
+            "cannot acquire update lock: {error}"
+        )),
     };
 
-    if let Err(error) = install_update_file(&pending.path, &current_exe) {
-        eprintln!("Update pending (installation failed: {error})");
-        return true;
+    match &outcome {
+        PendingUpdateOutcome::Applied => eprintln!("Update applied successfully!"),
+        PendingUpdateOutcome::Incomplete(error) => {
+            eprintln!("Update not applied ({error}); will check for updates this session");
+        }
+        PendingUpdateOutcome::NothingPending => {}
     }
 
-    remove_pending_update(&pending);
-    eprintln!("Update applied successfully!");
-    true
+    outcome.update_just_applied()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #82: only a completed installation may tell the caller that an
+    /// update was just applied. Any other outcome must report false so the
+    /// session still runs its background update check.
+    #[test]
+    fn only_a_completed_install_counts_as_just_applied() {
+        assert!(PendingUpdateOutcome::Applied.update_just_applied());
+        assert!(!PendingUpdateOutcome::NothingPending.update_just_applied());
+        assert!(
+            !PendingUpdateOutcome::Incomplete("timed out waiting for the update lock".into())
+                .update_just_applied()
+        );
+    }
 
     /// Smallest buffer validate_pe_executable accepts: MZ header, e_lfanew
     /// pointing at a PE\0\0 signature, padded past MIN_UPDATE_SIZE.
