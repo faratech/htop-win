@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use super::process::ProcessArch;
 
@@ -23,9 +23,16 @@ pub mod config {
     pub const QUERY_FAILURE_TTL_MS: u128 = 15_000;
     /// Exe status check interval in seconds
     pub const EXE_STATUS_TTL_SECS: u64 = 10;
-    /// Maximum exe status cache entries before clear
+    /// Maximum exe status cache entries before eviction
     pub const EXE_CACHE_MAX_SIZE: usize = 1000;
 }
+
+/// FILETIME of the Unix epoch (1601-01-01 → 1970-01-01) in 100ns ticks, used
+/// to express mtimes and process create times in the same units.
+const UNIX_EPOCH_FILETIME_100NS: u64 = 116444736000000000;
+
+/// How long an exe-status entry stays fresh before its file is re-stat'd.
+const EXE_STATUS_TTL: Duration = Duration::from_secs(config::EXE_STATUS_TTL_SECS);
 
 /// Per-PID cache entry containing all cached process data
 #[derive(Clone)]
@@ -89,7 +96,56 @@ impl Default for ProcessCacheEntry {
 pub struct ExeStatusEntry {
     pub updated: bool,
     pub deleted: bool,
-    pub checked_at: u64,
+    /// Monotonic instant of the filesystem stat backing this entry. `Instant`
+    /// (not wall-clock) so TTL freshness is immune to clock changes.
+    pub checked_at: Instant,
+}
+
+/// Exe-status cache layout: `path -> (process create FILETIME -> entry)`.
+///
+/// Nested instead of a single `HashMap<(String, u64), _>` composite key so the
+/// hot hit-path lookup can borrow the caller's `&str` (`Box<str>: Borrow<str>`
+/// hashes and compares through `str`) instead of allocating a `String` per call.
+type ExeStatusMap = HashMap<Box<str>, HashMap<u64, ExeStatusEntry>>;
+
+/// An entry is fresh while its last stat is younger than the TTL.
+fn exe_entry_is_fresh(entry: &ExeStatusEntry, now: Instant) -> bool {
+    now.saturating_duration_since(entry.checked_at) < EXE_STATUS_TTL
+}
+
+/// Total number of cached entries across every path.
+fn exe_status_len(map: &ExeStatusMap) -> usize {
+    map.values().map(HashMap::len).sum()
+}
+
+/// Drop entries whose TTL has lapsed, pruning paths left without any entry.
+/// Returns the number of entries removed.
+fn evict_expired_entries(map: &mut ExeStatusMap, now: Instant) -> usize {
+    let mut removed = 0usize;
+    map.retain(|_, by_start| {
+        by_start.retain(|_, entry| {
+            let fresh = exe_entry_is_fresh(entry, now);
+            if !fresh {
+                removed += 1;
+            }
+            fresh
+        });
+        !by_start.is_empty()
+    });
+    removed
+}
+
+/// Enforce the size cap once it is exceeded: shed expired entries first and
+/// wipe the cache wholesale only when everything left is still fresh, i.e.
+/// when eviction cannot free enough room.
+fn enforce_exe_cache_limit(map: &mut ExeStatusMap, now: Instant) {
+    if exe_status_len(map) <= config::EXE_CACHE_MAX_SIZE {
+        return;
+    }
+    evict_expired_entries(map, now);
+    if exe_status_len(map) > config::EXE_CACHE_MAX_SIZE {
+        map.clear();
+    }
 }
 
 /// Global process cache singleton
@@ -100,7 +156,7 @@ pub struct ProcessCache {
     /// Per-PID cache entries
     entries: RwLock<HashMap<u32, ProcessCacheEntry>>,
     /// Exe status cache (keyed by path+process create FILETIME)
-    exe_status: RwLock<HashMap<(String, u64), ExeStatusEntry>>,
+    exe_status: RwLock<ExeStatusMap>,
     /// Cleanup counter for periodic maintenance
     cleanup_counter: AtomicU32,
 }
@@ -197,30 +253,37 @@ impl ProcessCache {
     /// Check exe status with caching
     /// Returns (exe_updated, exe_deleted)
     pub fn check_exe_status(&self, exe_path: &str, start_time_100ns: u64) -> (bool, bool) {
+        self.check_exe_status_at(exe_path, start_time_100ns, Instant::now())
+    }
+
+    /// [`ProcessCache::check_exe_status`] evaluated at an explicit instant,
+    /// mirroring `update_times_batch_at` so TTL behavior is testable.
+    fn check_exe_status_at(
+        &self,
+        exe_path: &str,
+        start_time_100ns: u64,
+        now: Instant,
+    ) -> (bool, bool) {
         use std::fs;
-        use std::time::UNIX_EPOCH;
-        const UNIX_EPOCH_FILETIME_100NS: u64 = 116444736000000000;
 
         if exe_path.is_empty() {
             return (false, false);
         }
 
-        let now = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-
-        let cache_key = (exe_path.to_string(), start_time_100ns);
-
-        // Check cache first
+        // Hot path: borrowed lookup through `Box<str>: Borrow<str>`, so the hit
+        // case allocates nothing and reads no wall clock. Only the monotonic
+        // `now` decides freshness.
         if let Ok(cache) = self.exe_status.read()
-            && let Some(entry) = cache.get(&cache_key)
-            && now.saturating_sub(entry.checked_at) < config::EXE_STATUS_TTL_SECS
+            && let Some(by_start) = cache.get(exe_path)
+            && let Some(entry) = by_start.get(&start_time_100ns)
+            && exe_entry_is_fresh(entry, now)
         {
             return (entry.updated, entry.deleted);
         }
 
-        // Cache miss or stale - do filesystem check
+        // Cache miss or stale - do filesystem check. The comparison only needs
+        // the file's own mtime converted into FILETIME units; no wall-clock
+        // read is required here.
         let result = match fs::metadata(exe_path) {
             Ok(metadata) => {
                 let exe_updated = metadata
@@ -240,19 +303,20 @@ impl ProcessCache {
             Err(_) => (false, false),
         };
 
-        // Update cache (with size limit)
+        // Update cache (size-capped; shed expired entries before clearing)
         if let Ok(mut cache) = self.exe_status.write() {
-            if cache.len() > config::EXE_CACHE_MAX_SIZE {
-                cache.clear();
-            }
-            cache.insert(
-                cache_key,
-                ExeStatusEntry {
-                    updated: result.0,
-                    deleted: result.1,
-                    checked_at: now,
-                },
-            );
+            enforce_exe_cache_limit(&mut cache, now);
+            cache
+                .entry(Box::from(exe_path))
+                .or_default()
+                .insert(
+                    start_time_100ns,
+                    ExeStatusEntry {
+                        updated: result.0,
+                        deleted: result.1,
+                        checked_at: now,
+                    },
+                );
         }
 
         result
@@ -291,8 +355,9 @@ impl ProcessCache {
             cache.retain(|pid, _| current_pids.contains(pid));
         }
 
-        // Exe status cache uses size-based cleanup (in check_exe_status).
-        // No PID-based cleanup needed since keys are (path, create FILETIME).
+        // Exe status cache uses TTL eviction and a size cap (in
+        // check_exe_status). No PID-based cleanup needed since keys are
+        // (path, create FILETIME), not PIDs.
     }
 
     // ========== Batch Update Methods ==========
@@ -320,6 +385,7 @@ impl Default for ProcessCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::SystemTime;
 
     #[test]
     fn test_batch_update_and_io_rates() {
@@ -422,5 +488,226 @@ mod tests {
             assert!(c.contains_key(&1));
             assert!(c.contains_key(&2));
         });
+    }
+
+    // ===== Exe status cache =====
+
+    fn filetime_from_unix_secs(secs: u64) -> u64 {
+        UNIX_EPOCH_FILETIME_100NS.saturating_add(secs.saturating_mul(10_000_000))
+    }
+
+    fn temp_exe_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("htop-win-exe-cache-{}-{tag}", std::process::id()))
+    }
+
+    /// Create/rewrite a temp file with an explicit mtime (std-only, no
+    /// external test dependencies).
+    fn write_file_with_mtime(path: &std::path::Path, mtime: SystemTime) {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(path).expect("create temp file");
+        f.write_all(b"htop-win exe-status test").expect("write temp file");
+        f.set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .expect("set mtime");
+    }
+
+    fn remove_file(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn path_str(path: &std::path::Path) -> &str {
+        path.to_str().expect("utf-8 temp path")
+    }
+
+    #[test]
+    fn hit_path_serves_cached_verdict_without_restating() {
+        let cache = ProcessCache::new();
+        let path = temp_exe_path("hit");
+        let t0 = Instant::now();
+        // Process started at t=1000s; file written at t=2000s -> "updated".
+        let start_time = filetime_from_unix_secs(1_000);
+
+        write_file_with_mtime(&path, UNIX_EPOCH + Duration::from_secs(2_000));
+        assert_eq!(
+            cache.check_exe_status_at(path_str(&path), start_time, t0),
+            (true, false)
+        );
+
+        // Rewrite with an mtime that would flip the verdict to "not updated";
+        // within the TTL the cached answer must win (no restat).
+        write_file_with_mtime(&path, UNIX_EPOCH + Duration::from_secs(500));
+        assert_eq!(
+            cache.check_exe_status_at(
+                path_str(&path),
+                start_time,
+                t0 + EXE_STATUS_TTL - Duration::from_secs(1)
+            ),
+            (true, false)
+        );
+
+        // One tick past the TTL the entry is stale and gets restated.
+        assert_eq!(
+            cache.check_exe_status_at(
+                path_str(&path),
+                start_time,
+                t0 + EXE_STATUS_TTL + Duration::from_secs(1)
+            ),
+            (false, false)
+        );
+
+        remove_file(&path);
+    }
+
+    #[test]
+    fn deletion_is_negative_cached_until_ttl_lapses() {
+        let cache = ProcessCache::new();
+        let path = temp_exe_path("deleted");
+        let t0 = Instant::now();
+        let start_time = filetime_from_unix_secs(1_000);
+
+        write_file_with_mtime(&path, UNIX_EPOCH + Duration::from_secs(2_000));
+        assert_eq!(
+            cache.check_exe_status_at(path_str(&path), start_time, t0),
+            (true, false)
+        );
+
+        remove_file(&path);
+        // Still fresh: cached verdict even though the file is gone.
+        assert_eq!(
+            cache.check_exe_status_at(path_str(&path), start_time, t0 + Duration::from_secs(5)),
+            (true, false)
+        );
+        // Stale: restat reports the deletion...
+        assert_eq!(
+            cache.check_exe_status_at(path_str(&path), start_time, t0 + EXE_STATUS_TTL * 2),
+            (false, true)
+        );
+        // ...and that verdict is cached for its own TTL without the file.
+        assert_eq!(
+            cache.check_exe_status_at(path_str(&path), start_time, t0 + EXE_STATUS_TTL * 3),
+            (false, true)
+        );
+
+        remove_file(&path);
+    }
+
+    /// Insert synthetic entries (no filesystem involved), one path each.
+    fn add_synthetic_entries(
+        map: &mut ExeStatusMap,
+        range: std::ops::Range<usize>,
+        checked_at: Instant,
+    ) {
+        for i in range {
+            let key: Box<str> = format!("C:\\apps\\app{i}.exe").into_boxed_str();
+            map.entry(key).or_default().insert(
+                i as u64,
+                ExeStatusEntry {
+                    updated: false,
+                    deleted: false,
+                    checked_at,
+                },
+            );
+        }
+    }
+
+    fn contains_path(map: &ExeStatusMap, name: &str) -> bool {
+        map.contains_key(name)
+    }
+
+    #[test]
+    fn cap_eviction_sheds_expired_entries_and_keeps_fresh_ones() {
+        let t0 = Instant::now();
+        // `later` is one tick past the TTL, so entries stamped at t0 expire
+        // while entries stamped at `later` are still fresh.
+        let later = t0 + EXE_STATUS_TTL + Duration::from_secs(1);
+
+        let mut map = ExeStatusMap::new();
+        add_synthetic_entries(&mut map, 0..600, t0); // will be expired
+        add_synthetic_entries(&mut map, 1_000..1_600, later); // still fresh
+        // One path holding two start-times of mixed freshness.
+        map.insert(
+            Box::from("C:\\apps\\shared.exe"),
+            HashMap::from([
+                (
+                    7u64,
+                    ExeStatusEntry {
+                        updated: true,
+                        deleted: false,
+                        checked_at: t0,
+                    },
+                ),
+                (
+                    8u64,
+                    ExeStatusEntry {
+                        updated: false,
+                        deleted: false,
+                        checked_at: later,
+                    },
+                ),
+            ]),
+        );
+        assert!(exe_status_len(&map) > config::EXE_CACHE_MAX_SIZE);
+
+        enforce_exe_cache_limit(&mut map, later);
+
+        // Expired entries shed, every fresh entry intact: no wholesale clear.
+        assert!(exe_status_len(&map) <= config::EXE_CACHE_MAX_SIZE);
+        assert_eq!(map.len(), 601);
+        for i in 1_000..1_600 {
+            assert!(
+                contains_path(&map, &format!("C:\\apps\\app{i}.exe")),
+                "fresh entry {i} was discarded"
+            );
+        }
+        for i in 0..600 {
+            assert!(
+                !contains_path(&map, &format!("C:\\apps\\app{i}.exe")),
+                "expired entry {i} survived"
+            );
+        }
+        // Mixed-freshness path survives with only its fresh start-time.
+        let shared = &map["C:\\apps\\shared.exe"];
+        assert!(!shared.contains_key(&7));
+        assert!(shared.contains_key(&8));
+    }
+
+    #[test]
+    fn wholesale_clear_only_when_nothing_is_expired() {
+        let t0 = Instant::now();
+        let mut map = ExeStatusMap::new();
+        // All entries fresh and over the cap: eviction cannot free anything,
+        // so clearing the whole map is the only way back under the limit.
+        add_synthetic_entries(&mut map, 0..config::EXE_CACHE_MAX_SIZE + 200, t0);
+        assert!(exe_status_len(&map) > config::EXE_CACHE_MAX_SIZE);
+
+        enforce_exe_cache_limit(&mut map, t0 + Duration::from_secs(1));
+
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn caches_under_the_cap_are_left_alone() {
+        let t0 = Instant::now();
+        let mut map = ExeStatusMap::new();
+        add_synthetic_entries(&mut map, 0..64, t0);
+
+        enforce_exe_cache_limit(&mut map, t0 + Duration::from_secs(1));
+
+        assert_eq!(exe_status_len(&map), 64);
+        assert_eq!(map.len(), 64);
+    }
+
+    #[test]
+    fn expired_only_paths_are_pruned_from_the_outer_map() {
+        let t0 = Instant::now();
+        let later = t0 + EXE_STATUS_TTL + Duration::from_secs(1);
+        let mut map = ExeStatusMap::new();
+        add_synthetic_entries(&mut map, 0..4, t0);
+        add_synthetic_entries(&mut map, 100..102, later);
+
+        assert_eq!(evict_expired_entries(&mut map, later), 4);
+
+        assert_eq!(map.len(), 2);
+        assert!(contains_path(&map, "C:\\apps\\app100.exe"));
+        assert!(contains_path(&map, "C:\\apps\\app101.exe"));
     }
 }
