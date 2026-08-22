@@ -118,6 +118,9 @@ pub struct SystemMetrics {
     prev_network: Option<HashMap<u64, NetworkCounters>>,
     prev_net_sample: Option<Instant>,
     // Native process enumeration state
+    /// Capacity baseline for process CPU%; re-queried every tick so hot-add or
+    /// processor-group changes move the denominator with the layout instead of
+    /// staying frozen at the value captured at startup.
     #[cfg_attr(not(windows), allow(dead_code))]
     logical_processor_count: usize,
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -237,6 +240,19 @@ fn cpu_capacity_100ns(elapsed: Duration, logical_processor_count: usize) -> u64 
         .saturating_mul(logical_processor_count.max(1) as u128)
         / 100;
     capacity.min(u64::MAX as u128) as u64
+}
+
+/// Capacity denominator for this tick: the count reported by the live
+/// processor enumeration when it yields one, otherwise the last known count
+/// (never zero, so the interval can still be divided).
+#[inline]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn tick_processor_count(previous: usize, enumerated: usize) -> usize {
+    if enumerated > 0 {
+        enumerated
+    } else {
+        previous.max(1)
+    }
 }
 
 #[inline]
@@ -452,8 +468,15 @@ impl SystemMetrics {
         // On query failure (None), keep the previous process list and baselines
         // untouched rather than blanking the table for a frame.
         let _ = with_process_list(|proc_list| {
-            // Update time tracking for CPU delta calculation
+            // Update time tracking for CPU delta calculation. The core layout
+            // is re-enumerated every tick, so the capacity denominator must be
+            // re-derived too: a hot-add or processor-group change would
+            // otherwise skew every percentage until restart.
             let now = Instant::now();
+            self.logical_processor_count = tick_processor_count(
+                self.logical_processor_count,
+                active_logical_processor_count(),
+            );
             let cpu_capacity = cpu_capacity_100ns(
                 now.duration_since(self.last_native_refresh),
                 self.logical_processor_count,
@@ -609,6 +632,34 @@ mod tests {
         assert_eq!(process_cpu_percentage(250, 1_000), 25.0);
         assert_eq!(process_cpu_percentage(1, 0), 0.0);
         assert_eq!(process_cpu_percentage(2_000, 1_000), 100.0);
+    }
+
+    #[test]
+    fn capacity_denominator_follows_core_count_changes() {
+        // Constant layout: the tick denominator is unchanged, so the math
+        // stays exactly as before.
+        let steady = tick_processor_count(8, 8);
+        assert_eq!(
+            cpu_capacity_100ns(Duration::from_millis(500), steady),
+            cpu_capacity_100ns(Duration::from_millis(500), 8)
+        );
+
+        // Hot-add / new processor group: the denominator grows with the
+        // current enumeration instead of staying at the startup count.
+        let grown = tick_processor_count(8, 16);
+        assert_eq!(grown, 16);
+        assert_eq!(
+            cpu_capacity_100ns(Duration::from_millis(500), grown),
+            cpu_capacity_100ns(Duration::from_millis(500), 8) * 2
+        );
+
+        // A shrinking layout is picked up as well.
+        assert_eq!(tick_processor_count(16, 8), 8);
+
+        // An empty enumeration (failed query) keeps the last known count.
+        assert_eq!(tick_processor_count(8, 0), 8);
+        // ...and never lets it drop to zero.
+        assert_eq!(tick_processor_count(0, 0), 1);
     }
 
     #[test]
