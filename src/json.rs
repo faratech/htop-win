@@ -218,15 +218,48 @@ impl<'a> Parser<'a> {
         if self.peek()? == '-' {
             self.advance();
         }
-        while let Some(c) = self.peek() {
-            if c.is_ascii_digit() {
+        // Integer part
+        while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+            self.advance();
+        }
+        // Fraction and exponent (hand-edited configs may contain "1500.0"
+        // or "1.5e3"; rejecting them failed the whole document). Both are only
+        // consumed when well-formed, so "1." stays a parse error.
+        if self.peek() == Some('.')
+            && self.input[self.pos + 1..].starts_with(|c: char| c.is_ascii_digit())
+        {
+            // safe: '.' is single-byte, so pos + 1 is a char boundary
+            self.advance();
+            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
                 self.advance();
-            } else {
-                break;
+            }
+        }
+        if matches!(self.peek(), Some('e') | Some('E')) {
+            let saved = self.pos;
+            self.advance();
+            if matches!(self.peek(), Some('+') | Some('-')) {
+                self.advance();
+            }
+            let mut any_digit = false;
+            while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                self.advance();
+                any_digit = true;
+            }
+            if !any_digit {
+                self.pos = saved; // not an exponent after all ("1e" is garbage)
             }
         }
         let s = &self.input[start..self.pos];
-        s.parse::<i64>().ok().map(Value::Number)
+        if let Ok(int_value) = s.parse::<i64>() {
+            return Some(Value::Number(int_value));
+        }
+        // Non-integer literal: round to the nearest integer. Config fields are
+        // all integral, so this accepts "1500.0"-style values without adding a
+        // float variant to Value.
+        s.parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .map(|f| Value::Number(f.round() as i64))
     }
 
     fn parse_bool(&mut self) -> Option<Value> {
@@ -322,6 +355,10 @@ impl<'a> Parser<'a> {
 
 /// Parse a JSON string
 pub fn parse(input: &str) -> Option<Value> {
+    // Editors on Windows (Notepad, PowerShell 5.1) commonly save config files
+    // with a UTF-8 BOM; U+FEFF is not char::is_whitespace, so it would
+    // otherwise fail the whole document at the first byte.
+    let input = input.strip_prefix('\u{feff}').unwrap_or(input);
     let mut parser = Parser::new(input);
     let value = parser.parse_value()?;
     parser.skip_whitespace();
@@ -512,6 +549,28 @@ mod tests {
     fn test_serializer_escapes_control_chars() {
         let serialized = to_string_pretty(&Value::String("\x01".to_string()));
         assert_eq!(serialized, "\"\\u0001\"");
+    }
+
+    #[test]
+    fn test_parse_tolerates_leading_bom() {
+        // Regression: Notepad / PowerShell 5.1 save UTF-8 with a BOM, which is
+        // not char::is_whitespace, so the whole config failed to parse.
+        let bom = "\u{feff}";
+        let v = parse(&format!("{}{{\"num\": 42}}", bom)).unwrap();
+        assert_eq!(v.get("num").unwrap().as_i64(), Some(42));
+    }
+
+    #[test]
+    fn test_parse_float_and_exponent_numbers() {
+        // Regression: "1500.0" parsed as 1500 but then failed the document at
+        // the '.'; exponents were equally fatal.
+        let v = parse(r#"{"a": 1500.0, "b": 1.5e3, "c": -2.5, "d": 7}"#).unwrap();
+        assert_eq!(v.get("a").unwrap().as_i64(), Some(1500));
+        assert_eq!(v.get("b").unwrap().as_i64(), Some(1500));
+        assert_eq!(v.get("c").unwrap().as_i64(), Some(-3)); // rounds to nearest
+        assert_eq!(v.get("d").unwrap().as_i64(), Some(7));
+        // Truncated numbers must still be rejected, not silently accepted.
+        assert!(parse(r#"{"a": 1.}"#).is_none());
     }
 
     #[test]

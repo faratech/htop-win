@@ -226,7 +226,15 @@ impl Config {
                     if let Some(value) = json::parse(&content) {
                         return Self::from_json(&value);
                     } else {
-                        eprintln!("Warning: Failed to parse config");
+                        // Preserve the unreadable file so a later save cannot
+                        // silently destroy whatever settings it held.
+                        eprintln!(
+                            "Warning: Failed to parse config at {}; backing it up as config.json.bak and using defaults",
+                            path.display()
+                        );
+                        let backup = path.with_extension("json.bak");
+                        let _ = fs::remove_file(&backup);
+                        let _ = fs::rename(&path, &backup);
                     }
                 }
                 Err(e) => {
