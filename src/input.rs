@@ -78,7 +78,9 @@ fn handle_list_nav(selected: &mut usize, len: usize, key: KeyCode) -> bool {
 /// Handle keyboard events. Returns true if the app should quit.
 pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     // Only handle key press events, ignore release and repeat
-    // This prevents "key bounce" issues where dialogs close immediately
+    // This prevents "key bounce" issues where dialogs close immediately.
+    // (The main loop consults is_noop_key_event first so such events — and
+    // bare modifier presses — skip this call and its redraw entirely.)
     if key.kind != KeyEventKind::Press {
         return false;
     }
@@ -123,10 +125,51 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
     }
 }
 
+/// True when dispatching this key event provably cannot change any application
+/// state, so the caller can skip both the handler call and the redraw +
+/// collector sync that otherwise follow every handled event (issue #83).
+///
+/// Deliberately conservative: an event is only a no-op if its handling is
+/// inert by construction; anything uncertain redraws.
+pub fn is_noop_key_event(app: &App, key: &KeyEvent) -> bool {
+    // Releases and repeats are dropped by handle_key_event before it touches
+    // state — and the Windows backend delivers a release for every mapped key,
+    // so treating them as work doubles the cost of each keystroke.
+    if key.kind != KeyEventKind::Press {
+        return true;
+    }
+    // A bare modifier press carries no actionable code: no handler arm matches
+    // KeyCode::Modifier, and handle_normal_keys deliberately leaves a pending
+    // user-picker request alive for it. The one shared path it could still
+    // reach is the error banner, which any press clears.
+    matches!(key.code, KeyCode::Modifier(_)) && app.last_error.is_none()
+}
+
+/// Same contract as [`is_noop_key_event`] for mouse events (issue #83).
+///
+/// `handle_mouse_event` ignores Moved/Drag/Up and horizontal scrolling
+/// outright, so the only way such an event can change state is that handler's
+/// unconditional prelude, which clears a visible error banner on every mouse
+/// event. Clicks and vertical scrolls always take the full path, so they are
+/// never classified as no-ops here.
+pub fn is_noop_mouse_event(app: &App, mouse: &MouseEvent) -> bool {
+    match mouse.kind {
+        MouseEventKind::Moved
+        | MouseEventKind::Drag(_)
+        | MouseEventKind::Up(_)
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => app.last_error.is_none(),
+        _ => false,
+    }
+}
+
 fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
     use crate::app::FocusRegion;
 
-    if key.code != KeyCode::Char('u') {
+    // Any other command cancels a deferred user-picker request — but a bare
+    // modifier press carries no command intent, and leaving it alone keeps it
+    // a provable no-op for is_noop_key_event (issue #83).
+    if key.code != KeyCode::Char('u') && !matches!(key.code, KeyCode::Modifier(_)) {
         app.cancel_pending_user_select();
     }
 
@@ -1690,5 +1733,114 @@ mod tests {
         };
         assert!(!handle_key_event(&mut app, press(KeyCode::Enter)));
         assert!(app.config_dirty);
+    }
+
+    #[test]
+    fn key_releases_and_modifier_presses_are_noops() {
+        use crossterm::event::ModifierKeyCode;
+
+        let app = test_app();
+        // The Windows backend delivers a release for every mapped key.
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Char('q'),
+            KeyModifiers::empty(),
+            KeyEventKind::Release,
+        );
+        assert!(is_noop_key_event(&app, &release));
+        // A bare modifier press carries no actionable code.
+        let shift = KeyEvent::new(
+            KeyCode::Modifier(ModifierKeyCode::LeftShift),
+            KeyModifiers::SHIFT,
+        );
+        assert!(is_noop_key_event(&app, &shift));
+        // Real presses are never suppressed.
+        assert!(!is_noop_key_event(&app, &press(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn noop_classification_yields_to_error_banner_clearing() {
+        use crossterm::event::ModifierKeyCode;
+
+        let mut app = test_app();
+        app.last_error = Some(("boom".to_string(), std::time::Instant::now()));
+        // Any press clears the banner, so it must still redraw.
+        assert!(!is_noop_key_event(
+            &app,
+            &KeyEvent::new(
+                KeyCode::Modifier(ModifierKeyCode::RightShift),
+                KeyModifiers::empty()
+            )
+        ));
+        let moved = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(!is_noop_mouse_event(&app, &moved));
+
+        app.clear_error();
+        assert!(is_noop_mouse_event(&app, &moved));
+    }
+
+    #[test]
+    fn mouse_moves_and_releases_are_noops_but_scrolls_are_not() {
+        use crossterm::event::{MouseButton as MButton, MouseEventKind as MEventKind};
+
+        let app = test_app();
+        let event = |kind| MouseEvent {
+            kind,
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(is_noop_mouse_event(&app, &event(MEventKind::Moved)));
+        assert!(is_noop_mouse_event(
+            &app,
+            &event(MEventKind::Up(MButton::Left))
+        ));
+        assert!(is_noop_mouse_event(
+            &app,
+            &event(MEventKind::Drag(MButton::Left))
+        ));
+        assert!(!is_noop_mouse_event(&app, &event(MEventKind::ScrollDown)));
+        assert!(!is_noop_mouse_event(
+            &app,
+            &event(MEventKind::Down(MButton::Left))
+        ));
+    }
+
+    #[test]
+    fn modifier_press_keeps_pending_user_picker_alive() {
+        use crossterm::event::ModifierKeyCode;
+
+        let mut app = test_app();
+        // No owner data yet, so 'u' defers the picker and announces it.
+        assert!(!handle_key_event(&mut app, press(KeyCode::Char('u'))));
+        let loading = Some("Loading process owners...");
+        assert_eq!(
+            app.status_message.as_ref().map(|(m, _)| m.as_str()),
+            loading
+        );
+
+        // A modifier-only press is not a command: it must neither cancel the
+        // request nor clear its status line.
+        let shift = KeyEvent::new(
+            KeyCode::Modifier(ModifierKeyCode::LeftShift),
+            KeyModifiers::empty(),
+        );
+        assert!(is_noop_key_event(&app, &shift));
+        handle_key_event(&mut app, shift);
+        assert_eq!(
+            app.status_message.as_ref().map(|(m, _)| m.as_str()),
+            loading
+        );
+
+        // ...while any real key still cancels it (existing behavior).
+        handle_key_event(&mut app, press(KeyCode::F(1)));
+        assert_ne!(
+            app.status_message.as_ref().map(|(m, _)| m.as_str()),
+            loading
+        );
     }
 }

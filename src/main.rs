@@ -677,26 +677,37 @@ fn run_app(
         if event::poll(timeout)? {
             match event::read()? {
                 Event::Key(key) => {
-                    if input::handle_key_event(app, key) {
-                        return Ok(());
+                    // Provably inert events (releases/repeats of mapped keys,
+                    // bare modifier presses) cannot change state; skip the
+                    // handler call and the redraw they would otherwise force
+                    // (issue #83).
+                    if !input::is_noop_key_event(app, &key) {
+                        if input::handle_key_event(app, key) {
+                            return Ok(());
+                        }
+                        // Sync shared state with background collector
+                        collector.paused.store(app.paused, Ordering::Relaxed);
+                        collector
+                            .tick_rate_ms
+                            .store(app.config.refresh_rate_ms, Ordering::Relaxed);
+                        needs_redraw = true;
                     }
-                    // Sync shared state with background collector
-                    collector.paused.store(app.paused, Ordering::Relaxed);
-                    collector
-                        .tick_rate_ms
-                        .store(app.config.refresh_rate_ms, Ordering::Relaxed);
-                    needs_redraw = true;
                 }
                 Event::Mouse(mouse) => {
-                    if input::handle_mouse_event(app, mouse) {
-                        return Ok(());
+                    // Mouse moves and button releases are ignored by the
+                    // handler; redrawing for each one burns a full frame per
+                    // pointer movement (issue #83).
+                    if !input::is_noop_mouse_event(app, &mouse) {
+                        if input::handle_mouse_event(app, mouse) {
+                            return Ok(());
+                        }
+                        // Sync shared state with background collector
+                        collector.paused.store(app.paused, Ordering::Relaxed);
+                        collector
+                            .tick_rate_ms
+                            .store(app.config.refresh_rate_ms, Ordering::Relaxed);
+                        needs_redraw = true;
                     }
-                    // Sync shared state with background collector
-                    collector.paused.store(app.paused, Ordering::Relaxed);
-                    collector
-                        .tick_rate_ms
-                        .store(app.config.refresh_rate_ms, Ordering::Relaxed);
-                    needs_redraw = true;
                 }
                 Event::Resize(_, _) => {
                     // Terminal will handle resize automatically
