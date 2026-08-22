@@ -43,21 +43,21 @@ fn format_time_colored<'a>(
         theme.process
     };
 
-    // All formats produce 8 characters for consistent column width:
-    // Minutes: " M:SS.cc" or "MM:SS.cc" (8 chars)
-    // Hours:   " Hh MM:SS" or "HHhMM:SS" (8 chars)
-    // Days:    "DDDd HHh" (8 chars)
-    // Years:   "YYYy DDDd" (9 chars for large values, but rare)
+    // Every scale renders at exactly 8 characters so the column stays aligned
+    // no matter which scale a value falls into:
+    // Minutes: " M:SS.cc"      -> "{:2}:{:02}.{:02}"
+    // Hours:   "HHhMM:SS"      -> "{:2}h{:02}:{:02}"
+    // Days:    "DDDd HHh"      -> "{:3}d {:02}h"
+    // Years:   "YYYyDDDDd"     -> "{:3}y{:03}d"
+    // (Only absurd runtimes - 1000+ years of CPU time - can exceed this.)
     if use_uniform {
         // Single span - no multi-color needed
         let text = if total_mins < 60 {
             format!("{:2}:{:02}.{:02}", total_mins, secs, centis)
         } else if total_hours < 24 {
             format!("{:2}h{:02}:{:02}", total_hours, mins, secs)
-        } else if total_days < 100 {
-            format!("{:2}d {:02}h", total_days, hours)
         } else if total_days < 365 {
-            format!("{:3}d{:02}h", total_days, hours)
+            format!("{:3}d {:02}h", total_days, hours)
         } else {
             let years = total_days / 365;
             let days = total_days % 365;
@@ -87,17 +87,13 @@ fn format_time_colored<'a>(
                 Style::default().fg(base_color),
             ),
         ]
-    } else if total_days < 100 {
+    } else if total_days < 365 {
+        // "{:3}d " (5) + "{:02}h" (3) = same 8-char width as the other scales
         vec![
             Span::styled(
-                format!("{:2}d ", total_days),
+                format!("{:3}d ", total_days),
                 Style::default().fg(day_color),
             ),
-            Span::styled(format!("{:02}h", hours), Style::default().fg(hour_color)),
-        ]
-    } else if total_days < 365 {
-        vec![
-            Span::styled(format!("{:3}d", total_days), Style::default().fg(day_color)),
             Span::styled(format!("{:02}h", hours), Style::default().fg(hour_color)),
         ]
     } else {
@@ -365,18 +361,22 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // Reusable format buffer to avoid per-cell String allocations.
-    // write!() reuses the buffer's capacity across clear() calls.
+    // Format buffer for scalar cells. Cells outlive the buffer (rows are all
+    // collected before rendering), so a cell's text must be owned - capacity
+    // cannot be recycled in place. Instead of clear()+clone(), which allocated
+    // a second copy of every cell, hand the whole buffer to the caller with
+    // mem::take() and start from an empty one next call. Each cell then costs
+    // exactly one allocation (the write! growth), same as format!, but without
+    // the extra deep copy.
     use std::fmt::Write;
-    let mut fmt_buf = String::with_capacity(32);
+    let mut fmt_buf = String::new();
 
-    // Macro to format into the reusable buffer and return an owned String.
-    // Avoids format!()'s internal allocation of a fresh String::new() per call.
+    // Macro to format into `fmt_buf` and take ownership of it as an owned
+    // String; `mem::take` leaves `fmt_buf` empty for the next call.
     macro_rules! fmt {
         ($($arg:tt)*) => {{
-            fmt_buf.clear();
             write!(fmt_buf, $($arg)*).unwrap();
-            fmt_buf.clone()
+            std::mem::take(&mut fmt_buf)
         }};
     }
 
@@ -1056,4 +1056,141 @@ fn format_start_time(start_time: u64, now: u64) -> std::borrow::Cow<'static, str
             format!("{}d{}h", days, (elapsed_secs % 86400) / 3600)
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Concatenate the text of every span, so multi-color layouts can be
+    /// compared against the single-span uniform layout.
+    fn joined_spans<'a>(spans: &[Span<'a>]) -> String {
+        spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn time_column_fixed_width_across_all_scales() {
+        let theme = Theme::default_theme();
+        // Zero, seconds, minutes, hours, day and year scales - including the
+        // boundaries between them - must all render at the same display width.
+        let samples: &[u64] = &[
+            0,
+            1,
+            59,
+            60,             // 1 minute
+            3_599,          // 59:59
+            3_600,          // 1 hour
+            86_399,         // 23h59:59
+            86_400,         // 1 day
+            432_000,        // 5 days
+            8_553_600,      // 99 days
+            8_553_601,      // 99d 00h +1s boundary
+            17_280_000,     // 200 days
+            31_535_999,     // 364d 23h 59m 59s
+            31_536_000,     // 365 days -> year scale
+            34_560_000,     // 400 days
+            7_889_400_000,  // ~250 years, multi-digit year
+        ];
+        for &secs in samples {
+            let d = std::time::Duration::from_secs(secs);
+            for is_selected in [false, true] {
+                for highlight in [false, true] {
+                    let uniform = format_time_colored(d, &theme, is_selected, false);
+                    let colored = format_time_colored(d, &theme, is_selected, highlight);
+                    for spans in [&uniform, &colored] {
+                        let text = joined_spans(spans);
+                        assert_eq!(
+                            text.chars().count(),
+                            8,
+                            "width mismatch for {secs}s (selected={is_selected}, \
+                             highlight={highlight}): {text:?}"
+                        );
+                    }
+                    // Uniform and colored layouts must agree on the text so
+                    // toggling highlighting never reshuffles the column.
+                    assert_eq!(joined_spans(&uniform), joined_spans(&colored));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn time_column_exact_strings_per_scale() {
+        let theme = Theme::default_theme();
+        let d = |secs: u64| std::time::Duration::from_secs(secs);
+
+        // Seconds/minutes scale (" M:SS.cc")
+        assert_eq!(
+            joined_spans(&format_time_colored(d(5), &theme, false, false)),
+            " 0:05.00"
+        );
+        assert_eq!(
+            joined_spans(&format_time_colored(d(65), &theme, false, false)),
+            " 1:05.00"
+        );
+        assert_eq!(
+            joined_spans(&format_time_colored(d(3_599), &theme, false, false)),
+            "59:59.00"
+        );
+
+        // Hours scale ("HhMM:SS")
+        assert_eq!(
+            joined_spans(&format_time_colored(d(11_565), &theme, false, false)),
+            " 3h12:45"
+        );
+        assert_eq!(
+            joined_spans(&format_time_colored(d(86_399), &theme, false, false)),
+            "23h59:59"
+        );
+
+        // Days scale ("DDDd HHh") - previously 7 chars wide, misaligning the column
+        assert_eq!(
+            joined_spans(&format_time_colored(d(86_400), &theme, false, false)),
+            "  1d 00h"
+        );
+        assert_eq!(
+            joined_spans(&format_time_colored(d(432_000), &theme, false, false)),
+            "  5d 00h"
+        );
+        assert_eq!(
+            joined_spans(&format_time_colored(d(8_582_400), &theme, false, false)),
+            " 99d 08h"
+        );
+        assert_eq!(
+            joined_spans(&format_time_colored(d(31_449_600), &theme, false, false)),
+            "364d 00h"
+        );
+
+        // Years scale ("YYYyDDDDd")
+        assert_eq!(
+            joined_spans(&format_time_colored(d(34_560_000), &theme, false, false)),
+            "  1y035d"
+        );
+    }
+
+    #[test]
+    fn time_column_multicolor_splits_align_with_uniform() {
+        let theme = Theme::default_theme();
+        let d = |secs: u64| std::time::Duration::from_secs(secs);
+
+        // Hours scale splits as "{:2}h" + "{:02}:{:02}"
+        let spans = format_time_colored(d(11_565), &theme, false, true);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(joined_spans(&spans), " 3h12:45");
+
+        // Days scale splits as "{:3}d " + "{:02}h" (was "{:2}d ", 7 chars total)
+        let spans = format_time_colored(d(432_000), &theme, false, true);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(joined_spans(&spans), "  5d 00h");
+
+        // Years scale splits as "{:3}y" + "{:03}d"
+        let spans = format_time_colored(d(34_560_000), &theme, false, true);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(joined_spans(&spans), "  1y035d");
+
+        // Selected rows always collapse to one uniformly-colored span
+        let spans = format_time_colored(d(432_000), &theme, true, true);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(joined_spans(&spans), "  5d 00h");
+    }
 }
