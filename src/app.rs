@@ -2123,6 +2123,15 @@ impl App {
 
     /// Ensure selected item is visible
     fn ensure_visible(&mut self) {
+        if self.visible_height == 0 {
+            // Issue #75: with no rows drawn the window below degenerates and
+            // would set scroll_offset = selected_index + 1, one row past the
+            // last valid index. There is no viewport to satisfy, so just keep
+            // the offset anchored inside the list.
+            let last = self.displayed_processes.len().saturating_sub(1);
+            self.scroll_offset = self.scroll_offset.min(last);
+            return;
+        }
         if self.selected_index < self.scroll_offset {
             self.scroll_offset = self.selected_index;
         } else if self.selected_index >= self.scroll_offset + self.visible_height {
@@ -3283,5 +3292,78 @@ mod tests {
 
         assert!(app.record_config_save_result(Ok(())));
         assert!(!app.config_dirty);
+    }
+
+    fn zero_height_app() -> App {
+        let mut app = App::new(Config::default());
+        // A viewport with no rows: collapsed window, or a layout pass that
+        // gave the process table no space (issue #75).
+        app.visible_height = 0;
+        app.displayed_processes = (1..=10).map(|pid| process(pid * 100, 0)).collect();
+        app
+    }
+
+    #[test]
+    fn zero_visible_height_select_down_keeps_scroll_offset_in_bounds() {
+        let mut app = zero_height_app();
+
+        for step in 1..=12 {
+            app.select_down();
+            assert_eq!(
+                app.selected_index,
+                step.min(9),
+                "selection should stop at the last row"
+            );
+            assert!(
+                app.scroll_offset < app.displayed_processes.len(),
+                "scroll_offset {} escaped the list after {} select_down calls",
+                app.scroll_offset,
+                step
+            );
+        }
+
+        app.page_down();
+        assert!(app.scroll_offset < app.displayed_processes.len());
+        app.select_last();
+        assert!(app.scroll_offset < app.displayed_processes.len());
+    }
+
+    #[test]
+    fn update_displayed_processes_with_zero_visible_height_clamps_scroll() {
+        let mut app = App::new(Config::default());
+        app.processes = (1..=10).map(|pid| process(pid * 100, 0)).collect();
+        app.visible_height = 0;
+
+        app.update_displayed_processes();
+        assert!(!app.displayed_processes.is_empty());
+
+        // Selection at the last row used to push scroll_offset one past it.
+        app.select_last();
+        app.update_displayed_processes();
+        assert!(app.scroll_offset < app.displayed_processes.len());
+
+        // And a stale offset from a bigger list is clamped, not preserved.
+        app.scroll_offset = 50;
+        app.update_displayed_processes();
+        assert!(app.scroll_offset < app.displayed_processes.len());
+    }
+
+    #[test]
+    fn non_zero_viewport_scrolling_is_unchanged() {
+        let mut app = zero_height_app();
+        app.visible_height = 3;
+        app.scroll_offset = 0;
+        app.selected_index = 0;
+
+        for _ in 0..9 {
+            app.select_down();
+        }
+        assert_eq!(app.selected_index, 9);
+        assert_eq!(app.scroll_offset, 7);
+
+        for _ in 0..9 {
+            app.select_up();
+        }
+        assert_eq!(app.scroll_offset, 0);
     }
 }
