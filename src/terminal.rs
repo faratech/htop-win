@@ -547,10 +547,170 @@ impl<'a> From<Span<'a>> for Text<'a> {
 // Buffer and Cell
 // ============================================================================
 
+/// Maximum number of UTF-8 bytes a symbol keeps inline inside the cell.
+///
+/// 15 bytes covers everything the UI draws cell-by-cell: ASCII, box-drawing
+/// glyphs (3 B), CJK ideographs (3 B), emoji with variation selectors (7 B)
+/// and regional-indicator flag pairs (8 B). Longer grapheme clusters (ZWJ
+/// sequences) fall back to the heap. With this size the whole [`Symbol`]
+/// occupies the same 24 bytes the old `String` field did, so buffers are no
+/// bigger than before - they just stop allocating one `String` per cell.
+const SYMBOL_INLINE_CAP: usize = 15;
+
+/// Cell glyph storage: inline byte array for short symbols, heap fallback
+/// otherwise. Dereferences to `str`.
+#[derive(Clone)]
+pub struct Symbol {
+    repr: SymbolRepr,
+}
+
+#[derive(Clone)]
+enum SymbolRepr {
+    Inline {
+        /// Valid byte count of `bytes` (always <= [`SYMBOL_INLINE_CAP`]).
+        len: u8,
+        /// UTF-8 bytes; content past `len` is stale and never read back.
+        bytes: [u8; SYMBOL_INLINE_CAP],
+    },
+    Heap(Box<str>),
+}
+
+impl Symbol {
+    fn clear(&mut self) {
+        // Back to inline empty; drops any heap allocation immediately so a
+        // reused cell does not pin a Box across frames.
+        self.repr = SymbolRepr::Inline {
+            len: 0,
+            bytes: [0; SYMBOL_INLINE_CAP],
+        };
+    }
+
+    /// Append `text`, mapping terminal-hostile chars exactly like
+    /// [`push_terminal_safe_char`] did when symbols were plain `String`s.
+    fn push_sanitized_str(&mut self, text: &str) {
+        if !text.is_empty() && !text.chars().any(is_terminal_control) {
+            self.push_raw(text);
+            return;
+        }
+        for ch in text.chars() {
+            self.push_sanitized_char(ch);
+        }
+    }
+
+    fn push_sanitized_char(&mut self, ch: char) {
+        if ch == '\t' {
+            self.push_raw(" ");
+        } else if is_terminal_control(ch) {
+            self.push_raw("\u{FFFD}");
+        } else {
+            let mut buf = [0u8; 4];
+            self.push_raw(ch.encode_utf8(&mut buf));
+        }
+    }
+
+    /// Append already-sanitized UTF-8 text, spilling to the heap when the
+    /// inline array cannot hold it.
+    fn push_raw(&mut self, text: &str) {
+        if self.len() + text.len() > SYMBOL_INLINE_CAP {
+            self.spill_to_heap();
+        }
+        match &mut self.repr {
+            SymbolRepr::Inline { len, bytes } => {
+                let start = usize::from(*len);
+                let end = start + text.len();
+                debug_assert!(end <= SYMBOL_INLINE_CAP);
+                bytes[start..end].copy_from_slice(text.as_bytes());
+                *len = end as u8;
+            }
+            SymbolRepr::Heap(s) => {
+                let mut owned = std::mem::take(s).into_string();
+                owned.push_str(text);
+                *s = owned.into_boxed_str();
+            }
+        }
+    }
+
+    fn spill_to_heap(&mut self) {
+        let (len, bytes) = match self.repr {
+            SymbolRepr::Inline { len, bytes } => (len, bytes),
+            SymbolRepr::Heap(_) => return,
+        };
+        let text = std::str::from_utf8(&bytes[..usize::from(len)]).unwrap_or_default();
+        self.repr = SymbolRepr::Heap(String::from(text).into_boxed_str());
+    }
+
+    pub fn as_str(&self) -> &str {
+        match &self.repr {
+            SymbolRepr::Inline { len, bytes } => {
+                std::str::from_utf8(&bytes[..usize::from(*len)]).unwrap_or_default()
+            }
+            SymbolRepr::Heap(s) => s,
+        }
+    }
+
+    fn is_inline(&self) -> bool {
+        matches!(self.repr, SymbolRepr::Inline { .. })
+    }
+}
+
+impl Default for Symbol {
+    fn default() -> Self {
+        let mut symbol = Self {
+            repr: SymbolRepr::Inline {
+                len: 0,
+                bytes: [0; SYMBOL_INLINE_CAP],
+            },
+        };
+        symbol.push_raw(" ");
+        symbol
+    }
+}
+
+impl std::ops::Deref for Symbol {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for Symbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::fmt::Debug for Symbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Show the live text, not the stale tail of the inline array.
+        std::fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl PartialEq for Symbol {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl Eq for Symbol {}
+
+impl PartialEq<str> for Symbol {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for Symbol {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
 /// Single cell in the buffer (internal type, not exported as Cell)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferCell {
-    pub symbol: String,
+    pub symbol: Symbol,
     pub fg: Color,
     pub bg: Color,
     pub modifier: Modifier,
@@ -561,7 +721,7 @@ pub struct BufferCell {
 impl Default for BufferCell {
     fn default() -> Self {
         Self {
-            symbol: " ".to_string(),
+            symbol: Symbol::default(),
             fg: Color::Reset,
             bg: Color::Reset,
             modifier: Modifier::empty(),
@@ -573,13 +733,13 @@ impl Default for BufferCell {
 impl BufferCell {
     pub fn set_symbol(&mut self, symbol: &str) -> &mut Self {
         self.symbol.clear();
-        push_terminal_safe_str(&mut self.symbol, symbol);
+        self.symbol.push_sanitized_str(symbol);
         self
     }
 
     pub fn set_char(&mut self, ch: char) -> &mut Self {
         self.symbol.clear();
-        push_terminal_safe_char(&mut self.symbol, ch);
+        self.symbol.push_sanitized_char(ch);
         self
     }
 
@@ -597,7 +757,7 @@ impl BufferCell {
 
     pub fn reset(&mut self) {
         self.symbol.clear();
-        self.symbol.push(' ');
+        self.symbol.push_sanitized_char(' ');
         self.fg = Color::Reset;
         self.bg = Color::Reset;
         self.modifier = Modifier::empty();
@@ -716,13 +876,6 @@ impl<'a> Iterator for TerminalSymbols<'a> {
     }
 }
 
-#[inline]
-fn push_terminal_safe_str(out: &mut String, text: &str) {
-    for ch in text.chars() {
-        push_terminal_safe_char(out, ch);
-    }
-}
-
 /// 2D buffer of cells
 #[derive(Debug, Clone, Default)]
 pub struct Buffer {
@@ -744,6 +897,23 @@ impl Buffer {
         Self {
             area,
             content: vec![cell; size],
+        }
+    }
+
+    /// Resize in place to `area`, reusing the existing cell allocation.
+    ///
+    /// Equivalent to replacing the buffer with `Buffer::empty(area)` - every
+    /// cell ends up pristine - but without freeing and re-allocating the whole
+    /// backing store (and, before symbols went inline, every per-cell String)
+    /// on each terminal resize. Capacity is kept across shrinks so oscillating
+    /// sizes stop thrashing the allocator.
+    pub fn resize(&mut self, area: Rect) {
+        let size = area.area();
+        self.area = area;
+        self.content.truncate(size);
+        self.content.resize(size, BufferCell::default());
+        for cell in &mut self.content {
+            *cell = BufferCell::default();
         }
     }
 
@@ -803,7 +973,7 @@ impl Buffer {
                 if let Some(base_col) = last_base_col
                     && let Some(cell) = self.get_mut(base_col, y)
                 {
-                    push_terminal_safe_str(&mut cell.symbol, symbol.text);
+                    cell.symbol.push_sanitized_str(symbol.text);
                 }
                 continue;
             }
@@ -831,7 +1001,7 @@ impl Buffer {
                     if let Some(base_col) = last_base_col
                         && let Some(cell) = self.get_mut(base_col, y)
                     {
-                        push_terminal_safe_str(&mut cell.symbol, symbol.text);
+                        cell.symbol.push_sanitized_str(symbol.text);
                     }
                     continue;
                 }
@@ -931,8 +1101,9 @@ impl Terminal {
         if self.buffers[self.current].area != area {
             // Clear screen on resize to remove stale content
             self.backend.stdout.queue(CtClear(ClearType::All))?;
-            self.buffers[0] = Buffer::empty(area);
-            self.buffers[1] = Buffer::empty(area);
+            for buffer in &mut self.buffers {
+                buffer.resize(area);
+            }
         }
 
         // Clear the current buffer
@@ -1113,8 +1284,9 @@ impl Terminal {
         // Reset both buffers
         let size = terminal::size()?;
         let area = Rect::new(0, 0, size.0, size.1);
-        self.buffers[0] = Buffer::empty(area);
-        self.buffers[1] = Buffer::empty(area);
+        for buffer in &mut self.buffers {
+            buffer.resize(area);
+        }
         Ok(())
     }
 
@@ -2305,5 +2477,158 @@ mod tests {
         let widths = table.get_column_widths(25);
         assert_eq!(widths.iter().sum::<u16>(), 25);
         assert!(widths.iter().all(|&w| w >= 10));
+    }
+
+    #[test]
+    fn symbol_inline_roundtrip_ascii_box_drawing_and_wide() {
+        // Every glyph the UI draws cell-by-cell must survive set_symbol
+        // byte-for-byte while staying inside the cell (no heap allocation).
+        for text in ["A", " ", "0", "─", "│", "┌", "█", "░", "日", "🛡️", "🇺🇸"] {
+            let mut cell = BufferCell::default();
+            cell.set_symbol(text);
+            assert_eq!(&*cell.symbol, text, "roundtrip failed for {text:?}");
+            assert_eq!(cell.symbol.as_str(), text);
+            assert!(
+                cell.symbol.is_inline(),
+                "{text:?} ({} bytes) should stay inline",
+                text.len()
+            );
+            assert_eq!(format!("{}", cell.symbol), text);
+        }
+    }
+
+    #[test]
+    fn symbol_long_grapheme_spills_to_heap_and_releases_on_clear() {
+        // ZWJ family emoji is 25 UTF-8 bytes: too big for inline storage.
+        let long = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        let mut cell = BufferCell::default();
+        cell.set_symbol(long);
+        assert_eq!(cell.symbol.as_str(), long);
+        assert!(!cell.symbol.is_inline(), "25-byte grapheme must spill to heap");
+
+        // Clearing a reused cell must drop the box again.
+        cell.reset();
+        assert!(cell.symbol.is_inline());
+        assert_eq!(cell.symbol.as_str(), " ");
+    }
+
+    #[test]
+    fn symbol_append_spills_only_when_inline_capacity_exceeded() {
+        let mut symbol = Symbol::default();
+        symbol.clear(); // default is one space; start truly empty
+        symbol.push_sanitized_str("abcde");
+        assert!(symbol.is_inline());
+        // 5 + 11 = 16 bytes: one past the inline cap.
+        symbol.push_sanitized_str("fghijklmnopq");
+        assert_eq!(symbol.as_str(), "abcdefghijklmnopq");
+        assert!(!symbol.is_inline());
+
+        // Appending still works on the spilled representation.
+        symbol.push_sanitized_str("r");
+        assert_eq!(symbol.as_str(), "abcdefghijklmnopqr");
+    }
+
+    #[test]
+    fn symbol_sanitization_matches_previous_string_behavior() {
+        let cases = [
+            ("\t", " "),
+            ("a\tb", "a b"),
+            ("\u{1b}", "\u{FFFD}"),   // ESC must never reach the terminal
+            ("\u{85}", "\u{FFFD}"),   // C1 control
+            ("\u{7}", "\u{FFFD}"),    // BEL
+            ("ok", "ok"),
+        ];
+        for (input, expected) in cases {
+            let mut cell = BufferCell::default();
+            cell.set_symbol(input);
+            assert_eq!(cell.symbol.as_str(), expected, "input {input:?}");
+
+            // set_char maps one char at a time, so it only applies to the
+            // single-character cases.
+            if input.chars().count() == 1 {
+                let mut cell = BufferCell::default();
+                cell.set_char(input.chars().next().unwrap());
+                assert_eq!(cell.symbol.as_str(), expected, "set_char {input:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn reused_cell_equals_fresh_default_cell() {
+        // flush_diff skips cells that compare equal to the previous frame, so
+        // a reset cell must compare equal to a pristine one even after it held
+        // a spilled heap symbol with stale bytes behind it.
+        let mut used = BufferCell::default();
+        used.set_symbol("👨\u{200d}👩\u{200d}👧\u{200d}👦");
+        used.set_style(Style::default().fg(Color::Red).bg(Color::Blue));
+        used.reset();
+
+        assert_eq!(used, BufferCell::default());
+    }
+
+    #[test]
+    fn symbol_size_stays_within_old_string_footprint() {
+        // The whole point of the inline layout: no growth per cell versus the
+        // previous `symbol: String` field.
+        assert!(std::mem::size_of::<Symbol>() <= std::mem::size_of::<String>());
+    }
+
+    #[test]
+    fn buffer_resize_reuses_allocation_and_resets_cells() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 10)); // 400 cells
+        buf.set_string(0, 0, "hello 🛡️ world", Style::default());
+        buf.set_style(buf.area, Style::default().fg(Color::Red));
+        let cap_before = buf.content.capacity();
+
+        // Shrink: the backing store must neither be freed nor re-allocated.
+        buf.resize(Rect::new(0, 0, 20, 10));
+        assert_eq!(buf.area, Rect::new(0, 0, 20, 10));
+        assert_eq!(buf.content.len(), 200);
+        assert_eq!(buf.content.capacity(), cap_before);
+        assert!(
+            buf.content.iter().all(|cell| *cell == BufferCell::default()),
+            "resize must leave every cell pristine, like Buffer::empty did"
+        );
+
+        // Growing back to the original size still does not reallocate.
+        buf.resize(Rect::new(0, 0, 40, 10));
+        assert_eq!(buf.content.len(), 400);
+        assert_eq!(buf.content.capacity(), cap_before);
+    }
+
+    #[test]
+    fn buffer_resize_wipes_content_so_diff_does_not_skip_rows() {
+        // Regression guard for the resize path in Terminal::draw: after a
+        // resize the screen is cleared, so a previous buffer that kept stale
+        // content would make flush_diff skip rows that are now blank.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 4));
+        for x in 0..8 {
+            buf.get_mut(x, 1).unwrap().set_symbol("█");
+        }
+
+        buf.resize(Rect::new(0, 0, 16, 3));
+
+        let pristine = Buffer::empty(buf.area);
+        assert_eq!(buf.content, pristine.content);
+    }
+
+    #[test]
+    fn cells_hold_no_heap_symbols_after_full_reset_cycle() {
+        // Draw text into every cell of a small buffer (some symbols spill),
+        // then reset like Terminal::draw does each frame: all storage must be
+        // back inline afterwards.
+        let area = Rect::new(0, 0, 6, 2);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "🛡️👨‍👩‍👧‍👦ok", Style::default());
+        assert!(buf.content.iter().any(|c| !c.symbol.is_inline()));
+
+        for cell in &mut buf.content {
+            cell.reset();
+        }
+        assert!(buf.content.iter().all(|c| c.symbol.is_inline()));
+        assert!(buf
+            .content
+            .iter()
+            .all(|c| *c == BufferCell::default()));
     }
 }
