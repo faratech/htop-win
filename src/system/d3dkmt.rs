@@ -1158,10 +1158,32 @@ mod tests {
                     node_index += 1;
                 }
             }
-            assert!(
-                seen.iter().all(|&c| c == 1),
-                "gates=({gpu_enabled},{npu_enabled}) saw {seen:?}"
+            // The sweep consumes the whole flattened space exactly once, but
+            // slots of a disabled adapter stay reserved and untouched — that
+            // is what keeps baselines aligned when the gates flip.
+            assert_eq!(
+                node_index, 9,
+                "gates=({gpu_enabled},{npu_enabled}) sweep must cover every slot"
             );
+            let mut expect_enabled = vec![false; 9];
+            let mut offset = 0;
+            for adapter in &adapters {
+                let enabled = match adapter.class {
+                    C::Gpu => gpu_enabled,
+                    C::Npu => npu_enabled,
+                };
+                if enabled {
+                    expect_enabled[offset..offset + adapter.node_count as usize].fill(true);
+                }
+                offset += adapter.node_count as usize;
+            }
+            for (slot, (count, enabled)) in seen.iter().zip(expect_enabled.iter()).enumerate() {
+                let want = if *enabled { 1 } else { 0 };
+                assert_eq!(
+                    *count, want,
+                    "gates=({gpu_enabled},{npu_enabled}) slot {slot}: saw {count}, want {want}"
+                );
+            }
         }
     }
 }
