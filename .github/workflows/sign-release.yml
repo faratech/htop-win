@@ -1,0 +1,54 @@
+name: Sign Release Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to sign binaries for (e.g. v0.2.8)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  sign-windows-binaries:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Windows binaries from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "binaries" | Out-Null
+          gh release download "$env:TAG" --repo "$env:GITHUB_REPOSITORY" --dir "binaries" --pattern "*.exe"
+          $files = Get-ChildItem -Path "binaries" -Filter "*.exe"
+          if ($files.Count -eq 0) {
+            throw "No .exe binaries found in release $env:TAG"
+          }
+          Write-Host "Found $($files.Count) executable(s) to sign."
+
+      - name: Sign executables with Azure Trusted Signing
+        uses: Azure/trusted-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: 'https://eus.codesigning.azure.net/'
+          trusted-signing-account-name: 'fara-codesigning'
+          certificate-profile-name: 'MikeFara'
+          files-folder: '${{ github.workspace }}\binaries'
+          files-folder-filter: '*.exe'
+
+      - name: Verify and re-upload signed executables to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        shell: pwsh
+        run: |
+          $signedFiles = Get-ChildItem -Path "binaries" -Filter "*.exe" | ForEach-Object { $_.FullName }
+          gh release upload "$env:TAG" @signedFiles --clobber --repo "$env:GITHUB_REPOSITORY"
+          Write-Host "Successfully uploaded signed binaries to $env:TAG"
