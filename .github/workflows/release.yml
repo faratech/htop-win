@@ -153,6 +153,18 @@ jobs:
             target = $env:BUILD_TARGET
           } | ConvertTo-Json | Set-Content -NoNewline "htop-win-${{ matrix.arch }}.source.json"
 
+      - name: Sign executable with Azure Trusted Signing
+        uses: azure/trusted-signing-action@v0.4.1
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: 'https://eus.codesigning.azure.net/'
+          trusted-signing-account-name: 'fara-codesigning'
+          certificate-profile-name: 'MikeFara'
+          files: |
+            htop-win-${{ matrix.arch }}.exe
+
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v4
         continue-on-error: true  # Attestation only works for public repos
