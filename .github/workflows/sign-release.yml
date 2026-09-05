@@ -9,6 +9,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 
 jobs:
   sign-windows-binaries:
@@ -42,6 +44,12 @@ jobs:
           certificate-profile-name: 'MikeFara'
           files-folder: '${{ github.workspace }}\binaries'
           files-folder-filter: '*.exe'
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v4
+        continue-on-error: true
+        with:
+          subject-path: 'binaries/*.exe'
 
       - name: Verify and re-upload signed executables to release
         env:
