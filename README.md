@@ -107,6 +107,15 @@ Download the latest release for your architecture:
 | x64 (Intel/AMD) | [htop-win-amd64.exe](https://github.com/faratech/htop-win/releases/latest/download/htop-win-amd64.exe) |
 | ARM64 | [htop-win-arm64.exe](https://github.com/faratech/htop-win/releases/latest/download/htop-win-arm64.exe) |
 
+### Verification
+
+All release binaries are signed with Azure Trusted Signing and verified with GitHub artifact attestation. Verify downloaded binaries using the GitHub CLI:
+
+```bash
+gh attestation verify htop-win-amd64.exe --owner faratech
+gh attestation verify htop-win-arm64.exe --owner faratech
+```
+
 ### Install to PATH
 
 Run the downloaded executable as your normal user:
