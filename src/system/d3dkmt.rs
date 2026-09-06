@@ -1142,7 +1142,7 @@ mod tests {
         ];
         assert_eq!(total_node_slots(&adapters), 9);
         for (gpu_enabled, npu_enabled) in [(true, true), (true, false), (false, true)] {
-            let mut seen = vec![0usize; 9];
+            let mut seen = [0usize; 9];
             let mut node_index = 0;
             for adapter in &adapters {
                 let enabled = match adapter.class {
@@ -1165,7 +1165,7 @@ mod tests {
                 node_index, 9,
                 "gates=({gpu_enabled},{npu_enabled}) sweep must cover every slot"
             );
-            let mut expect_enabled = vec![false; 9];
+            let mut expect_enabled = [false; 9];
             let mut offset = 0;
             for adapter in &adapters {
                 let enabled = match adapter.class {
