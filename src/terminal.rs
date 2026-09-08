@@ -827,53 +827,14 @@ struct TerminalSymbol<'a> {
     width: u16,
 }
 
-struct TerminalSymbols<'a> {
-    text: &'a str,
-    chars: std::iter::Peekable<std::str::CharIndices<'a>>,
-}
-
-fn terminal_symbols(text: &str) -> TerminalSymbols<'_> {
-    TerminalSymbols {
-        text,
-        chars: text.char_indices().peekable(),
-    }
-}
-
-impl<'a> Iterator for TerminalSymbols<'a> {
-    type Item = TerminalSymbol<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let (start, first) = self.chars.next()?;
-        let mut end = start + first.len_utf8();
-
-        if is_terminal_control(first) || terminal_char_width(first) == 0 {
-            return Some(TerminalSymbol {
-                text: &self.text[start..end],
-                width: terminal_char_width(first),
-            });
-        }
-
-        let mut join_next = false;
-        while let Some(&(idx, ch)) = self.chars.peek() {
-            if is_terminal_control(ch) {
-                break;
-            }
-            let include = join_next || ch == '\u{200d}' || terminal_char_width(ch) == 0;
-            if !include {
-                break;
-            }
-
-            self.chars.next();
-            end = idx + ch.len_utf8();
-            join_next = ch == '\u{200d}';
-        }
-
-        let text = &self.text[start..end];
-        Some(TerminalSymbol {
+fn terminal_symbols(text: &str) -> impl Iterator<Item = TerminalSymbol<'_>> {
+    use unicode_segmentation::UnicodeSegmentation;
+    text.split_inclusive(is_terminal_control)
+        .flat_map(|part| part.graphemes(true))
+        .map(|text| TerminalSymbol {
             text,
             width: terminal_symbol_width(text),
         })
-    }
 }
 
 /// 2D buffer of cells
@@ -2343,6 +2304,40 @@ mod tests {
     }
 
     #[test]
+    fn graphemes_render_and_truncate_without_splitting_modifiers() {
+        for (text, cluster, width) in [
+            ("👍🏽A", "👍🏽", 2),
+            ("🧑🏽‍💻A", "🧑🏽‍💻", 2),
+            ("🇺🇸A", "🇺🇸", 2),
+            ("éA", "é", 1),
+        ] {
+            let mut buf = Buffer::empty(Rect::new(0, 0, width + 1, 1));
+            buf.set_string_truncated(0, 0, text, width + 1, Style::default());
+            assert_eq!(buf.get(0, 0).unwrap().symbol.as_str(), cluster);
+            assert_eq!(buf.get(width, 0).unwrap().symbol.as_str(), "A");
+            let mut short = Buffer::empty(Rect::new(0, 0, width, 1));
+            short.set_string_truncated(0, 0, text, width, Style::default());
+            assert_eq!(short.get(0, 0).unwrap().symbol.as_str(), cluster);
+            if width == 2 {
+                assert!(short.get(1, 0).unwrap().is_continuation);
+            }
+        }
+    }
+
+    #[test]
+    fn diff_replay_replaces_modifier_cluster_without_leaving_continuations() {
+        let mut previous = Buffer::empty(Rect::new(0, 0, 8, 1));
+        let mut physical = PhysicalLine::new(8);
+        for text in ["👍🏽A", "🇺🇸B", "éC", "🧑🏽‍💻D", "normal"] {
+            let mut current = Buffer::empty(previous.area);
+            current.set_string_truncated(0, 0, text, 8, Style::default());
+            replay_diff_for_test(&previous, &current, &mut physical);
+            assert_eq!(physical.line(), text);
+            previous = current;
+        }
+    }
+
+    #[test]
     fn set_line_places_emoji_presentation_as_wide_symbol() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 12, 1));
 
@@ -2458,11 +2453,7 @@ mod tests {
     fn table_column_widths_use_the_full_width() {
         // Regression: same remainder-dropping algorithm as Layout::split left
         // the last table columns unused on non-divisible widths.
-        let table = Table::new(
-            Vec::<Row>::new(),
-            [Constraint::Ratio(1, 3); 3],
-        )
-        .column_spacing(0);
+        let table = Table::new(Vec::<Row>::new(), [Constraint::Ratio(1, 3); 3]).column_spacing(0);
         let widths = table.get_column_widths(101);
         assert_eq!(widths.iter().sum::<u16>(), 101);
     }
@@ -2483,7 +2474,8 @@ mod tests {
     fn symbol_inline_roundtrip_ascii_box_drawing_and_wide() {
         // Every glyph the UI draws cell-by-cell must survive set_symbol
         // byte-for-byte while staying inside the cell (no heap allocation).
-        for text in ["A", " ", "0", "─", "│", "┌", "█", "░", "日", "🛡️", "🇺🇸"] {
+        for text in ["A", " ", "0", "─", "│", "┌", "█", "░", "日", "🛡️", "🇺🇸"]
+        {
             let mut cell = BufferCell::default();
             cell.set_symbol(text);
             assert_eq!(&*cell.symbol, text, "roundtrip failed for {text:?}");
@@ -2504,7 +2496,10 @@ mod tests {
         let mut cell = BufferCell::default();
         cell.set_symbol(long);
         assert_eq!(cell.symbol.as_str(), long);
-        assert!(!cell.symbol.is_inline(), "25-byte grapheme must spill to heap");
+        assert!(
+            !cell.symbol.is_inline(),
+            "25-byte grapheme must spill to heap"
+        );
 
         // Clearing a reused cell must drop the box again.
         cell.reset();
@@ -2533,9 +2528,9 @@ mod tests {
         let cases = [
             ("\t", " "),
             ("a\tb", "a b"),
-            ("\u{1b}", "\u{FFFD}"),   // ESC must never reach the terminal
-            ("\u{85}", "\u{FFFD}"),   // C1 control
-            ("\u{7}", "\u{FFFD}"),    // BEL
+            ("\u{1b}", "\u{FFFD}"), // ESC must never reach the terminal
+            ("\u{85}", "\u{FFFD}"), // C1 control
+            ("\u{7}", "\u{FFFD}"),  // BEL
             ("ok", "ok"),
         ];
         for (input, expected) in cases {
@@ -2586,7 +2581,9 @@ mod tests {
         assert_eq!(buf.content.len(), 200);
         assert_eq!(buf.content.capacity(), cap_before);
         assert!(
-            buf.content.iter().all(|cell| *cell == BufferCell::default()),
+            buf.content
+                .iter()
+                .all(|cell| *cell == BufferCell::default()),
             "resize must leave every cell pristine, like Buffer::empty did"
         );
 
@@ -2626,9 +2623,6 @@ mod tests {
             cell.reset();
         }
         assert!(buf.content.iter().all(|c| c.symbol.is_inline()));
-        assert!(buf
-            .content
-            .iter()
-            .all(|c| *c == BufferCell::default()));
+        assert!(buf.content.iter().all(|c| *c == BufferCell::default()));
     }
 }

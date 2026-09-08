@@ -310,8 +310,8 @@ pub(crate) fn open_process_query(pid: u32) -> Option<HANDLE> {
 #[cfg(windows)]
 #[inline]
 fn query_exe_path(handle: HANDLE) -> String {
-    use windows::core::HRESULT;
     use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
+    use windows::core::HRESULT;
 
     unsafe {
         let mut capacity = 1024usize;
@@ -524,6 +524,8 @@ struct EnrichedProcessData {
     /// denied, or a per-fact query failed). Drives the negative-cache timestamp
     /// so the next QUERY_FAILURE_TTL_MS of refreshes skip the doomed retries.
     query_failed: bool,
+    /// Distinguishes a real retry from a suppressed/cache-only pass.
+    query_attempted: bool,
     is_elevated: bool,
     arch: ProcessArch,
     user: Option<Arc<str>>,
@@ -586,6 +588,7 @@ pub fn enrich_processes_for(
                     exe_path_fresh: true,
                     elevation_fresh: true,
                     query_failed: false,
+                    query_attempted: false,
                     is_elevated: pid == 4, // System process is elevated
                     arch: ProcessArch::Native,
                     user: Some(Arc::from(SYSTEM_STR)),
@@ -623,7 +626,9 @@ pub fn enrich_processes_for(
             // that succeeded are cached normally and unaffected.
             let query_suppressed = cached_entry
                 .and_then(|e| e.query_failed_at)
-                .map(|at| now.saturating_duration_since(at).as_millis() < config::QUERY_FAILURE_TTL_MS)
+                .map(|at| {
+                    now.saturating_duration_since(at).as_millis() < config::QUERY_FAILURE_TTL_MS
+                })
                 .unwrap_or(false);
 
             // Determine what we need to query
@@ -631,8 +636,7 @@ pub fn enrich_processes_for(
             let need_elevation =
                 requirements.elevation && cached_elevation.is_none() && !query_suppressed;
             let need_user = requirements.user && cached_user.is_none() && !query_suppressed;
-            let need_efficiency =
-                requirements.efficiency && !efficiency_valid && !query_suppressed;
+            let need_efficiency = requirements.efficiency && !efficiency_valid && !query_suppressed;
             let need_exe_path = requirements.exe_path
                 && cached_exe_path
                     .as_ref()
@@ -664,6 +668,7 @@ pub fn enrich_processes_for(
                     exe_path_fresh: false,
                     elevation_fresh: false,
                     query_failed: need_handle,
+                    query_attempted: true,
                     is_elevated: cached_elevation.unwrap_or(p.is_elevated),
                     arch: cached_arch.unwrap_or(p.arch),
                     user,
@@ -869,6 +874,7 @@ pub fn enrich_processes_for(
                 exe_path_fresh,
                 elevation_fresh,
                 query_failed,
+                query_attempted: need_handle,
                 is_elevated,
                 arch,
                 user,
@@ -912,13 +918,10 @@ pub fn enrich_processes_for(
                     entry.efficiency_mode = Some(data.efficiency_mode);
                     entry.efficiency_updated = Some(std::time::Instant::now());
                 }
-                // Negative cache: stamp the failure for this pass, or clear a
-                // stale one once every needed fact resolved without error.
-                entry.query_failed_at = if data.query_failed {
-                    Some(std::time::Instant::now())
-                } else {
-                    None
-                };
+                // A suppressed/cache-only pass is not a successful retry.
+                if data.query_attempted {
+                    entry.query_failed_at = data.query_failed.then(std::time::Instant::now);
+                }
             }
         });
     }
@@ -1064,7 +1067,7 @@ pub struct ProcessInfo {
     pub parent_pid: u32,
     pub name: Arc<str>,
     pub exe_path: Arc<str>, // Full executable path
-    pub command: Arc<str>,  // Full command line with arguments
+    pub command: Arc<str>,  // Executable path or name; arguments are not collected
     pub user: Arc<str>,
     pub status: char,
     pub cpu_percent: f32,

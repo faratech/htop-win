@@ -672,7 +672,9 @@ fn run_app(
             needs_redraw = false;
         }
 
-        // Handle events with timeout
+        // Handle input against the displayed frame before applying another
+        // collector snapshot below. Process action keys must capture the
+        // identity the user sees at the selected row.
         let timeout = tick_rate.saturating_sub(last_tick.elapsed());
         if event::poll(timeout)? {
             match event::read()? {

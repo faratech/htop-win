@@ -34,14 +34,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Main layout: header, tab bar, process list, footer
     // Header is hidden if app.show_header is false
-    let tab_bar_height = if app.screen_tabs.len() > 1 { 1 } else { 0 };
+    let tab_bar_height = if app.screen_tabs.len() > 1 && size.height >= 3 {
+        1
+    } else {
+        0
+    };
+    // Keep the heading and at least one data row even on short terminals.
+    let footer_height = size.height.saturating_sub(tab_bar_height + 2).min(2);
     let header_height = if app.show_header {
-        header::calculate_header_height(app).min(size.height.saturating_sub(tab_bar_height + 2 + 1))
+        header::calculate_header_height(app).min(
+            size.height
+                .saturating_sub(tab_bar_height + footer_height + 1 + 3),
+        )
     } else {
         0
     };
     let remaining = size.height.saturating_sub(header_height + tab_bar_height);
-    let footer_height = remaining.min(2);
     let process_height = remaining.saturating_sub(footer_height);
 
     let chunks = Layout::default()
@@ -64,7 +72,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.ui_bounds.tab_bar_y = chunks[1].y;
     app.ui_bounds.tab_bar_visible = tab_bar_height > 0;
     app.ui_bounds.column_header_y = chunks[2].y;
-    app.ui_bounds.process_list_y_start = chunks[2].y + 1; // +1 to skip header row
+    app.ui_bounds.process_list_y_start = chunks[2].y + chunks[2].height.min(1);
     app.ui_bounds.process_list_y_end = chunks[2].y + chunks[2].height;
     app.ui_bounds.footer_y_start = chunks[3].y;
 
@@ -82,7 +90,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Store visible height for scrolling calculations
-    app.visible_height = chunks[2].height.saturating_sub(1) as usize;
+    app.set_visible_height(chunks[2].height.saturating_sub(1) as usize);
 
     // Draw process list
     process_list::draw(frame, app, chunks[2]);
@@ -110,10 +118,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         DialogState::None => {}
     }
 
-    // Draw error message if present (within expiry window)
-    if let Some((error, time)) = app.last_error.as_ref()
-        && time.elapsed() < std::time::Duration::from_secs(5)
-    {
+    // Keep errors visible until dismissed so long diagnostics remain readable.
+    if let Some((error, _)) = app.last_error.as_ref() {
         let error = error.clone();
         dialogs::draw_error(frame, app, &error);
     }
@@ -135,8 +141,7 @@ fn draw_tab_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         // Measure in display cells, not bytes: tab names are user-editable
         // and may contain multi-byte characters, which would otherwise
         // register a click region wider than the drawn label.
-        let label_width =
-            unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
+        let label_width = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
 
         if is_active {
             // Active tab: same as htop - bold with selection colors

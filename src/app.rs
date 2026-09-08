@@ -609,6 +609,66 @@ impl SetupItem {
     }
 }
 
+/// Process data frozen when a termination action is requested.
+#[derive(Debug, Clone)]
+pub struct TerminationTarget {
+    pub identity: ProcessIdentity,
+    pub name: String,
+    pub command: String,
+}
+
+impl From<&ProcessInfo> for TerminationTarget {
+    fn from(process: &ProcessInfo) -> Self {
+        Self {
+            identity: process.identity(),
+            name: process.name.to_string(),
+            command: process.command.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TerminationRequest {
+    Single(TerminationTarget),
+    Tagged(Vec<TerminationTarget>),
+}
+
+impl TerminationRequest {
+    pub fn targets(&self) -> &[TerminationTarget] {
+        match self {
+            Self::Single(target) => std::slice::from_ref(target),
+            Self::Tagged(targets) => targets,
+        }
+    }
+
+    pub fn tagged_count(&self) -> usize {
+        match self {
+            Self::Single(_) => 0,
+            Self::Tagged(targets) => targets.len(),
+        }
+    }
+}
+
+/// Resolve ancestry from this snapshot, rejecting reused or unknown parents.
+fn validated_parents(processes: &[ProcessInfo]) -> std::collections::HashMap<u32, u32> {
+    let times: std::collections::HashMap<_, _> = processes
+        .iter()
+        .map(|p| (p.pid, p.create_time_100ns))
+        .collect();
+    processes
+        .iter()
+        .filter_map(|child| {
+            let parent_time = *times.get(&child.parent_pid)?;
+            (child.parent_pid != 0
+                && child.parent_pid != child.pid
+                && parent_time != 0
+                && child.create_time_100ns != 0
+                && parent_time <= child.create_time_100ns)
+                .then_some((child.pid, child.parent_pid))
+        })
+        .collect()
+}
+
 /// Dialog/view state - encapsulates per-dialog state into enum variants
 /// Replaces the previous flat ViewMode enum + scattered dialog fields
 #[derive(Debug, Clone, Default)]
@@ -635,9 +695,7 @@ pub enum DialogState {
         index: usize,
     },
     Kill {
-        identity: ProcessIdentity,
-        name: String,
-        command: String,
+        request: TerminationRequest,
     },
     Priority {
         class_index: usize,
@@ -753,8 +811,13 @@ pub struct App {
     pub visible_height: usize,
     /// Terminal width in columns (set during render, used for responsive header layout)
     pub terminal_width: u16,
-    /// Last error message with timestamp for auto-expiry
+    /// Error identity timestamp; only the footer notice auto-expires.
     pub last_error: Option<(String, Instant)>,
+    pub error_scroll: usize,
+    pub error_visible_rows: usize,
+    error_seen_at: Option<Instant>,
+    #[cfg(test)]
+    pub termination_log: Option<Vec<ProcessIdentity>>,
     /// Status message (success/info) with timestamp for auto-expiry
     pub status_message: Option<(String, Instant)>,
     /// Set when a hot path (meter clicks, arrow-key meter cycling) changes the
@@ -917,6 +980,11 @@ impl App {
             visible_height: 20,
             terminal_width: 80,
             last_error: None,
+            error_scroll: 0,
+            error_visible_rows: 0,
+            error_seen_at: None,
+            #[cfg(test)]
+            termination_log: None,
             status_message: None,
             config_dirty: false,
             config_save_failed: false,
@@ -1380,28 +1448,39 @@ impl App {
         if self.readonly_blocked("kill processes") {
             return;
         }
-        if let Some(proc) = self.selected_process() {
-            let (identity, name, command) = (
-                proc.identity(),
-                proc.name.to_string(),
-                proc.command.to_string(),
-            );
-
-            // Skip confirmation dialog if disabled in settings
-            if !self.config.confirm_kill {
-                if !self.tagged_pids.is_empty() {
-                    self.kill_tagged();
-                } else {
-                    self.kill_process_by(identity, &name);
-                }
-            } else {
-                self.dialog = DialogState::Kill {
-                    identity,
-                    name,
-                    command,
-                };
-            }
+        let request = if self.tagged_pids.is_empty() {
+            let Some(process) = self.selected_process() else {
+                return;
+            };
+            TerminationRequest::Single(process.into())
+        } else {
+            self.capture_tagged_termination()
+        };
+        if self.config.confirm_kill {
+            self.dialog = DialogState::Kill { request };
+        } else {
+            self.execute_termination(request);
         }
+    }
+
+    fn capture_tagged_termination(&self) -> TerminationRequest {
+        let mut targets: Vec<_> = self
+            .tagged_pids
+            .iter()
+            .map(|identity| {
+                self.processes
+                    .iter()
+                    .find(|process| process.identity() == *identity)
+                    .map(TerminationTarget::from)
+                    .unwrap_or_else(|| TerminationTarget {
+                        identity: *identity,
+                        name: "(unavailable)".to_string(),
+                        command: String::new(),
+                    })
+            })
+            .collect();
+        targets.sort_by_key(|target| target.identity.pid);
+        TerminationRequest::Tagged(targets)
     }
 
     /// Enter priority mode and capture the target process
@@ -1632,10 +1711,6 @@ impl App {
 
     /// Update displayed processes based on filter and sort
     pub fn update_displayed_processes(&mut self) {
-        // Capture who is selected before `displayed_processes` is replaced, so
-        // the selection can be re-found by identity after the re-sort below.
-        let selected_identity = self.selected_process().map(ProcessInfo::identity);
-
         self.refresh_adapter_collection_flags();
 
         // Use cached lowercase filter string
@@ -1751,19 +1826,10 @@ impl App {
 
         self.displayed_processes = processes;
 
-        // Follow the previously selected process through this rebuild: the list
-        // reshuffles on every refresh under the default CPU% sort, so a bare
-        // row index leaves the highlight — and Enter/F9/priority actions — on
-        // whatever process drifted into that position. Fall back to the clamp
-        // below when the selected process no longer exists.
-        if let Some(identity) = selected_identity
-            && let Some(idx) = self
-                .displayed_processes
-                .iter()
-                .position(|p| p.identity() == identity)
-        {
-            self.selected_index = idx;
-        }
+        // Normal viewing is anchored to the row, not the process: dynamic
+        // sorting must not drag the viewport around. Action handlers capture
+        // the displayed process identity when invoked; only explicit follow
+        // mode below tracks an identity across refreshes.
 
         // Clamp selection and scroll immediately after replacing the list, before
         // enrichment uses scroll_offset to choose the visible slice.
@@ -1933,28 +1999,18 @@ impl App {
         }
 
         let process_count = processes.len();
-        let all_pids: HashSet<u32> = processes.iter().map(|process| process.pid).collect();
+        let parents = validated_parents(&processes);
         let order: Vec<u32> = processes.iter().map(|process| process.pid).collect();
         let roots: Vec<u32> = processes
             .iter()
-            .filter(|process| {
-                process.parent_pid == 0
-                    || process.parent_pid == process.pid
-                    || !all_pids.contains(&process.parent_pid)
-            })
+            .filter(|process| !parents.contains_key(&process.pid))
             .map(|process| process.pid)
             .collect();
         let mut children: HashMap<u32, Vec<u32>> = HashMap::with_capacity(process_count / 4);
         let mut nodes: HashMap<u32, ProcessInfo> = HashMap::with_capacity(process_count);
         for process in processes {
-            if process.parent_pid != 0
-                && process.parent_pid != process.pid
-                && all_pids.contains(&process.parent_pid)
-            {
-                children
-                    .entry(process.parent_pid)
-                    .or_default()
-                    .push(process.pid);
+            if let Some(parent) = parents.get(&process.pid) {
+                children.entry(*parent).or_default().push(process.pid);
             }
             nodes.insert(process.pid, process);
         }
@@ -2121,6 +2177,15 @@ impl App {
         self.ensure_visible();
     }
 
+    /// Apply geometry before rendering, including while collection is paused.
+    pub fn set_visible_height(&mut self, height: usize) {
+        self.visible_height = height;
+        let len = self.displayed_processes.len();
+        self.selected_index = self.selected_index.min(len.saturating_sub(1));
+        self.scroll_offset = self.scroll_offset.min(len.saturating_sub(height.max(1)));
+        self.ensure_visible();
+    }
+
     /// Ensure selected item is visible
     fn ensure_visible(&mut self) {
         if self.visible_height == 0 {
@@ -2280,79 +2345,55 @@ impl App {
         }
     }
 
-    /// Kill the captured target process (used by kill confirmation dialog)
+    /// Execute only the immutable request captured when the dialog opened.
     pub fn kill_target_process(&mut self) {
-        let (identity, name) = match &self.dialog {
-            DialogState::Kill { identity, name, .. } => (*identity, name.clone()),
-            _ => return,
-        };
-        self.kill_process_by(identity, &name);
-    }
-
-    /// Force-terminate a process after validating the captured identity.
-    fn kill_process_by(&mut self, identity: ProcessIdentity, name: &str) {
-        if self.readonly_blocked("kill processes") {
-            return;
-        }
-        match crate::system::kill_process(identity) {
-            Ok(_) => {
-                self.status_message = Some((
-                    format!("Force terminated {} (PID {})", name, identity.pid),
-                    Instant::now(),
-                ));
-            }
-            Err(e) => {
-                self.last_error = Some((
-                    format!("Failed to terminate {} ({}): {}", name, identity.pid, e),
-                    Instant::now(),
-                ));
-            }
+        if let DialogState::Kill { request } = &self.dialog {
+            self.execute_termination(request.clone());
         }
     }
 
-    /// Kill all tagged processes
-    pub fn kill_tagged(&mut self) {
+    fn terminate_identity(&mut self, identity: ProcessIdentity) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(log) = &mut self.termination_log {
+            log.push(identity);
+            return Ok(());
+        }
+        crate::system::kill_process(identity)
+    }
+
+    fn execute_termination(&mut self, request: TerminationRequest) {
         if self.readonly_blocked("kill processes") {
             return;
         }
-        let identities: Vec<ProcessIdentity> = self.tagged_pids.iter().copied().collect();
-        let total = identities.len();
+        let total = request.targets().len();
         let mut killed = 0;
-        let mut failed = 0;
-
-        for identity in identities {
-            match crate::system::kill_process(identity) {
-                Ok(_) => killed += 1,
-                Err(e) => {
-                    failed += 1;
+        for target in request.targets() {
+            match self.terminate_identity(target.identity) {
+                Ok(()) => killed += 1,
+                Err(error) => {
                     self.last_error = Some((
-                        format!("Failed to terminate process {}: {}", identity.pid, e),
+                        format!(
+                            "Failed to terminate {} ({}): {}",
+                            target.name, target.identity.pid, error
+                        ),
                         Instant::now(),
-                    ));
+                    ))
                 }
             }
+            self.tagged_pids.remove(&target.identity);
         }
+        self.status_message = Some((
+            format!(
+                "Force terminated {killed}/{total} processes ({} failed)",
+                total - killed
+            ),
+            Instant::now(),
+        ));
+    }
 
-        if failed == 0 {
-            self.status_message = Some((
-                format!(
-                    "Force terminated {} process{}",
-                    killed,
-                    if killed == 1 { "" } else { "es" }
-                ),
-                Instant::now(),
-            ));
-        } else {
-            self.status_message = Some((
-                format!(
-                    "Force terminated {}/{} processes ({} failed)",
-                    killed, total, failed
-                ),
-                Instant::now(),
-            ));
-        }
-
-        self.tagged_pids.clear();
+    /// Terminate the tags captured at the instant this action is invoked.
+    pub fn kill_tagged(&mut self) {
+        self.execute_termination(self.capture_tagged_termination());
     }
 
     /// Set priority class for selected process
@@ -2419,9 +2460,19 @@ impl App {
         }
     }
 
-    /// Clear error message
+    /// Reset error navigation when a newly reported error replaces the overlay.
+    pub fn sync_error_scroll(&mut self) {
+        let at = self.last_error.as_ref().map(|(_, at)| *at);
+        if self.error_seen_at != at {
+            self.error_scroll = 0;
+            self.error_seen_at = at;
+        }
+    }
+
+    /// Dismiss the error overlay and reset its navigation.
     pub fn clear_error(&mut self) {
         self.last_error = None;
+        self.sync_error_scroll();
     }
 
     /// Add character to input buffer
@@ -2569,6 +2620,7 @@ impl App {
 
         let mut result = Vec::new();
         let mut visited = HashSet::new();
+        let parents = validated_parents(&self.processes);
         let mut pending = vec![root.pid];
         while let Some(parent_pid) = pending.pop() {
             if !visited.insert(parent_pid) {
@@ -2584,7 +2636,7 @@ impl App {
             pending.extend(
                 self.processes
                     .iter()
-                    .filter(|process| process.parent_pid == parent_pid && process.pid != parent_pid)
+                    .filter(|process| parents.get(&process.pid) == Some(&parent_pid))
                     .map(|process| process.pid),
             );
         }
@@ -2817,7 +2869,10 @@ impl App {
     /// Collapse to parent in tree view
     pub fn collapse_to_parent(&mut self) {
         if let Some(proc) = self.selected_process() {
-            let parent_pid = proc.parent_pid;
+            let parents = validated_parents(&self.processes);
+            let Some(&parent_pid) = parents.get(&proc.pid) else {
+                return;
+            };
             // Find parent in displayed processes and select it
             if let Some((index, identity)) = self
                 .displayed_processes
@@ -2959,6 +3014,133 @@ mod tests {
     }
 
     #[test]
+    fn tagged_confirmation_never_retargets_after_exits_or_pid_reuse() {
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+        for mouse in [false, true] {
+            for reuse in [false, true] {
+                let mut app = App::new(Config::default());
+                app.termination_log = Some(Vec::new());
+                app.processes = vec![process(1, 0), process(2, 0), process(3, 0)];
+                let expected = vec![app.processes[0].identity(), app.processes[1].identity()];
+                app.tagged_pids.extend(expected.iter().copied());
+                // Only untagged B is displayed; tags retain canonical names.
+                app.filter_string_lower = "p3".into();
+                app.canonical_enrichment = app.canonical_enrichment_requirements();
+                app.update_displayed_processes();
+                crate::input::handle_key_event(
+                    &mut app,
+                    KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE),
+                );
+                let DialogState::Kill { request } = &app.dialog else {
+                    panic!("kill dialog");
+                };
+                assert_eq!(request.tagged_count(), 2);
+                assert_eq!(request.targets()[0].name, "p1");
+                app.processes.remove(0);
+                if reuse {
+                    app.processes[0].create_time_100ns += 1;
+                } else {
+                    app.processes.remove(0);
+                }
+                app.update_displayed_processes();
+                assert!(app.tagged_pids.is_empty());
+                if mouse {
+                    let mut buffer = crate::terminal::Buffer::empty(Rect::new(0, 0, 80, 25));
+                    crate::ui::draw(&mut crate::terminal::Frame::new(&mut buffer), &mut app);
+                    let inner = app.dialog_inner.unwrap();
+                    let click = MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: inner.x + 1,
+                        row: inner.y + 5,
+                        modifiers: KeyModifiers::NONE,
+                    };
+                    crate::input::handle_mouse_event(&mut app, click);
+                    assert!(app.termination_log.as_ref().unwrap().is_empty());
+                    crate::input::handle_mouse_event(&mut app, click);
+                } else {
+                    crate::input::handle_key_event(
+                        &mut app,
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                    );
+                }
+                assert_eq!(app.termination_log.unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn partial_batch_exits_and_readonly_preserve_captured_targets() {
+        let mut app = App::new(Config::default());
+        app.termination_log = Some(Vec::new());
+        app.processes = vec![process(1, 0), process(2, 0)];
+        let expected: Vec<_> = app.processes.iter().map(ProcessInfo::identity).collect();
+        app.tagged_pids.extend(expected.iter().copied());
+        app.update_displayed_processes();
+        app.enter_kill_mode();
+        app.processes.remove(0);
+        app.update_displayed_processes();
+        app.config.readonly = true;
+        app.kill_target_process();
+        assert!(app.termination_log.as_ref().unwrap().is_empty());
+        app.config.readonly = false;
+        app.kill_target_process();
+        assert_eq!(app.termination_log.unwrap(), expected);
+    }
+
+    #[test]
+    fn parent_edges_are_validated_for_tree_tags_and_navigation() {
+        for (parent_time, child_time, linked) in [
+            (200, 100, false),
+            (0, 100, false),
+            (100, 0, false),
+            (100, 100, true),
+            (100, 200, true),
+        ] {
+            let mut app = App::new(Config::default());
+            app.processes = vec![process(1, 0), process(2, 1), process(3, 2)];
+            app.processes[0].create_time_100ns = parent_time;
+            app.processes[1].create_time_100ns = child_time;
+            app.processes[2].create_time_100ns = child_time + 1;
+            app.tree_view = true;
+            app.sort_column = SortColumn::Pid;
+            app.sort_ascending = true;
+            app.update_displayed_processes();
+            assert_eq!(app.displayed_processes[1].tree_depth, usize::from(linked));
+            app.tag_with_children();
+            assert_eq!(app.tagged_pids.len(), if linked { 3 } else { 1 });
+            app.selected_index = 1;
+            app.collapse_to_parent();
+            assert_eq!(app.selected_index, if linked { 0 } else { 1 });
+        }
+        let mut cycle = vec![process(1, 2), process(2, 1), process(3, 99)];
+        for p in &mut cycle {
+            p.create_time_100ns = 100;
+        }
+        let mut app = App::new(Config::default());
+        app.processes = cycle;
+        app.tree_view = true;
+        app.update_displayed_processes();
+        assert_eq!(app.displayed_processes.len(), 3);
+        assert_eq!(app.branch_identities(app.processes[0].identity()).len(), 2);
+    }
+
+    #[test]
+    fn virtual_memory_sort_uses_virtual_size() {
+        let mut app = App::new(Config::default());
+        app.sort_column = SortColumn::Virt;
+        app.processes = vec![process(1, 0), process(2, 0)];
+        app.processes[0].virtual_mem = 1 << 30;
+        app.processes[1].virtual_mem = 1 << 20;
+        app.update_displayed_processes();
+        assert_eq!(app.displayed_processes[0].pid, 1);
+        app.sort_ascending = true;
+        app.update_displayed_processes();
+        assert_eq!(app.displayed_processes[0].pid, 2);
+    }
+
+    #[test]
     fn destructive_reset_is_last_setup_item() {
         // Keep the destructive action at the bottom of the Setup list
         // (issue #27) — draw and input both derive order from this table.
@@ -3092,37 +3274,118 @@ mod tests {
     }
 
     #[test]
-    fn selection_follows_its_process_through_a_resort() {
-        // Regression: the highlight was glued to a row index while the default
-        // CPU% sort reshuffled rows every refresh, so actions landed on
-        // whichever process drifted under the cursor.
+    fn dynamic_sorts_keep_selection_and_viewport_stationary() {
+        for column in [
+            SortColumn::Cpu,
+            SortColumn::Mem,
+            SortColumn::Gpu,
+            SortColumn::Npu,
+            SortColumn::IoRate,
+            SortColumn::Res,
+            SortColumn::Time,
+        ] {
+            for ascending in [false, true] {
+                let mut app = App::new(Config::default());
+                app.sort_column = column;
+                app.sort_ascending = ascending;
+                app.visible_height = 3;
+                app.processes = (1..=12).map(|pid| process(pid, 0)).collect();
+                for tick in 0..12 {
+                    // Rotate the ranking so every identity crosses the viewport.
+                    for p in &mut app.processes {
+                        let value = (p.pid + tick) % 12;
+                        p.cpu_percent = value as f32;
+                        p.mem_percent = value as f32;
+                        p.gpu_percent = value as f32;
+                        p.npu_percent = value as f32;
+                        p.io_read_rate = value as u64;
+                        p.resident_mem = value as u64;
+                        p.cpu_time = Duration::from_secs(value as u64);
+                    }
+                    app.update_displayed_processes();
+                    if tick == 0 {
+                        app.selected_index = 6;
+                        app.scroll_offset = 5;
+                    }
+                    assert_eq!(app.selected_index, 6, "{column:?}, tick {tick}");
+                    assert_eq!(app.scroll_offset, 5, "{column:?}, tick {tick}");
+                    let expected: Vec<_> = if ascending {
+                        (0..12).collect()
+                    } else {
+                        (0..12).rev().collect()
+                    };
+                    let actual: Vec<_> = app
+                        .displayed_processes
+                        .iter()
+                        .map(|p| (p.pid + tick) % 12)
+                        .collect();
+                    assert_eq!(actual, expected, "{column:?}, tick {tick}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_follow_tracks_identity_until_disabled() {
         let mut app = App::new(Config::default());
-        let mut low = process(1, 0);
-        low.cpu_percent = 1.0;
-        let mut hot = process(2, 0);
-        hot.cpu_percent = 50.0;
-        let mut mid = process(3, 0);
-        mid.cpu_percent = 5.0;
-        app.processes = vec![low, hot, mid];
-
+        app.visible_height = 2;
+        app.processes = (1..=6)
+            .map(|pid| {
+                let mut p = process(pid, 0);
+                p.cpu_percent = pid as f32;
+                p
+            })
+            .collect();
         app.update_displayed_processes();
-        assert_eq!(
-            app.selected_index,
-            0,
-            "fresh list should keep the default top-row selection"
-        );
-        app.selected_index = 2;
-        assert_eq!(app.selected_process().map(|p| p.pid), Some(1));
-
-        // Next refresh: the selected process spikes to the top of the sort.
-        app.processes[0].cpu_percent = 90.0;
+        let identity = app.selected_process().unwrap().identity();
+        app.toggle_follow_mode();
+        app.processes[5].cpu_percent = 0.0;
         app.update_displayed_processes();
-        assert_eq!(app.displayed_processes[0].pid, 1);
-        assert_eq!(
-            app.selected_process().map(|p| p.pid),
-            Some(1),
-            "highlight must follow the same process across the re-sort"
-        );
+        assert_eq!(app.selected_process().unwrap().identity(), identity);
+        assert_eq!(app.selected_index, 5);
+        assert_eq!(app.scroll_offset, 4);
+
+        app.toggle_follow_mode();
+        app.processes[5].cpu_percent = 10.0;
+        app.update_displayed_processes();
+        assert_eq!(app.selected_index, 5);
+        assert_eq!(app.scroll_offset, 4);
+        assert_ne!(app.selected_process().unwrap().identity(), identity);
+    }
+
+    #[test]
+    fn action_keys_capture_displayed_identity_and_keep_it_after_resort_and_pid_reuse() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        for key in [KeyCode::F(9), KeyCode::F(7), KeyCode::Char('a')] {
+            let mut app = App::new(Config::default());
+            app.config.confirm_kill = true;
+            app.processes = vec![process(1, 0), process(2, 0)];
+            app.processes[0].cpu_percent = 50.0;
+            app.update_displayed_processes();
+            // A refresh changes the process under the stationary selection.
+            app.processes[1].cpu_percent = 90.0;
+            app.update_displayed_processes();
+            let target = app.selected_process().unwrap().identity();
+            assert_eq!(target.pid, 2);
+            crate::input::handle_key_event(&mut app, KeyEvent::new(key, KeyModifiers::NONE));
+            let captured = |app: &App| match &app.dialog {
+                DialogState::Kill { request } => request.targets()[0].identity,
+                DialogState::Priority { identity, .. } | DialogState::Affinity { identity, .. } => {
+                    *identity
+                }
+                _ => panic!("expected an action dialog for {key:?}"),
+            };
+            assert_eq!(captured(&app), target);
+            app.processes[0].cpu_percent = 100.0;
+            app.update_displayed_processes();
+            assert_eq!(app.selected_process().unwrap().pid, 1);
+            assert_eq!(captured(&app), target);
+            app.processes[1].create_time_100ns += 1;
+            app.update_displayed_processes();
+            assert_eq!(captured(&app), target);
+            assert!(app.process_by_identity(target).is_none());
+        }
     }
 
     #[test]

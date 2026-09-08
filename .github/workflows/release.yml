@@ -213,15 +213,15 @@ jobs:
           git for-each-ref --format='%(contents)' "refs/tags/$TAG" > release_notes.md
           cat >> release_notes.md << 'EOF'
 
-### Verification
+          ### Verification
 
-All release binaries are signed with Azure Trusted Signing and verified with GitHub artifact attestation:
+          All release binaries are signed with Azure Trusted Signing and verified with GitHub artifact attestation:
 
-```bash
-gh attestation verify htop-win-amd64.exe --owner faratech
-gh attestation verify htop-win-arm64.exe --owner faratech
-```
-EOF
+          ```bash
+          gh attestation verify htop-win-amd64.exe --owner faratech
+          gh attestation verify htop-win-arm64.exe --owner faratech
+          ```
+          EOF
           echo "Generated release notes for $TAG"
 
       - name: Create Release

@@ -49,10 +49,10 @@ pub fn get_installed_version() -> Option<String> {
 #[cfg(windows)]
 fn read_pe_file_version(path: &std::path::Path) -> Option<String> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
     use windows::Win32::Storage::FileSystem::{
-        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VS_FIXEDFILEINFO, VerQueryValueW,
     };
+    use windows::core::PCWSTR;
 
     let wide: Vec<u16> = path
         .as_os_str()
@@ -69,20 +69,24 @@ fn read_pe_file_version(path: &std::path::Path) -> Option<String> {
         if GetFileVersionInfoW(path_pcwstr, None, size, data.as_mut_ptr() as *mut _).is_err() {
             return None;
         }
-        let fixed: *mut VS_FIXEDFILEINFO = std::ptr::null_mut();
+        let mut fixed: *mut std::ffi::c_void = std::ptr::null_mut();
         let mut len = 0u32;
         if !VerQueryValueW(
             data.as_ptr() as *const _,
             windows::core::w!("\\"),
-            &mut fixed.cast() as *mut *mut _,
+            &mut fixed,
             &mut len,
         )
         .as_bool()
             || fixed.is_null()
+            || (len as usize) < std::mem::size_of::<VS_FIXEDFILEINFO>()
         {
             return None;
         }
-        let v = &*fixed;
+        let v = fixed.cast::<VS_FIXEDFILEINFO>().read_unaligned();
+        if v.dwSignature != 0xfeef04bd {
+            return None;
+        }
         // Cargo versions here are three-part; the fourth (build) field is
         // padding set by the resource compiler.
         Some(format!(
@@ -97,9 +101,15 @@ fn read_pe_file_version(path: &std::path::Path) -> Option<String> {
 /// Non-Windows fallback: shells out, as before (development builds only).
 #[cfg(not(windows))]
 fn read_pe_file_version(path: &std::path::Path) -> Option<String> {
-    let output = std::process::Command::new(path).arg("--version").output().ok()?;
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .ok()?;
     let version_output = String::from_utf8_lossy(&output.stdout);
-    version_output.split_whitespace().last().map(|s| s.to_string())
+    version_output
+        .split_whitespace()
+        .last()
+        .map(|s| s.to_string())
 }
 
 /// Install htop-win to a PATH directory so it can be run from anywhere
@@ -1154,9 +1164,7 @@ fn apply_pending_update_locked(current_exe: &Path) -> PendingUpdateOutcome {
                 remove_pending_update(&pending);
                 PendingUpdateOutcome::Applied
             }
-            Err(error) => {
-                PendingUpdateOutcome::Incomplete(format!("installation failed: {error}"))
-            }
+            Err(error) => PendingUpdateOutcome::Incomplete(format!("installation failed: {error}")),
         },
         Ok(None) => {
             // Clean up any old backup files from previous updates.
@@ -1164,9 +1172,9 @@ fn apply_pending_update_locked(current_exe: &Path) -> PendingUpdateOutcome {
             let _ = fs::remove_file(&backup_path);
             PendingUpdateOutcome::NothingPending
         }
-        Err(error) => PendingUpdateOutcome::Incomplete(format!(
-            "cannot inspect update files: {error}"
-        )),
+        Err(error) => {
+            PendingUpdateOutcome::Incomplete(format!("cannot inspect update files: {error}"))
+        }
     }
 }
 
@@ -1184,9 +1192,9 @@ pub fn apply_pending_update() -> bool {
     let outcome = match UpdateLock::acquire() {
         // Held across inspection, installation and publication.
         Ok(_lock) => apply_pending_update_locked(&current_exe),
-        Err(error) => PendingUpdateOutcome::Incomplete(format!(
-            "cannot acquire update lock: {error}"
-        )),
+        Err(error) => {
+            PendingUpdateOutcome::Incomplete(format!("cannot acquire update lock: {error}"))
+        }
     };
 
     match &outcome {

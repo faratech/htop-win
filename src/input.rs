@@ -93,15 +93,23 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
 
     // Ctrl+C is the conventional emergency exit; treat it as global as F10.
     // Previously it was only reachable from the normal-mode handler, so a
-    // stale error banner or an open text dialog could swallow it — and the
-    // banner outlives its 5-second display until some key clears it.
+    // error overlay or an open text dialog must not swallow it.
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         return true;
     }
 
-    // Clear error on any key press
     if app.last_error.is_some() {
-        app.clear_error();
+        app.sync_error_scroll();
+        let page = app.error_visible_rows.max(1);
+        match key.code {
+            KeyCode::Up => app.error_scroll = app.error_scroll.saturating_sub(1),
+            KeyCode::Down => app.error_scroll = app.error_scroll.saturating_add(1),
+            KeyCode::PageUp => app.error_scroll = app.error_scroll.saturating_sub(page),
+            KeyCode::PageDown => app.error_scroll = app.error_scroll.saturating_add(page),
+            KeyCode::Home => app.error_scroll = 0,
+            KeyCode::End => app.error_scroll = usize::MAX,
+            _ => app.clear_error(),
+        }
         return false;
     }
 
@@ -544,19 +552,11 @@ fn handle_kill_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         // Confirm: Enter, y, Y, Space
         KeyCode::Enter | KeyCode::Char(' ') => {
-            if !app.tagged_pids.is_empty() {
-                app.kill_tagged();
-            } else {
-                app.kill_target_process();
-            }
+            app.kill_target_process();
             app.dialog = DialogState::None;
         }
         KeyCode::Char('y') | KeyCode::Char('Y') => {
-            if !app.tagged_pids.is_empty() {
-                app.kill_tagged();
-            } else {
-                app.kill_target_process();
-            }
+            app.kill_target_process();
             app.dialog = DialogState::None;
         }
         _ => {}
@@ -1116,16 +1116,20 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> bool {
     // outside-click behavior. This makes mouse F10 and keyboard F10 identical.
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         && let Some(crate::app::UIElement::FunctionKey(key)) = app.ui_bounds.element_at(x, y)
+        && (app.last_error.is_none() || key == 10)
     {
         return app.handle_function_key(key);
     }
 
-    if let Some((_, time)) = app.last_error {
-        if time.elapsed() < std::time::Duration::from_secs(5) {
-            app.clear_error();
-            return false;
+    if app.last_error.is_some() {
+        app.sync_error_scroll();
+        match mouse.kind {
+            MouseEventKind::ScrollUp => app.error_scroll = app.error_scroll.saturating_sub(1),
+            MouseEventKind::ScrollDown => app.error_scroll = app.error_scroll.saturating_add(1),
+            MouseEventKind::Down(_) => app.clear_error(),
+            _ => {}
         }
-        app.clear_error();
+        return false;
     }
 
     // Check if we're in a dialog/modal mode
@@ -1312,11 +1316,7 @@ fn handle_dialog_click(app: &mut App, x: u16, y: u16, double: bool) -> bool {
         if !double || kill_confirmation_row(app, inner) != Some(y) {
             return false;
         }
-        if !app.tagged_pids.is_empty() {
-            app.kill_tagged();
-        } else {
-            app.kill_target_process();
-        }
+        app.kill_target_process();
         app.dialog = DialogState::None;
         return false;
     }
@@ -1346,7 +1346,10 @@ fn handle_dialog_click(app: &mut App, x: u16, y: u16, double: bool) -> bool {
 }
 
 fn kill_confirmation_row(app: &App, inner: crate::terminal::Rect) -> Option<u16> {
-    let tagged_count = app.tagged_pids.len();
+    let DialogState::Kill { request } = &app.dialog else {
+        return None;
+    };
+    let tagged_count = request.tagged_count();
     let confirm_index = if tagged_count > 0 {
         let listed = if tagged_count > 8 { 9 } else { tagged_count };
         3 + listed

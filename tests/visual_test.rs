@@ -336,3 +336,115 @@ fn reset_hardware_columns_render_elevated_system_with_wide_indicator() {
 
     panic!("rendered reset view did not contain elevated System command row");
 }
+
+fn render_at(app: &mut App, width: u16, height: u16) -> String {
+    let area = Rect::new(0, 0, width, height);
+    let mut buffer = Buffer::empty(area);
+    htop_win::ui::draw(&mut Frame::new(&mut buffer), app);
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer.get(x, y).unwrap().symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn many_core_headers_reserve_real_process_rows() {
+    for cores in [64, 128] {
+        for tabs in [1, 2] {
+            let mut app = fixture_app();
+            app.show_header = true;
+            app.system_metrics.cpu.core_usage = vec![0.0; cores];
+            if tabs == 2 {
+                app.screen_tabs.push(app.screen_tabs[0].clone());
+            }
+            let text = render_at(&mut app, 80, 24);
+            assert!(app.visible_height >= 3, "cores={cores}, tabs={tabs}");
+            assert!(text.contains("RustCompiler"));
+            for height in 0..10 {
+                render_at(&mut app, 80, height);
+                assert!(app.ui_bounds.process_list_y_start <= app.ui_bounds.process_list_y_end);
+                assert!(app.ui_bounds.process_list_y_end <= height);
+                if height >= 4 {
+                    assert!(app.visible_height >= 1);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn paused_resize_and_header_toggle_keep_selection_visible() {
+    let mut app = fixture_app();
+    app.paused = true;
+    app.processes = (1..=40)
+        .map(|pid| fixture_process(pid, "user", "fixture", 0.0, 0.0))
+        .collect();
+    app.update_displayed_processes();
+    app.selected_index = 15;
+    for (height, header) in [
+        (24, false),
+        (10, false),
+        (10, true),
+        (0, true),
+        (24, true),
+        (24, false),
+    ] {
+        app.show_header = header;
+        render_at(&mut app, 120, height);
+        assert_eq!(app.selected_index, 15);
+        if app.visible_height > 0 {
+            assert!(app.selected_index >= app.scroll_offset);
+            assert!(app.selected_index < app.scroll_offset + app.visible_height);
+        }
+        assert!(app.scroll_offset < app.displayed_processes.len());
+    }
+    let target = app.selected_process().unwrap().identity();
+    app.enter_kill_mode();
+    let DialogState::Kill { request } = app.dialog else {
+        panic!("kill dialog");
+    };
+    assert_eq!(request.targets()[0].identity, target);
+}
+
+#[test]
+fn errors_pin_hint_and_scroll_all_diagnostics_without_dismissing() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let mut app = fixture_app();
+    app.last_error = Some(("Short error".into(), std::time::Instant::now()));
+    let text = render_at(&mut app, 80, 24);
+    assert!(text.contains("Short error") && text.contains("other keys dismiss"));
+    app.last_error = Some((
+        (0..30).map(|n| format!("Diagnostic row {n}\n")).collect(),
+        std::time::Instant::now() - Duration::from_secs(10),
+    ));
+    let text = render_at(&mut app, 35, 10);
+    assert!(text.contains("Diagnostic row 0") && text.contains("Esc close"));
+    htop_win::input::handle_key_event(&mut app, KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+    let text = render_at(&mut app, 35, 10);
+    assert!(text.contains("Diagnostic row 29") && text.contains("Esc close"));
+    assert!(app.last_error.is_some());
+    app.last_error = Some(("Replacement error".into(), std::time::Instant::now()));
+    let text = render_at(&mut app, 35, 10);
+    assert_eq!(app.error_scroll, 0);
+    assert!(text.contains("Replacement error"));
+    htop_win::input::handle_key_event(&mut app, KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE));
+    assert!(app.last_error.is_none());
+    assert!(matches!(app.dialog, DialogState::None));
+}
+
+#[test]
+fn unsupported_views_describe_the_available_data() {
+    let mut app = fixture_app();
+    app.enter_command_wrap_mode();
+    let text = render_at(&mut app, 100, 30);
+    assert!(text.contains("Executable Path"));
+    assert!(!text.contains("Command Line"));
+    app.enter_environment_mode();
+    let text = render_at(&mut app, 100, 30);
+    assert!(text.contains("Environment inspection is not implemented."));
+    assert!(!text.contains("elevated privileges"));
+}

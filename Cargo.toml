@@ -1,6 +1,6 @@
 [package]
 name = "htop-win"
-version = "0.2.8"
+version = "0.2.9"
 edition = "2024"
 description = "A Windows clone of htop - interactive process viewer"
 authors = ["htop-win contributors"]
@@ -13,6 +13,7 @@ categories = ["command-line-utilities", "os::windows-apis"]
 crossterm = { version = "0.29", default-features = false, features = ["events", "windows"] }
 bitflags = "2"  # For Modifier flags
 unicode-width = "0.2"
+unicode-segmentation = "1.13.3"
 lexopt = "0.3"  # Lightweight arg parsing
 
 [target.'cfg(windows)'.dependencies]

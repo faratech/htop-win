@@ -54,8 +54,7 @@ impl<'a> SystemProcess<'a> {
     }
 
     pub fn virtual_size(&self) -> u64 {
-        // Use pagefile_usage (committed memory) for VIRT
-        self.info.pagefile_usage as u64
+        self.info.virtual_size as u64
     }
 
     pub fn kernel_time(&self) -> u64 {
@@ -331,4 +330,23 @@ struct SystemProcessInfo {
     read_transfer_count: i64,
     write_transfer_count: i64,
     other_transfer_count: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn virtual_size_includes_reservations_not_just_commit() {
+        // The raw Windows record contains only integers and raw pointers.
+        let mut raw: SystemProcessInfo = unsafe { std::mem::zeroed() };
+        raw.virtual_size = 1 << 30;
+        raw.pagefile_usage = 1 << 20;
+        raw.working_set_size = 1 << 19;
+        let process = SystemProcess { info: &raw };
+        assert_eq!(process.virtual_size(), 1 << 30);
+        assert_eq!(process.working_set(), 1 << 19);
+        let info = crate::system::ProcessInfo::from_raw(&process, 0.0, 1 << 32);
+        assert_eq!(info.virtual_mem, 1 << 30);
+    }
 }

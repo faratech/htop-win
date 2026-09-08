@@ -259,10 +259,17 @@ htop --benchmark-iterations 50
 | `U` | Untag all processes |
 | `Ctrl+T` | Tag all with same name |
 | `Ctrl+A` | Toggle tag all visible |
-| `e` | View environment variables |
-| `w` | View full command line |
+| `e` | Environment inspection unavailable |
+| `w` | Wrap executable path |
 | `a` | Set CPU affinity |
 | `F` | Toggle follow mode |
+
+During normal viewing, the selection bar and scroll position stay in place as
+processes change sort order. Press `F` to follow a particular process instead.
+Process actions capture the selected process when the action key is pressed;
+an open kill, priority, or affinity dialog keeps that target even if the list
+reorders. The process identity is verified before applying the action to guard
+against PID reuse.
 
 ### Tree View
 
@@ -355,7 +362,7 @@ Access via Setup (`F2`) → Color Scheme:
 | `NPU-MEM` | NPU dedicated + shared memory | 8 |
 | `TIME+` | Cumulative CPU time | 10 |
 | `START` | Process start time | 8 |
-| `Command` | Command line | Flexible |
+| `Command` | Executable path/name (no arguments) | Flexible |
 | `ELEV` | Elevated/Admin status | 4 |
 | `ARCH` | Architecture (x86/x64/ARM64) | 5 |
 | `ECO` | Efficiency Mode status | 4 |
@@ -374,7 +381,7 @@ Access via Setup (`F2`) → Color Scheme:
 | `IO_RD` | Cumulative bytes read |
 | `IO_WR` | Cumulative bytes written |
 | `HNDL` | Open handle count |
-| `Command` | Command line |
+| `Command` | Executable path/name (no arguments) |
 
 ---
 

@@ -1,6 +1,6 @@
 use crate::terminal::{
     Block, Borders, Clear, Frame, Line, List, ListItem, Modifier, Paragraph, Rect, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, Span, Style, Wrap,
+    ScrollbarOrientation, ScrollbarState, Span, Style,
 };
 
 use crate::app::{App, DialogState, SetupItem, SortColumn};
@@ -36,7 +36,8 @@ fn item_style(is_selected: bool, theme: &Theme) -> Style {
 /// indentation and hard-splitting words longer than the available width
 /// (e.g. long unbroken paths).
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
 
     if width == 0 || text.width() <= width {
         return vec![text.to_string()];
@@ -77,14 +78,14 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
             current.push_str(&word);
             current_width += word_width;
         } else {
-            for c in word.chars() {
-                let char_width = UnicodeWidthChar::width(c).unwrap_or(0);
+            for c in word.graphemes(true) {
+                let char_width = c.width();
                 if current_width > 0 && current_width + char_width > avail {
                     lines.push(format!("{indent}{current}"));
                     current.clear();
                     current_width = 0;
                 }
-                current.push(c);
+                current.push_str(c);
                 current_width += char_width;
             }
         }
@@ -305,8 +306,8 @@ pub fn draw_help(frame: &mut Frame, app: &mut App) {
         "  PROCESS ACTIONS",
         "  ─────────────────────────────────────────────────────────────",
         "    Enter              Show process details (PID, memory, I/O)",
-        "    e                  Show environment variables",
-        "    w                  Show wrapped command line",
+        "    e                  Environment inspection unavailable",
+        "    w                  Wrap executable path",
         "    a                  Set CPU affinity",
         "    Z                  Pause/resume process list updates",
         "",
@@ -437,46 +438,40 @@ pub fn draw_filter(frame: &mut Frame, app: &mut App) {
 }
 
 fn input_window(buffer: &str, cursor: usize, width: usize) -> (String, usize) {
-    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
 
     if width == 0 {
         return (String::new(), 0);
     }
-
-    let cursor = cursor.min(buffer.len());
-    let cursor = if buffer.is_char_boundary(cursor) {
-        cursor
-    } else {
-        buffer
-            .char_indices()
-            .map(|(idx, _)| idx)
-            .take_while(|idx| *idx < cursor)
-            .last()
-            .unwrap_or(0)
-    };
+    // Input editing stores byte offsets; display only complete clusters.
+    let cursor = buffer
+        .grapheme_indices(true)
+        .map(|(idx, _)| idx)
+        .chain(std::iter::once(buffer.len()))
+        .take_while(|idx| *idx <= cursor.min(buffer.len()))
+        .last()
+        .unwrap_or(0);
     let mut start = 0;
-    if UnicodeWidthStr::width(&buffer[..cursor]) > width {
-        for (idx, _) in buffer[..cursor].char_indices() {
-            start = idx;
-            if UnicodeWidthStr::width(&buffer[start..cursor]) <= width {
-                break;
-            }
-        }
+    if buffer[..cursor].width() > width {
+        start = buffer[..cursor]
+            .grapheme_indices(true)
+            .map(|(idx, _)| idx)
+            .chain(std::iter::once(cursor))
+            .find(|idx| buffer[*idx..cursor].width() <= width)
+            .unwrap_or(cursor);
     }
-
     let mut visible = String::new();
-    let mut used_width = 0usize;
-    for ch in buffer[start..].chars() {
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if char_width > 0 && used_width + char_width > width {
+    let mut used_width = 0;
+    for cluster in buffer[start..].graphemes(true) {
+        let cluster_width = cluster.width();
+        if used_width + cluster_width > width {
             break;
         }
-        visible.push(ch);
-        used_width += char_width;
+        visible.push_str(cluster);
+        used_width += cluster_width;
     }
-
-    let cursor_width = UnicodeWidthStr::width(&buffer[start..cursor]);
-    (visible, cursor_width)
+    (visible, buffer[start..cursor].width())
 }
 
 /// Draw sort selection dialog
@@ -518,16 +513,10 @@ pub fn draw_sort_select(frame: &mut Frame, app: &mut App) {
 
 /// Draw kill confirmation dialog
 pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
-    let DialogState::Kill {
-        identity,
-        name,
-        command,
-    } = &app.dialog
-    else {
+    let DialogState::Kill { request } = &app.dialog else {
         return;
     };
-    let pid = identity.pid;
-    let tagged_count = app.tagged_pids.len();
+    let tagged_count = request.tagged_count();
 
     // Determine dialog height based on tagged processes
     let base_height = if tagged_count > 0 { 10 } else { 9 };
@@ -551,7 +540,7 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
         lines.push(Line::from(""));
 
         // List tagged processes (show up to 8)
-        for (shown, tagged_identity) in app.tagged_pids.iter().enumerate() {
+        for (shown, target) in request.targets().iter().enumerate() {
             if shown >= 8 {
                 lines.push(Line::from(Span::styled(
                     format!("  ... and {} more", tagged_count - 8),
@@ -559,23 +548,20 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
                 )));
                 break;
             }
-            // Try to find process name
-            let proc_name = app
-                .displayed_processes
-                .iter()
-                .find(|p| p.identity() == *tagged_identity)
-                .map(|p| &*p.name)
-                .unwrap_or("(unknown)");
+            let proc_name = &target.name;
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  {} ", tagged_identity.pid),
+                    format!("  {} ", target.identity.pid),
                     Style::default().fg(theme.meter_value_warn),
                 ),
                 Span::styled(proc_name, Style::default().fg(theme.text)),
             ]));
         }
     } else {
-        // Single process
+        let Some(target) = request.targets().first() else {
+            return;
+        };
+        let (pid, name, command) = (target.identity.pid, &target.name, &target.command);
         lines.push(Line::from(Span::styled(
             "Force terminate this process?",
             Style::default()
@@ -886,8 +872,6 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
              \n\
              Executable\n   {}\n\
              \n\
-             Command Line\n   {}\n\
-             \n\
              Esc/q close   ↑/↓ PgUp/PgDn scroll",
             proc.pid,
             proc.parent_pid,
@@ -913,7 +897,6 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
             format_bytes(proc.io_read_bytes),
             format_bytes(proc.io_write_bytes),
             exe_display,
-            proc.command,
         )
     };
 
@@ -943,26 +926,67 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
 
 /// Draw error message
 pub fn draw_error(frame: &mut Frame, app: &mut App, error: &str) {
-    let area = centered_rect_fixed(60, 5, frame.area());
+    app.sync_error_scroll();
+    let width = frame.area().width.min(60);
+    let lines: Vec<Line> = error
+        .lines()
+        .flat_map(|line| wrap_text(line, width.saturating_sub(2).max(1) as usize))
+        .map(Line::from)
+        .collect();
+    let height = lines.len().saturating_add(3).min(u16::MAX as usize) as u16;
+    let area = centered_rect_fixed(width, height, frame.area());
     let theme = &app.theme;
-
-    let dialog = Paragraph::new(format!("\n{}\n\nPress any key to dismiss", error))
-        .block(
-            Block::default()
-                .title(" Error ")
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(theme.failed_read))
-                .style(Style::default().bg(theme.background)),
-        )
-        .style(Style::default().fg(theme.failed_read).bg(theme.background))
-        .wrap(Wrap { trim: true });
-
+    let style = Style::default().fg(theme.failed_read).bg(theme.background);
+    let block = Block::default()
+        .title(" Error ")
+        .borders(Borders::ALL)
+        .border_style(style)
+        .style(style);
+    let inner = block.inner(area);
+    let visible = inner.height.saturating_sub(1) as usize;
+    app.error_visible_rows = visible;
+    app.error_scroll = app
+        .error_scroll
+        .min(lines.len().saturating_sub(visible.max(1)));
     frame.render_widget(Clear, area);
-    frame.render_widget(dialog, area);
+    frame.render_widget(block, area);
+    let content_area = Rect {
+        height: visible as u16,
+        ..inner
+    };
+    frame.render_widget(
+        Paragraph::new(
+            lines
+                .into_iter()
+                .skip(app.error_scroll)
+                .take(visible)
+                .collect::<Vec<_>>(),
+        )
+        .style(style),
+        content_area,
+    );
+    if inner.height > 0 {
+        let hint = if width >= 50 {
+            "↑/↓ PgUp/PgDn scroll; other keys dismiss"
+        } else if width >= 24 {
+            "↑/↓ scroll; Esc close"
+        } else {
+            "Esc"
+        };
+        frame.render_widget(
+            Paragraph::new(hint).style(style),
+            Rect {
+                y: inner.y + inner.height - 1,
+                height: 1,
+                ..inner
+            },
+        );
+    }
     cache_dialog_geometry(app, area);
 }
 
 fn truncate_str(s: &str, max_len: usize) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
     use unicode_width::UnicodeWidthStr;
 
     if s.width() <= max_len {
@@ -972,13 +996,13 @@ fn truncate_str(s: &str, max_len: usize) -> String {
     } else {
         let mut result = String::with_capacity(max_len + 3);
         let mut current_width = 0;
-        for c in s.chars() {
-            let char_width = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        for c in s.graphemes(true) {
+            let char_width = c.width();
             if current_width + char_width >= max_len {
                 result.push('\u{2026}'); // ellipsis
                 break;
             }
-            result.push(c);
+            result.push_str(c);
             current_width += char_width;
         }
         result
@@ -1021,7 +1045,7 @@ pub fn draw_user_select(frame: &mut Frame, app: &mut App) {
     render_list_dialog(frame, app, area, block, style, items, index, 0, 0);
 }
 
-/// Draw environment variables dialog
+/// Explain that environment inspection is unavailable.
 pub fn draw_environment(frame: &mut Frame, app: &mut App) {
     let DialogState::Environment { identity, .. } = &app.dialog else {
         return;
@@ -1034,15 +1058,14 @@ pub fn draw_environment(frame: &mut Frame, app: &mut App) {
         .process_by_identity(identity)
         .map(|proc| {
             format!(
-                "Environment Variables for {} (PID: {})\n\n\
-             Note: Environment variables cannot be read from \n\
-             other processes on Windows without elevated privileges.\n\n\
-             Command line:\n{}\n\n\
-             Press Esc to close",
-                proc.name, proc.pid, proc.command
+                "{} (PID: {})\n\nEnvironment inspection is not implemented.\n\nPress Esc to close",
+                proc.name, proc.pid
             )
         })
-        .unwrap_or_else(|| "No process selected".to_string());
+        .unwrap_or_else(|| {
+            "Environment inspection is not implemented.\n\nProcess is no longer available."
+                .to_string()
+        });
 
     let wrap_width = area.width.saturating_sub(2) as usize;
     let lines: Vec<Line> = content
@@ -1148,7 +1171,7 @@ pub fn draw_gpu_select(frame: &mut Frame, app: &mut App) {
     render_list_dialog(frame, app, area, block, style, items, index, 0, 0);
 }
 
-/// Draw wrapped command display dialog
+/// Draw wrapped executable path (arguments are not collected).
 pub fn draw_command_wrap(frame: &mut Frame, app: &mut App) {
     let DialogState::CommandWrap { identity, .. } = &app.dialog else {
         return;
@@ -1161,19 +1184,13 @@ pub fn draw_command_wrap(frame: &mut Frame, app: &mut App) {
         let mut lines = vec![
             format!("Process: {} (PID: {})", proc.name, proc.pid),
             String::new(),
-            "Command Line:".to_string(),
+            "Executable path (or process name):".to_string(),
             String::new(),
         ];
 
-        // Wrap command and path with a 2-space indent
+        // The historical command field contains only an executable path/name.
         let max_width = area.width.saturating_sub(4) as usize;
         for segment in wrap_text(&proc.command, max_width) {
-            lines.push(format!("  {}", segment));
-        }
-
-        lines.push(String::new());
-        lines.push("Executable Path:".to_string());
-        for segment in wrap_text(&proc.exe_path, max_width) {
             lines.push(format!("  {}", segment));
         }
 
@@ -1188,7 +1205,7 @@ pub fn draw_command_wrap(frame: &mut Frame, app: &mut App) {
         return;
     };
     let block = Block::default()
-        .title(" Command Line (w to close) ")
+        .title(" Executable Path (w to close) ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme.border))
         .style(Style::default().bg(theme.background));
@@ -1327,6 +1344,15 @@ pub fn draw_affinity(frame: &mut Frame, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::wrap_text;
+
+    #[test]
+    fn input_and_dialog_truncation_keep_whole_graphemes() {
+        let text = "x👍🏽A";
+        assert_eq!(super::input_window(text, text.len(), 3), ("👍🏽A".into(), 3));
+        assert_eq!(super::input_window("👍🏽", "👍🏽".len(), 1), (String::new(), 0));
+        assert_eq!(super::truncate_str("👍🏽AB", 3), "👍🏽…");
+        assert_eq!(wrap_text("👍🏽AB", 2), ["👍🏽", "AB"]);
+    }
 
     #[test]
     fn wrap_text_short_line_unchanged() {
