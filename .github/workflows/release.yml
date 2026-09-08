@@ -90,9 +90,11 @@ jobs:
               )
           PY
 
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "version=$PACKAGE_VERSION" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$TAG"
+            echo "sha=$SHA"
+            echo "version=$PACKAGE_VERSION"
+          } >> "$GITHUB_OUTPUT"
           VERSION_WITHOUT_BUILD="${PACKAGE_VERSION%%+*}"
           if [[ "$VERSION_WITHOUT_BUILD" == *-* ]]; then
             echo "prerelease=true" >> "$GITHUB_OUTPUT"
