@@ -1,0 +1,23 @@
+name: Actions policy
+
+on:
+  push:
+    paths:
+      - '.github/workflows/**'
+      - '.github/dependabot.yml'
+  pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/dependabot.yml'
+  schedule:
+    - cron: '47 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    uses: faratech/ci-standards/.github/workflows/actions-policy.yml@main
+    with:
+      policy_strict: false
