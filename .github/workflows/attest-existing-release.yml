@@ -1,0 +1,38 @@
+name: Attest Existing Release Verification
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag in the reviewed verification manifest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify-and-attest:
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify reviewed hashes and all Windows signatures
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: python .github/scripts/verify-existing-release.py
+      - name: Attest verification of existing release bytes
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: release-assets/*
+          predicate-type: https://faratech.dev/attestations/windows-release-verification/v1
+          predicate-path: release-verification-predicate.json

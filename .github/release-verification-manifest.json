@@ -1,0 +1,25 @@
+{
+  "repository": "faratech/htop-win",
+  "releases": {
+    "v0.2.8": [
+      {
+        "name": "htop-win-amd64.exe",
+        "sha256": "2397e40d3fabd9f1a5a11c9c95b3ef2e6e48e029a4a0a4cd290b98c312ce6af4"
+      },
+      {
+        "name": "htop-win-arm64.exe",
+        "sha256": "434ad57a30cb89becb4f76b4b9102a32a07e1a49b6536f68fe1058579f609598"
+      }
+    ],
+    "v0.2.9": [
+      {
+        "name": "htop-win-amd64.exe",
+        "sha256": "9e3e4addba77e8b1171a214c942ea0b9236f21b46eeb70ee6049752caf0760e9"
+      },
+      {
+        "name": "htop-win-arm64.exe",
+        "sha256": "9b0961424d2f88c0e84809c0ab9bab4fc2568af41a9d3c73ac8e1c54f34dbb20"
+      }
+    ]
+  }
+}
