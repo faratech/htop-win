@@ -33,7 +33,22 @@ jobs:
           }
           Write-Host "Found $($files.Count) executable(s) to sign."
 
-      - name: Sign executables with Azure Trusted Signing
+      - name: Sign with Fara Technologies LLC (primary)
+        uses: Azure/trusted-signing-action@v2.0.0
+        with:
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: 'https://eus.codesigning.azure.net/'
+          trusted-signing-account-name: 'faraCodeSigningBusiness'
+          certificate-profile-name: 'Faratech'
+          files-folder: '${{ github.workspace }}\binaries'
+          files-folder-filter: '*.exe'
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Append Mike Fara signature
         uses: Azure/trusted-signing-action@v2.0.0
         with:
           azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -44,6 +59,26 @@ jobs:
           certificate-profile-name: 'MikeFara'
           files-folder: '${{ github.workspace }}\binaries'
           files-folder-filter: '*.exe'
+          append-signature: true
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      - name: Verify both embedded signatures
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object { [version]$_.Directory.Parent.Name } -Descending | Select-Object -First 1
+          if (-not $tool) { throw 'x64 signtool.exe not found' }
+          $files = @(Get-ChildItem -LiteralPath 'binaries' -Filter '*.exe' -File)
+          if ($files.Count -eq 0) { throw 'No signed executables found' }
+          foreach ($file in $files) {
+            & $tool.FullName verify /pa /all /v $file.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Signature verification failed: $file" }
+            & $tool.FullName verify /pa /ds 1 $file.FullName
+            if ($LASTEXITCODE -ne 0) { throw "Second signature missing or invalid: $file" }
+          }
 
       - name: Generate artifact attestation
         uses: actions/attest-build-provenance@v4
