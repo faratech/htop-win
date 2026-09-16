@@ -83,6 +83,13 @@ fn read_pe_file_version(path: &std::path::Path) -> Option<String> {
         {
             return None;
         }
+        // SAFETY: every precondition is checked above — `data` is alive and
+        // `size` bytes long, VerQueryValueW reported success for the root
+        // value, `fixed` is non-null and `len` is at least the size of
+        // VS_FIXEDFILEINFO. `fixed` points into `data`, so the unaligned read
+        // stays in bounds; the signature check below gates interpretation of
+        // the fields, not memory validity. (CodeQL cannot model the Win32
+        // contract binding `fixed` to `data` and may still report this line.)
         let v = fixed.cast::<VS_FIXEDFILEINFO>().read_unaligned();
         if v.dwSignature != 0xfeef04bd {
             return None;
