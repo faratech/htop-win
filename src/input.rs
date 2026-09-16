@@ -936,7 +936,7 @@ fn handle_gpu_select_keys(app: &mut App, key: KeyEvent) -> bool {
                 _ => None,
             };
             app.config.gpu_meter_adapter = choice;
-            crate::system::set_gpu_selection(app.config.gpu_meter_adapter.clone());
+            crate::system::set_gpu_selection(app.config.gpu_meter_adapter.as_deref());
             app.mark_config_dirty();
             app.save_config();
             app.dialog = DialogState::Setup {

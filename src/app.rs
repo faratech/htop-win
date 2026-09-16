@@ -2,7 +2,7 @@ use crate::config::Config;
 use crate::system::{ProcessIdentity, ProcessInfo, SystemMetrics};
 use crate::terminal::Rect;
 use crate::ui::colors::Theme;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 // ============================================================================
@@ -650,6 +650,33 @@ impl TerminationRequest {
 }
 
 /// Resolve ancestry from this snapshot, rejecting reused or unknown parents.
+/// Index-space equivalents of the old pid-keyed HashMaps in `build_tree`:
+/// pid→index, validated parent links, and children as CSR arrays. Buffers are
+/// cleared and reused across ticks; only tree glyphs/prefixes allocate.
+#[derive(Default)]
+struct TreeScratch {
+    idx_of: HashMap<u32, u32>,
+    parent_idx: Vec<u32>,
+    child_cnt: Vec<u32>,
+    child_off: Vec<u32>,
+    child_list: Vec<u32>,
+    visited: Vec<bool>,
+    suppressed: Vec<bool>,
+    slots: Vec<Option<ProcessInfo>>,
+    stack: Vec<PendingNode>,
+}
+
+/// DFS work item for `build_tree`.
+#[derive(Debug)]
+struct PendingNode {
+    idx: u32,
+    depth: usize,
+    is_last: bool,
+    /// Shared prefix of the parent: siblings bump the refcount instead of
+    /// each cloning the whole ancestor chain (O(depth) allocs).
+    parent_prefix: std::sync::Arc<str>,
+}
+
 fn validated_parents(processes: &[ProcessInfo]) -> std::collections::HashMap<u32, u32> {
     let times: std::collections::HashMap<_, _> = processes
         .iter()
@@ -831,6 +858,11 @@ pub struct App {
 
     /// Collapsed process identities in tree view.
     pub collapsed_pids: HashSet<ProcessIdentity>,
+    /// Reusable index-space buffers for `build_tree` (cleared, not reallocated).
+    tree_scratch: TreeScratch,
+    /// Spare buffer for `displayed_processes` (same recycle pattern as the
+    /// collector's snapshot vec).
+    displayed_scratch: Vec<ProcessInfo>,
     /// Follow mode: stable identity to follow across refreshes.
     pub follow_pid: Option<ProcessIdentity>,
     /// Pause updates
@@ -989,6 +1021,8 @@ impl App {
             config_dirty: false,
             config_save_failed: false,
             collapsed_pids: HashSet::new(),
+            tree_scratch: TreeScratch::default(),
+            displayed_scratch: Vec::new(),
             follow_pid: None,
             paused: false,
             pid_search_buffer: String::new(),
@@ -1682,12 +1716,55 @@ impl App {
         crate::system::set_npu_process_stats_enabled(npu_wanted);
 
         // Keep the pinned-GPU selection in sync with config (Setup can change it).
-        crate::system::set_gpu_selection(self.config.gpu_meter_adapter.clone());
+        crate::system::set_gpu_selection(self.config.gpu_meter_adapter.as_deref());
     }
 
     /// Canonical metadata the collector must populate for the active
     /// filter/sort/dialog. The default returns no requirements, keeping normal
     /// steady-state collection free of all-process Windows calls.
+    /// Which collector subsystems the visible UI actually needs this tick.
+    /// Computed from the same layout arithmetic the header renders with
+    /// (`ui::header::filler_plan`), so a gated-off collector is never one the
+    /// user could see. Pushed to the collector on change by the event loop.
+    pub fn canonical_collect_requirements(&self) -> u8 {
+        use crate::system::collect_gates;
+        use crate::config::MeterMode;
+
+        if !self.show_header {
+            // Nothing in the header renders, so no subsystem is needed.
+            return 0;
+        }
+
+        let mut bits = 0u8;
+        if self.config.show_cpu_meters && self.config.cpu_meter_mode != MeterMode::Hidden {
+            bits |= collect_gates::CPU;
+        }
+
+        // Net / Dsk / Bat are filler meters; their visibility comes from the
+        // layout plan. (Disk has no dedicated collector — its rates ride with
+        // the process scan — so only NET and BATTERY are gated here.)
+        let plan = crate::ui::filler_plan(self);
+        if plan[0] {
+            bits |= collect_gates::NET;
+        }
+        if plan[2] {
+            bits |= collect_gates::BATTERY;
+        }
+
+        // GPU/NPU: collect while the meter is enabled OR an adapter is already
+        // tracked (presence is then known when the meter is re-enabled, and
+        // hardware-aware default columns keep working).
+        let gpu_meter_on =
+            self.config.show_gpu_meter && self.config.gpu_meter_mode != MeterMode::Hidden;
+        let npu_meter_on =
+            self.config.show_npu_meter && self.config.npu_meter_mode != MeterMode::Hidden;
+        if gpu_meter_on || npu_meter_on || crate::system::has_tracked_adapters() {
+            bits |= collect_gates::GPU | collect_gates::NPU;
+        }
+
+        bits
+    }
+
     pub fn canonical_enrichment_requirements(
         &self,
     ) -> crate::system::ProcessEnrichmentRequirements {
@@ -1737,36 +1814,55 @@ impl App {
             return;
         }
 
-        let live_identities: HashSet<ProcessIdentity> =
-            self.processes.iter().map(ProcessInfo::identity).collect();
-        self.tagged_pids
-            .retain(|identity| live_identities.contains(identity));
-        if self
-            .follow_pid
-            .is_some_and(|identity| !live_identities.contains(&identity))
-        {
-            self.follow_pid = None;
+        // Identity pruning needs the live set only when something actually
+        // references it: a non-empty tag/follow set, or an oversized collapsed
+        // set. In the common steady state (no tags, no follow, modest
+        // collapsed set) none of the retains below would remove anything, so
+        // skip the O(n) hashed build entirely. Outcomes are identical: each
+        // retain below runs exactly when its guard set is non-trivial.
+        let live_identities: Option<HashSet<ProcessIdentity>> = (!self.tagged_pids.is_empty()
+            || self.follow_pid.is_some()
+            || self.collapsed_pids.len() > process_count * 2)
+            .then(|| self.processes.iter().map(ProcessInfo::identity).collect());
+        if let Some(live) = live_identities.as_ref() {
+            self.tagged_pids.retain(|identity| live.contains(identity));
+            if self
+                .follow_pid
+                .is_some_and(|identity| !live.contains(&identity))
+            {
+                self.follow_pid = None;
+            }
         }
 
         // Prune stale collapsed PIDs only when the set has grown disproportionate to
         // the live process count. Otherwise `collapsed_pids` grows unbounded over long
         // uptime (each collapse_all adds every PID; dead/reused PIDs are never removed).
-        if self.collapsed_pids.len() > process_count * 2 {
+        if self.collapsed_pids.len() > process_count * 2
+            && let Some(live) = live_identities.as_ref()
+        {
             self.collapsed_pids
-                .retain(|identity| live_identities.contains(identity));
+                .retain(|identity| live.contains(identity));
         }
 
-        let mut processes: Vec<ProcessInfo> = Vec::with_capacity(process_count);
+        // Reuse the previous displayed list's buffer (capacity included) for
+        // this pass; the old list moves to the spare slot at the end.
+        let mut processes = std::mem::take(&mut self.displayed_scratch);
+        processes.clear();
+        processes.reserve(process_count);
         processes.extend(
             self.processes
                 .iter()
                 .filter(|p| {
                     // Kernel/System threads filter
-                    // On Windows, "kernel threads" are SYSTEM user processes
-                    let is_kernel = &*p.user_lower == "system"
-                        || p.user_lower.starts_with("nt authority")
-                        || p.pid == 0
-                        || p.pid == 4;
+                    // On Windows, "kernel threads" are SYSTEM user processes.
+                    // The string checks are dead when both flags are on (the
+                    // default): every process passes both guards regardless.
+                    let kernel_check_needed = !show_kernel || !show_user;
+                    let is_kernel = kernel_check_needed
+                        && (&*p.user_lower == "system"
+                            || p.user_lower.starts_with("nt authority")
+                            || p.pid == 0
+                            || p.pid == 4);
 
                     if !show_kernel && is_kernel {
                         return false;
@@ -1801,20 +1897,18 @@ impl App {
                     }
                     true
                 })
-                .cloned(),
+                .map(|p| {
+                    // Tag the render-time search flag during the single
+                    // filter/clone pass instead of a second sweep. Fresh
+                    // clones start with matches_search=false (from_raw), so
+                    // assigning unconditionally is exactly equivalent.
+                    let mut cloned = p.clone();
+                    cloned.matches_search = has_search
+                        && (cloned.name_lower.contains(&self.search_string_lower)
+                            || cloned.command_lower.contains(&self.search_string_lower));
+                    cloned
+                }),
         );
-
-        // Set matches_search flag on each process (for render-time highlighting)
-        if has_search {
-            for proc in &mut processes {
-                proc.matches_search = proc.name_lower.contains(&self.search_string_lower)
-                    || proc.command_lower.contains(&self.search_string_lower);
-            }
-        } else {
-            for proc in &mut processes {
-                proc.matches_search = false;
-            }
-        }
 
         // Sort processes
         self.sort_processes(&mut processes);
@@ -1824,7 +1918,9 @@ impl App {
             processes = self.build_tree(processes);
         }
 
-        self.displayed_processes = processes;
+        // Swap buffers: the old displayed vec becomes the next pass's scratch.
+        let old = std::mem::replace(&mut self.displayed_processes, processes);
+        self.displayed_scratch = old;
 
         // Normal viewing is anchored to the row, not the process: dynamic
         // sorting must not drag the viewport around. Action handlers capture
@@ -1954,7 +2050,7 @@ impl App {
                         SortColumn::StartTime => a.start_time.cmp(&b.start_time),
                         SortColumn::Command => a.command.cmp(&b.command),
                         SortColumn::Elevated => a.is_elevated.cmp(&b.is_elevated),
-                        SortColumn::Arch => a.arch.as_str().cmp(b.arch.as_str()),
+                        SortColumn::Arch => a.arch.sort_rank().cmp(&b.arch.sort_rank()),
                         SortColumn::Efficiency => a.efficiency_mode.cmp(&b.efficiency_mode),
                         SortColumn::HandleCount => a.handle_count.cmp(&b.handle_count),
                         SortColumn::IoRate => (a.io_read_rate + a.io_write_rate)
@@ -1987,113 +2083,175 @@ impl App {
         }
     }
 
-    fn build_tree(&self, processes: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
-        use std::collections::HashMap;
+    fn build_tree(&mut self, processes: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
+        use std::sync::Arc;
 
-        #[derive(Debug)]
-        struct PendingNode {
-            pid: u32,
-            depth: usize,
-            is_last: bool,
-            parent_prefix: String,
-        }
+        const NONE: u32 = u32::MAX;
+        let scratch = &mut self.tree_scratch;
+        let TreeScratch {
+            idx_of,
+            parent_idx,
+            child_cnt,
+            child_off,
+            child_list,
+            visited,
+            suppressed,
+            slots,
+            stack,
+        } = scratch;
 
         let process_count = processes.len();
-        let parents = validated_parents(&processes);
-        let order: Vec<u32> = processes.iter().map(|process| process.pid).collect();
-        let roots: Vec<u32> = processes
-            .iter()
-            .filter(|process| !parents.contains_key(&process.pid))
-            .map(|process| process.pid)
-            .collect();
-        let mut children: HashMap<u32, Vec<u32>> = HashMap::with_capacity(process_count / 4);
-        let mut nodes: HashMap<u32, ProcessInfo> = HashMap::with_capacity(process_count);
-        for process in processes {
-            if let Some(parent) = parents.get(&process.pid) {
-                children.entry(*parent).or_default().push(process.pid);
-            }
-            nodes.insert(process.pid, process);
+
+        // pid → index (last occurrence wins, matching the old HashMap insert).
+        idx_of.clear();
+        idx_of.reserve(process_count);
+        for (idx, process) in processes.iter().enumerate() {
+            idx_of.insert(process.pid, idx as u32);
         }
 
+        // Validated parent links in index space, with the same rules as
+        // `validated_parents` (parent in list, nonzero create times, parent
+        // not created after the child).
+        parent_idx.clear();
+        parent_idx.reserve(process_count);
+        child_cnt.clear();
+        child_cnt.resize(process_count, 0);
+        for process in processes.iter() {
+            let validated = (process.parent_pid != 0 && process.parent_pid != process.pid)
+                .then(|| idx_of.get(&process.parent_pid).copied())
+                .flatten()
+                .filter(|&parent| {
+                    let parent_time = processes[parent as usize].create_time_100ns;
+                    parent_time != 0
+                        && process.create_time_100ns != 0
+                        && parent_time <= process.create_time_100ns
+                });
+            match validated {
+                Some(parent) => {
+                    parent_idx.push(parent);
+                    child_cnt[parent as usize] += 1;
+                }
+                None => parent_idx.push(NONE),
+            }
+        }
+
+        // CSR children arrays, children in original (sort) order per parent.
+        child_off.clear();
+        child_off.resize(process_count + 1, 0);
+        for i in 0..process_count {
+            child_off[i + 1] = child_off[i] + child_cnt[i];
+        }
+        child_list.clear();
+        child_list.resize(child_off[process_count] as usize, 0);
+        let mut fill = child_off[..process_count].to_vec();
+        for (idx, &parent) in parent_idx.iter().enumerate() {
+            if parent != NONE {
+                let slot = &mut fill[parent as usize];
+                child_list[*slot as usize] = idx as u32;
+                *slot += 1;
+            }
+        }
+        drop(fill);
+
+        visited.clear();
+        visited.resize(process_count, false);
+        suppressed.clear();
+        suppressed.resize(process_count, false);
+        slots.clear();
+        slots.extend(processes.into_iter().map(Some));
+
         let mut result = Vec::with_capacity(process_count);
-        let mut visited = HashSet::with_capacity(process_count);
-        let mut suppressed = HashSet::new();
 
         // Traverse rooted components first, then cycle-only components in the
-        // original sort order. Iteration avoids both the old depth cutoff and
-        // call-stack overflow while the visited set emits every node once.
-        let mut component_roots = roots;
-        component_roots.extend(order.iter().copied());
-        for root_pid in component_roots {
-            if visited.contains(&root_pid) || suppressed.contains(&root_pid) {
-                continue;
-            }
-            let mut stack = vec![PendingNode {
-                pid: root_pid,
-                depth: 0,
-                is_last: true,
-                parent_prefix: String::new(),
-            }];
-            while let Some(pending) = stack.pop() {
-                if !visited.insert(pending.pid) || suppressed.contains(&pending.pid) {
+        // original sort order (the old `roots ++ order` iteration). Iteration
+        // avoids both the old depth cutoff and call-stack overflow while the
+        // visited set emits every node once.
+        stack.clear();
+        stack.reserve(process_count);
+        for pass in 0..2 {
+            for start in 0..process_count as u32 {
+                if pass == 0 && parent_idx[start as usize] != NONE {
+                    continue; // pass 0: validated roots only
+                }
+                if visited[start as usize] || suppressed[start as usize] {
                     continue;
                 }
-                let Some(mut process) = nodes.remove(&pending.pid) else {
-                    continue;
-                };
-                let identity = process.identity();
-                let child_pids = children.get(&pending.pid).cloned().unwrap_or_default();
-                let is_collapsed = self.collapsed_pids.contains(&identity);
-
-                process.tree_depth = pending.depth;
-                process.has_children = !child_pids.is_empty();
-                process.is_collapsed = is_collapsed;
-                process.tree_prefix = if pending.depth == 0 {
-                    String::new()
-                } else {
-                    let branch = if pending.is_last {
-                        "└─ "
-                    } else {
-                        "├─ "
-                    };
-                    let mut prefix = pending.parent_prefix.clone();
-                    prefix.push_str(branch);
-                    prefix
-                };
-                result.push(process);
-
-                if is_collapsed {
-                    // Descendants of a collapsed node are intentionally hidden,
-                    // not orphans. Mark the entire branch so fallback traversal
-                    // cannot append it at the top level.
-                    let mut descendants = child_pids;
-                    while let Some(descendant) = descendants.pop() {
-                        if visited.contains(&descendant) || !suppressed.insert(descendant) {
-                            continue;
-                        }
-                        if let Some(grandchildren) = children.get(&descendant) {
-                            descendants.extend(grandchildren.iter().copied());
-                        }
+                stack.push(PendingNode {
+                    idx: start,
+                    depth: 0,
+                    is_last: true,
+                    parent_prefix: Arc::from(""),
+                });
+                while let Some(pending) = stack.pop() {
+                    let pending_idx = pending.idx as usize;
+                    if visited[pending_idx] || suppressed[pending_idx] {
+                        continue;
                     }
-                    continue;
-                }
+                    visited[pending_idx] = true;
+                    let Some(mut process) = slots[pending_idx].take() else {
+                        continue;
+                    };
+                    let identity = process.identity();
+                    let child_range =
+                        child_off[pending_idx] as usize..child_off[pending_idx + 1] as usize;
+                    let child_slice = &child_list[child_range];
+                    let is_collapsed = self.collapsed_pids.contains(&identity);
 
-                let mut child_parent_prefix = if pending.depth == 0 {
-                    String::new()
-                } else {
-                    pending.parent_prefix
-                };
-                if pending.depth > 0 {
-                    child_parent_prefix.push_str(if pending.is_last { "   " } else { "│  " });
-                }
-                let child_count = child_pids.len();
-                for (index, child_pid) in child_pids.into_iter().enumerate().rev() {
-                    stack.push(PendingNode {
-                        pid: child_pid,
-                        depth: pending.depth + 1,
-                        is_last: index + 1 == child_count,
-                        parent_prefix: child_parent_prefix.clone(),
-                    });
+                    process.tree_depth = pending.depth.min(u16::MAX as usize) as u16;
+                    process.has_children = !child_slice.is_empty();
+                    process.is_collapsed = is_collapsed;
+                    process.tree_prefix = if pending.depth == 0 {
+                        String::new()
+                    } else {
+                        let branch = if pending.is_last { "└─ " } else { "├─ " };
+                        // One allocation sized up front; the old clone-then-push
+                        // allocated twice (clone at parent length, then regrow).
+                        let mut prefix =
+                            String::with_capacity(pending.parent_prefix.len() + branch.len());
+                        prefix.push_str(&pending.parent_prefix);
+                        prefix.push_str(branch);
+                        prefix
+                    };
+                    result.push(process);
+
+                    if is_collapsed {
+                        // Descendants of a collapsed node are intentionally
+                        // hidden, not orphans. Mark the entire branch so the
+                        // fallback traversal cannot append it at the top level.
+                        let mut descendants: Vec<u32> = child_slice.to_vec();
+                        while let Some(descendant) = descendants.pop() {
+                            let d = descendant as usize;
+                            if visited[d] || suppressed[d] {
+                                continue;
+                            }
+                            suppressed[d] = true;
+                            let d_range = child_off[d] as usize..child_off[d + 1] as usize;
+                            descendants.extend_from_slice(&child_list[d_range]);
+                        }
+                        continue;
+                    }
+
+                    // One shared allocation per visited node; every child bumps
+                    // the refcount instead of cloning the ancestor chain.
+                    let child_parent_prefix: Arc<str> = if pending.depth == 0 {
+                        Arc::from("")
+                    } else {
+                        let continuation = if pending.is_last { "   " } else { "│  " };
+                        let mut prefix =
+                            String::with_capacity(pending.parent_prefix.len() + continuation.len());
+                        prefix.push_str(&pending.parent_prefix);
+                        prefix.push_str(continuation);
+                        Arc::from(prefix)
+                    };
+                    let child_count = child_slice.len();
+                    for (index, &child) in child_slice.iter().enumerate().rev() {
+                        stack.push(PendingNode {
+                            idx: child,
+                            depth: pending.depth + 1,
+                            is_last: index + 1 == child_count,
+                            parent_prefix: child_parent_prefix.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -2956,14 +3114,14 @@ mod tests {
             exe_path: Arc::from(""),
             command: Arc::from(name.clone()),
             user: Arc::from("user"),
-            status: 'S',
+            status: b'S',
             cpu_percent: 0.0,
             mem_percent: 0.0,
             virtual_mem: 0,
             resident_mem: 0,
             shared_mem: 0,
             priority: 8,
-            cpu_time: Duration::ZERO,
+            cpu_time: 0,
             tree_depth: 0,
             tree_prefix: String::new(),
             has_children: false,
@@ -3107,7 +3265,7 @@ mod tests {
             app.sort_column = SortColumn::Pid;
             app.sort_ascending = true;
             app.update_displayed_processes();
-            assert_eq!(app.displayed_processes[1].tree_depth, usize::from(linked));
+            assert_eq!(usize::from(app.displayed_processes[1].tree_depth), usize::from(linked));
             app.tag_with_children();
             assert_eq!(app.tagged_pids.len(), if linked { 3 } else { 1 });
             app.selected_index = 1;
@@ -3300,7 +3458,7 @@ mod tests {
                         p.npu_percent = value as f32;
                         p.io_read_rate = value as u64;
                         p.resident_mem = value as u64;
-                        p.cpu_time = Duration::from_secs(value as u64);
+                        p.cpu_time = value as u64 * 10_000_000;
                     }
                     app.update_displayed_processes();
                     if tick == 0 {
@@ -3628,5 +3786,194 @@ mod tests {
             app.select_up();
         }
         assert_eq!(app.scroll_offset, 0);
+    }
+
+    /// Reference implementation of the pre-index build_tree algorithm
+    /// (pid-keyed HashMaps), used to prove the index-space rewrite emits
+    /// identical order and stamps.
+    fn reference_build_tree(
+        processes: Vec<ProcessInfo>,
+        collapsed_pids: &HashSet<ProcessIdentity>,
+    ) -> Vec<ProcessInfo> {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        #[derive(Debug)]
+        struct PendingNode {
+            pid: u32,
+            depth: usize,
+            is_last: bool,
+            parent_prefix: Arc<str>,
+        }
+
+        let process_count = processes.len();
+        let parents = validated_parents(&processes);
+        let order: Vec<u32> = processes.iter().map(|process| process.pid).collect();
+        let roots: Vec<u32> = processes
+            .iter()
+            .filter(|process| !parents.contains_key(&process.pid))
+            .map(|process| process.pid)
+            .collect();
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::with_capacity(process_count / 4);
+        let mut nodes: HashMap<u32, ProcessInfo> = HashMap::with_capacity(process_count);
+        for process in processes {
+            if let Some(parent) = parents.get(&process.pid) {
+                children.entry(*parent).or_default().push(process.pid);
+            }
+            nodes.insert(process.pid, process);
+        }
+
+        let mut result = Vec::with_capacity(process_count);
+        let mut visited = HashSet::with_capacity(process_count);
+        let mut suppressed = HashSet::new();
+
+        let mut component_roots = roots;
+        component_roots.extend(order.iter().copied());
+        for root_pid in component_roots {
+            if visited.contains(&root_pid) || suppressed.contains(&root_pid) {
+                continue;
+            }
+            let mut stack = vec![PendingNode {
+                pid: root_pid,
+                depth: 0,
+                is_last: true,
+                parent_prefix: Arc::from(""),
+            }];
+            while let Some(pending) = stack.pop() {
+                if !visited.insert(pending.pid) || suppressed.contains(&pending.pid) {
+                    continue;
+                }
+                let Some(mut process) = nodes.remove(&pending.pid) else {
+                    continue;
+                };
+                let identity = process.identity();
+                let child_pids = children.remove(&pending.pid).unwrap_or_default();
+                let is_collapsed = collapsed_pids.contains(&identity);
+
+                process.tree_depth = pending.depth.min(u16::MAX as usize) as u16;
+                process.has_children = !child_pids.is_empty();
+                process.is_collapsed = is_collapsed;
+                process.tree_prefix = if pending.depth == 0 {
+                    String::new()
+                } else {
+                    let branch = if pending.is_last { "\u{2514}\u{2500} " } else { "\u{251c}\u{2500} " };
+                    let mut prefix =
+                        String::with_capacity(pending.parent_prefix.len() + branch.len());
+                    prefix.push_str(&pending.parent_prefix);
+                    prefix.push_str(branch);
+                    prefix
+                };
+                result.push(process);
+
+                if is_collapsed {
+                    let mut descendants = child_pids;
+                    while let Some(descendant) = descendants.pop() {
+                        if visited.contains(&descendant) || !suppressed.insert(descendant) {
+                            continue;
+                        }
+                        if let Some(grandchildren) = children.get(&descendant) {
+                            descendants.extend(grandchildren.iter().copied());
+                        }
+                    }
+                    continue;
+                }
+
+                let child_parent_prefix: Arc<str> = if pending.depth == 0 {
+                    Arc::from("")
+                } else {
+                    let continuation = if pending.is_last { "   " } else { "\u{2502}  " };
+                    let mut prefix =
+                        String::with_capacity(pending.parent_prefix.len() + continuation.len());
+                    prefix.push_str(&pending.parent_prefix);
+                    prefix.push_str(continuation);
+                    Arc::from(prefix)
+                };
+                let child_count = child_pids.len();
+                for (index, child_pid) in child_pids.into_iter().enumerate().rev() {
+                    stack.push(PendingNode {
+                        pid: child_pid,
+                        depth: pending.depth + 1,
+                        is_last: index + 1 == child_count,
+                        parent_prefix: child_parent_prefix.clone(),
+                    });
+                }
+            }
+        }
+
+        result
+    }
+
+    #[test]
+    fn index_build_tree_matches_reference_on_random_forests() {
+        // Deterministic LCG so failures reproduce.
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+
+        for scenario in 0..200 {
+            let count = (next() % 80) as u32;
+            // Unique pids from a sparse range, shuffled.
+            let mut pids: Vec<u32> = (1..=count * 2 + 2).map(|i| i * 3).collect();
+            for i in (1..pids.len()).rev() {
+                let j = (next() % (i as u64 + 1)) as usize;
+                pids.swap(i, j);
+            }
+            pids.truncate(count as usize);
+
+            let processes: Vec<ProcessInfo> = pids
+                .iter()
+                .map(|&pid| {
+                    let roll = next() % 10;
+                    let parent_pid = if roll < 3 {
+                        0 // root candidate
+                    } else if roll == 4 {
+                        pid // self-parent (invalid)
+                    } else if roll == 5 {
+                        99_999 // missing parent (invalid)
+                    } else {
+                        pids[(next() % pids.len() as u64) as usize] // cycle-prone
+                    };
+                    let mut p = process(pid, parent_pid);
+                    // Varied create times make some parent links invalid.
+                    p.create_time_100ns = 10_000 + (next() % 5) * 1_000 + pid as u64;
+                    p
+                })
+                .collect();
+
+            let mut app = App::new(Config::default());
+            app.tree_view = true;
+            // Collapse a random subset by identity.
+            for p in &processes {
+                if next() % 4 == 0 {
+                    app.collapsed_pids.insert(p.identity());
+                }
+            }
+
+            let expected = reference_build_tree(processes.clone(), &app.collapsed_pids);
+            let actual = app.build_tree(processes.clone());
+            let summary = |list: &[ProcessInfo]| -> Vec<(u32, u16, String, bool, bool)> {
+                list.iter()
+                    .map(|p| {
+                        (
+                            p.pid,
+                            p.tree_depth,
+                            p.tree_prefix.clone(),
+                            p.has_children,
+                            p.is_collapsed,
+                        )
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                summary(&actual),
+                summary(&expected),
+                "scenario {scenario} diverged ({} processes)",
+                processes.len()
+            );
+        }
     }
 }

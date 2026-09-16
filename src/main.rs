@@ -292,12 +292,14 @@ impl BenchmarkStats {
             let total: Duration = self.refresh_times.iter().sum();
             println!("║ REFRESH (system data collection)                             ║");
             println!(
-                "║   Total: {:>10.2?}  Avg: {:>10.2?}                       ║",
-                total, avg
+                "║   Total: {:>10}  Avg: {:>10}                       ║",
+                bench_ms(total),
+                bench_ms(avg)
             );
             println!(
-                "║   Min:   {:>10.2?}  Max: {:>10.2?}                       ║",
-                min, max
+                "║   Min:   {:>10}  Max: {:>10}                       ║",
+                bench_ms(min),
+                bench_ms(max)
             );
         }
 
@@ -310,12 +312,14 @@ impl BenchmarkStats {
             println!("╠══════════════════════════════════════════════════════════════╣");
             println!("║ DRAW (UI rendering)                                          ║");
             println!(
-                "║   Total: {:>10.2?}  Avg: {:>10.2?}                       ║",
-                total, avg
+                "║   Total: {:>10}  Avg: {:>10}                       ║",
+                bench_ms(total),
+                bench_ms(avg)
             );
             println!(
-                "║   Min:   {:>10.2?}  Max: {:>10.2?}                       ║",
-                min, max
+                "║   Min:   {:>10}  Max: {:>10}                       ║",
+                bench_ms(min),
+                bench_ms(max)
             );
         }
 
@@ -323,19 +327,29 @@ impl BenchmarkStats {
         println!("╠══════════════════════════════════════════════════════════════╣");
         println!("║ OVERALL                                                      ║");
         println!(
-            "║   Wall time:    {:>10.2?}                                  ║",
-            total_elapsed
+            "║   Wall time:    {:>10}                                  ║",
+            bench_ms(total_elapsed)
         );
         println!(
-            "║   CPU time:     {:>10.2?}                                  ║",
-            process_cpu_used
+            "║   CPU time:     {:>10}                                  ║",
+            bench_ms(process_cpu_used)
         );
+        // Integer tenths keep core::fmt's float machinery out of the binary.
+        let cpu_tenths = (cpu_percent * 10.0).round_ties_even() as i64;
         println!(
-            "║   CPU usage:    {:>10.1}%                                  ║",
-            cpu_percent
+            "║   CPU usage:    {:>10}%                                  ║",
+            format!("{}{}{}", cpu_tenths / 10, ".", cpu_tenths % 10)
         );
         println!("╚══════════════════════════════════════════════════════════════╝");
     }
+}
+
+/// Format a Duration as whole milliseconds with two decimals ("7.08ms"),
+/// computed with integer math so the benchmark report does not link
+/// Duration's precision-aware Debug formatting.
+fn bench_ms(duration: Duration) -> String {
+    let micros = duration.as_micros();
+    format!("{}.{:02}ms", micros / 1000, (micros % 1000) / 10)
 }
 
 /// True once mouse capture has been enabled, so restore only disables what was set.
@@ -352,6 +366,19 @@ fn restore_terminal() {
         let _ = execute!(stdout, DisableMouseCapture);
     }
     let _ = execute!(stdout, cursor::Show);
+}
+
+/// Extract the panic message without std's default-hook machinery (release
+/// hook only). Non-string payloads fall back to a fixed placeholder.
+#[cfg(not(debug_assertions))]
+fn panic_message<'a>(info: &'a std::panic::PanicHookInfo<'_>) -> &'a str {
+    if let Some(message) = info.payload().downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = info.payload().downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "Box<dyn Any>"
+    }
 }
 
 fn load_session_config(args: &Args) -> (Config, bool) {
@@ -440,24 +467,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (config, first_run) = load_session_config(&args);
     let mouse_enabled = config.mouse_enabled && !args.no_mouse;
 
-    // Restore the terminal before the default panic handler prints, so the
-    // message lands on the normal screen instead of the soon-to-vanish
-    // alternate one. Panic hooks still run before abort() under the release
-    // profile's panic = "abort". (In debug builds a background-thread panic
-    // restores while the UI thread keeps drawing; in release the process
-    // aborts immediately, so the hook's view is exact. In debug builds, make a
-    // background panic process-fatal too; continuing the UI after its collector
-    // or updater died would leave a deceptively frozen application.)
+    // Restore the terminal before the panic message prints, so it lands on
+    // the normal screen instead of the soon-to-vanish alternate one. Panic
+    // hooks still run before abort() under the release profile's panic =
+    // "abort". (In debug builds a background-thread panic restores while the
+    // UI thread keeps drawing; in release the process aborts immediately, so
+    // the hook's view is exact. In debug builds, make a background panic
+    // process-fatal too; continuing the UI after its collector or updater
+    // died would leave a deceptively frozen application.)
+    //
+    // Release uses a self-contained hook: chaining to the default hook would
+    // link std's panic formatter (thread names, backtrace note) into the
+    // binary for a message this small.
     let main_thread = std::thread::current().id();
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let background_panic = std::thread::current().id() != main_thread;
-        restore_terminal();
-        default_hook(info);
-        if background_panic {
-            std::process::abort();
-        }
-    }));
+    #[cfg(not(debug_assertions))]
+    {
+        use std::io::Write as _;
+        std::panic::set_hook(Box::new(move |info| {
+            let background_panic = std::thread::current().id() != main_thread;
+            restore_terminal();
+            let mut err = io::stderr().lock();
+            let _ = writeln!(err, "htop-win panicked: {}", panic_message(info));
+            if let Some(location) = info.location() {
+                let _ = writeln!(err, "at {location}");
+            }
+            if background_panic {
+                std::process::abort();
+            }
+        }));
+    }
+    #[cfg(debug_assertions)]
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let background_panic = std::thread::current().id() != main_thread;
+            restore_terminal();
+            default_hook(info);
+            if background_panic {
+                std::process::abort();
+            }
+        }));
+    }
 
     // Setup terminal. If this very first step fails there is nothing to
     // restore; every failure after it returns through run_tui to the single
@@ -647,30 +697,45 @@ fn run_app(
     collector: &data::DataCollector,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut last_tick = Instant::now();
-    let mut needs_redraw = true;
+    let mut last_enrichment_bits = u8::MAX; // force the first store
+    let mut last_collect_bits = u8::MAX; // force the first store
 
+    // Paint the initial state before blocking on input: the loop below draws
+    // only after handling events, so without this the first frame could wait
+    // a full tick.
+    let mut needs_redraw = {
+        let draw_start = Instant::now();
+        terminal.draw(|f| ui::draw(f, app))?;
+        if let Some(stats) = bench_stats.as_mut() {
+            stats.record_draw(draw_start.elapsed());
+        }
+        false
+    };
+
+    // Loop order: input → update-check → snapshot → deferred flush → draw.
+    // Input is handled against the frame the user can see (drawn last
+    // iteration); a keypress and a snapshot arriving in the same iteration
+    // collapse into ONE deferred update pass and one draw instead of two.
     loop {
-        collector.set_enrichment_requirements(app.canonical_enrichment_requirements());
+        // Requirements only change with config/dialog state; skip the atomic
+        // store when the bits are unchanged.
+        let requirements = app.canonical_enrichment_requirements();
+        let enrichment_bits = requirements.bits();
+        if enrichment_bits != last_enrichment_bits {
+            last_enrichment_bits = enrichment_bits;
+            collector.set_enrichment_requirements(requirements);
+        }
+
+        // Same change-detection for the collection gates (which subsystems
+        // refresh() collects, mirroring meter visibility).
+        let collect_bits = app.canonical_collect_requirements();
+        if collect_bits != last_collect_bits {
+            last_collect_bits = collect_bits;
+            system::set_collect_gates(collect_bits);
+        }
 
         // Read tick rate from app.config so it updates dynamically
         let tick_rate = Duration::from_millis(app.config.refresh_rate_ms);
-
-        // Flush deferred process list update before rendering
-        if app.needs_process_update {
-            app.update_displayed_processes();
-            app.needs_process_update = false;
-            needs_redraw = true;
-        }
-
-        // Draw UI only when needed (state changed)
-        if needs_redraw {
-            let draw_start = Instant::now();
-            terminal.draw(|f| ui::draw(f, app))?;
-            if let Some(stats) = bench_stats.as_mut() {
-                stats.record_draw(draw_start.elapsed());
-            }
-            needs_redraw = false;
-        }
 
         // Handle input against the displayed frame before applying another
         // collector snapshot below. Process action keys must capture the
@@ -767,6 +832,24 @@ fn run_app(
                     return Ok(());
                 }
             }
+        }
+
+        // Flush deferred process list update once, after any snapshot above,
+        // so a keypress + snapshot in the same iteration cost one pass.
+        if app.needs_process_update {
+            app.update_displayed_processes();
+            app.needs_process_update = false;
+            needs_redraw = true;
+        }
+
+        // Draw UI only when needed (state changed)
+        if needs_redraw {
+            let draw_start = Instant::now();
+            terminal.draw(|f| ui::draw(f, app))?;
+            if let Some(stats) = bench_stats.as_mut() {
+                stats.record_draw(draw_start.elapsed());
+            }
+            needs_redraw = false;
         }
 
         // Refresh I/O counters when process info dialog is open (at tick rate, even when paused)

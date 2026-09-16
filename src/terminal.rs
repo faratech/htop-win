@@ -12,7 +12,7 @@ use crossterm::{
     },
     terminal::{self, Clear as CtClear, ClearType},
 };
-use std::io::{self, Stdout, Write};
+use std::io::{self, BufWriter, Stdout, Write};
 
 // ============================================================================
 // Layout types
@@ -552,37 +552,53 @@ impl<'a> From<Span<'a>> for Text<'a> {
 /// 15 bytes covers everything the UI draws cell-by-cell: ASCII, box-drawing
 /// glyphs (3 B), CJK ideographs (3 B), emoji with variation selectors (7 B)
 /// and regional-indicator flag pairs (8 B). Longer grapheme clusters (ZWJ
-/// sequences) fall back to the heap. With this size the whole [`Symbol`]
-/// occupies the same 24 bytes the old `String` field did, so buffers are no
-/// bigger than before - they just stop allocating one `String` per cell.
+/// sequences) fall back to the heap.
 const SYMBOL_INLINE_CAP: usize = 15;
+
+/// `meta` value marking the heap representation. Everything from 0 to
+/// [`SYMBOL_INLINE_CAP`] is the inline byte length instead.
+const SYMBOL_HEAP_TAG: u8 = u8::MAX;
+
+/// An empty inline symbol: `head`/`tail` zeroed, `meta` = length 0.
+const SYMBOL_INLINE_EMPTY: Symbol = Symbol {
+    head: 0,
+    tail: [0; 7],
+    meta: 0,
+};
 
 /// Cell glyph storage: inline byte array for short symbols, heap fallback
 /// otherwise. Dereferences to `str`.
-#[derive(Clone)]
+///
+/// Packed into 16 bytes: `head` (8) + `tail` (7) hold the inline UTF-8 bytes,
+/// and `meta` doubles as the discriminant — `0..=SYMBOL_INLINE_CAP` is the
+/// inline byte length, [`SYMBOL_HEAP_TAG`] marks the heap form (pointer in
+/// `head`, byte length in `tail[0..2]`, capped at 65 535). `repr(C)` makes
+/// `head`/`tail` contiguous so the inline text reads as one slice; because
+/// the heap pointer is hand-managed, `Clone` and `Drop` are manual.
+#[repr(C)]
 pub struct Symbol {
-    repr: SymbolRepr,
+    head: usize,
+    tail: [u8; 7],
+    meta: u8,
 }
 
-#[derive(Clone)]
-enum SymbolRepr {
-    Inline {
-        /// Valid byte count of `bytes` (always <= [`SYMBOL_INLINE_CAP`]).
-        len: u8,
-        /// UTF-8 bytes; content past `len` is stale and never read back.
-        bytes: [u8; SYMBOL_INLINE_CAP],
-    },
-    Heap(Box<str>),
+impl Clone for Symbol {
+    fn clone(&self) -> Self {
+        let mut cloned = SYMBOL_INLINE_EMPTY;
+        cloned.push_raw(self.as_str());
+        cloned
+    }
 }
 
 impl Symbol {
     fn clear(&mut self) {
         // Back to inline empty; drops any heap allocation immediately so a
-        // reused cell does not pin a Box across frames.
-        self.repr = SymbolRepr::Inline {
-            len: 0,
-            bytes: [0; SYMBOL_INLINE_CAP],
-        };
+        // reused cell does not pin a Box across frames. (ptr::write rather
+        // than assignment so the old value is never dropped re-entrantly —
+        // see take_heap_box.)
+        if self.take_heap_box().is_none() {
+            unsafe { std::ptr::write(self, SYMBOL_INLINE_EMPTY) };
+        }
     }
 
     /// Append `text`, mapping terminal-hostile chars exactly like
@@ -611,56 +627,106 @@ impl Symbol {
     /// Append already-sanitized UTF-8 text, spilling to the heap when the
     /// inline array cannot hold it.
     fn push_raw(&mut self, text: &str) {
-        if self.len() + text.len() > SYMBOL_INLINE_CAP {
+        if self.meta != SYMBOL_HEAP_TAG && self.len() + text.len() > SYMBOL_INLINE_CAP {
             self.spill_to_heap();
         }
-        match &mut self.repr {
-            SymbolRepr::Inline { len, bytes } => {
-                let start = usize::from(*len);
-                let end = start + text.len();
-                debug_assert!(end <= SYMBOL_INLINE_CAP);
-                bytes[start..end].copy_from_slice(text.as_bytes());
-                *len = end as u8;
+        if self.meta == SYMBOL_HEAP_TAG {
+            // Rebuild the box with the appended text (take + realloc keeps the
+            // old bytes; push_str extends in place when capacity allows).
+            let mut owned = self.take_heap_box().unwrap_or_default().into_string();
+            owned.push_str(text);
+            self.set_heap(owned.into_boxed_str());
+        } else {
+            let start = usize::from(self.meta);
+            let end = start + text.len();
+            debug_assert!(end <= SYMBOL_INLINE_CAP);
+            // SAFETY: repr(C) puts the 15 inline bytes at offsets 0..15 and
+            // this write stays within the live range [start, end).
+            unsafe {
+                let base = std::ptr::from_mut(self) as *mut u8;
+                std::ptr::copy_nonoverlapping(text.as_ptr(), base.add(start), text.len());
             }
-            SymbolRepr::Heap(s) => {
-                let mut owned = std::mem::take(s).into_string();
-                owned.push_str(text);
-                *s = owned.into_boxed_str();
-            }
+            self.meta = end as u8;
         }
     }
 
     fn spill_to_heap(&mut self) {
-        let (len, bytes) = match self.repr {
-            SymbolRepr::Inline { len, bytes } => (len, bytes),
-            SymbolRepr::Heap(_) => return,
-        };
-        let text = std::str::from_utf8(&bytes[..usize::from(len)]).unwrap_or_default();
-        self.repr = SymbolRepr::Heap(String::from(text).into_boxed_str());
+        if self.meta == SYMBOL_HEAP_TAG {
+            return;
+        }
+        let text = self.as_str().to_owned();
+        self.set_heap(text.into_boxed_str());
+    }
+
+    /// Move the heap representation back into an owned box, resetting `self`
+    /// to the empty inline form. `None` when this symbol is inline.
+    fn take_heap_box(&mut self) -> Option<Box<str>> {
+        if self.meta != SYMBOL_HEAP_TAG {
+            return None;
+        }
+        let len = u16::from(self.tail[0]) | (u16::from(self.tail[1]) << 8);
+        let ptr = self.head as *mut u8;
+        // Overwrite WITHOUT dropping the old value: Drop::drop routes here,
+        // so an assignment (`*self = …`) would drop the heap tag again and
+        // re-enter this method on the same pointer — infinite recursion.
+        unsafe { std::ptr::write(self, SYMBOL_INLINE_EMPTY) };
+        // SAFETY: `ptr`/`len` were produced by `Box::into_raw` in `set_heap`
+        // and nothing else freed or copied them since (clear/clone/drop all
+        // route through this method or leave the value untouched).
+        Some(unsafe {
+            Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len as usize) as *mut str)
+        })
+    }
+
+    fn set_heap(&mut self, boxed: Box<str>) {
+        let len = boxed.len().min(u16::MAX as usize);
+        let ptr = Box::into_raw(boxed) as *mut u8 as usize;
+        self.head = ptr;
+        self.tail = [0; 7];
+        self.tail[0] = len as u8;
+        self.tail[1] = (len >> 8) as u8;
+        self.meta = SYMBOL_HEAP_TAG;
     }
 
     pub fn as_str(&self) -> &str {
-        match &self.repr {
-            SymbolRepr::Inline { len, bytes } => {
-                std::str::from_utf8(&bytes[..usize::from(*len)]).unwrap_or_default()
+        if self.meta == SYMBOL_HEAP_TAG {
+            let len = u16::from(self.tail[0]) | (u16::from(self.tail[1]) << 8);
+            // SAFETY: heap bytes are valid UTF-8 (only sanitized text is
+            // stored) and the pointer stays valid until taken via
+            // `take_heap_box`.
+            unsafe {
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                    self.head as *const u8,
+                    len as usize,
+                ))
             }
-            SymbolRepr::Heap(s) => s,
+        } else {
+            // SAFETY: repr(C) lays the inline bytes out contiguously at
+            // offset 0; only the first `meta` bytes are live and were stored
+            // as valid UTF-8.
+            unsafe {
+                std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                    std::ptr::from_ref(self) as *const u8,
+                    usize::from(self.meta),
+                ))
+            }
         }
     }
 
     fn is_inline(&self) -> bool {
-        matches!(self.repr, SymbolRepr::Inline { .. })
+        self.meta != SYMBOL_HEAP_TAG
+    }
+}
+
+impl Drop for Symbol {
+    fn drop(&mut self) {
+        drop(self.take_heap_box());
     }
 }
 
 impl Default for Symbol {
     fn default() -> Self {
-        let mut symbol = Self {
-            repr: SymbolRepr::Inline {
-                len: 0,
-                bytes: [0; SYMBOL_INLINE_CAP],
-            },
-        };
+        let mut symbol = SYMBOL_INLINE_EMPTY;
         symbol.push_raw(" ");
         symbol
     }
@@ -689,7 +755,18 @@ impl std::fmt::Debug for Symbol {
 
 impl PartialEq for Symbol {
     fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
+        if self.meta != other.meta {
+            return false;
+        }
+        if self.meta == SYMBOL_HEAP_TAG {
+            self.as_str() == other.as_str()
+        } else {
+            // Same inline length + same raw head/tail bytes. Appends always
+            // write [len..len+n) after a full clear, so equal live text implies
+            // equal raw bytes; a false "unequal" from stale tails is possible
+            // only in states the cell lifecycle never produces.
+            self.head == other.head && self.tail == other.tail
+        }
     }
 }
 
@@ -996,7 +1073,28 @@ impl Buffer {
         self.set_line(x, y, &line, max_width);
     }
 
+    /// Paint only the background color of every cell in `area`. Equivalent to
+    /// `set_style(area, Style::default().bg(color))` without per-cell branchwork.
+    pub fn fill_bg(&mut self, area: Rect, color: Color) {
+        for y in area.y..area.y.saturating_add(area.height) {
+            for x in area.x..area.x.saturating_add(area.width) {
+                if let Some(cell) = self.get_mut(x, y) {
+                    cell.bg = color;
+                }
+            }
+        }
+    }
+
     pub fn set_style(&mut self, area: Rect, style: Style) {
+        // A fully default style patches nothing — skip the whole-area sweep
+        // (default Block/Table backgrounds hit this every frame).
+        if style.fg.is_none()
+            && style.bg.is_none()
+            && style.add_modifier.is_empty()
+            && style.sub_modifier.is_empty()
+        {
+            return;
+        }
         for y in area.y..area.y.saturating_add(area.height) {
             for x in area.x..area.x.saturating_add(area.width) {
                 if let Some(cell) = self.get_mut(x, y) {
@@ -1013,12 +1111,19 @@ impl Buffer {
 
 /// Crossterm backend
 pub struct CrosstermBackend {
-    stdout: Stdout,
+    stdout: BufWriter<Stdout>,
 }
 
 impl CrosstermBackend {
     pub fn new(stdout: Stdout) -> Self {
-        Self { stdout }
+        // Buffer ANSI output across the frame: without this, raw Stdout's
+        // ~1 KB LineWriter turns every queued command into its own write
+        // syscall on full repaints. Terminal::draw's single flush() is the
+        // only write boundary; crossterm itself flushes before any non-ANSI
+        // WinAPI-fallback command, so legacy consoles keep correct ordering.
+        Self {
+            stdout: BufWriter::with_capacity(256 * 1024, stdout),
+        }
     }
 }
 
@@ -1069,9 +1174,10 @@ impl Terminal {
 
         // Clear the current buffer
         let buffer = &mut self.buffers[self.current];
-        for cell in &mut buffer.content {
-            cell.reset();
-        }
+        // A pristine default cell is byte-equivalent to reset()'s output
+        // (see reused_cell_equals_fresh_default_cell); filling with a clone
+        // of one template is far cheaper than 4,800+ reset() calls.
+        buffer.content.fill(BufferCell::default());
 
         // Run the drawing function
         let mut frame = Frame {
@@ -1688,6 +1794,11 @@ pub struct Cell<'a> {
 }
 
 impl<'a> Cell<'a> {
+    /// Mutable access for span recycling between frames.
+    pub fn content_mut(&mut self) -> &mut Line<'a> {
+        &mut self.content
+    }
+
     pub fn new<T: Into<Line<'a>>>(content: T) -> Self {
         Self {
             content: content.into(),
@@ -1740,6 +1851,11 @@ pub struct Row<'a> {
 }
 
 impl<'a> Row<'a> {
+    /// Mutable access for span recycling between frames.
+    pub fn cells_mut(&mut self) -> &mut [Cell<'a>] {
+        &mut self.cells
+    }
+
     pub fn new<T: IntoIterator<Item = Cell<'a>>>(cells: T) -> Self {
         Self {
             cells: cells.into_iter().collect(),
@@ -1766,6 +1882,10 @@ pub struct Table<'a> {
     header: Option<Row<'a>>,
     rows: Vec<Row<'a>>,
     widths: Vec<Constraint>,
+    /// Pre-resolved column widths; when present (and non-empty), `render`
+    /// skips re-running the constraint math so the caller's layout is used
+    /// verbatim.
+    resolved_widths: Option<Vec<u16>>,
     column_spacing: u16,
     style: Style,
     row_highlight_style: Style,
@@ -1797,6 +1917,24 @@ impl<'a> Table<'a> {
     pub fn widths(mut self, widths: impl Into<Vec<Constraint>>) -> Self {
         self.widths = widths.into();
         self
+    }
+
+    /// Provide already-resolved per-column widths (e.g. from the same layout
+    /// pass that produced click regions). Takes precedence over `widths`
+    /// during render when non-empty.
+    pub fn column_widths_resolved(mut self, widths: Vec<u16>) -> Self {
+        self.resolved_widths = Some(widths);
+        self
+    }
+
+    /// Mutable access for span recycling between frames.
+    pub fn header_mut(&mut self) -> Option<&mut Row<'a>> {
+        self.header.as_mut()
+    }
+
+    /// Mutable access for span recycling between frames.
+    pub fn rows_mut(&mut self) -> &mut [Row<'a>] {
+        &mut self.rows
     }
 
     pub fn column_spacing(mut self, spacing: u16) -> Self {
@@ -1893,8 +2031,10 @@ impl<'a> Table<'a> {
     }
 }
 
-impl Widget for Table<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
+impl Table<'_> {
+    /// Shared-reference render so callers can keep ownership of `rows` and
+    /// recycle their span strings across frames.
+    fn render_ref(&self, area: Rect, buf: &mut Buffer) {
         let table_area = if let Some(block) = &self.block {
             let inner = block.inner(area);
             block.clone().render(area, buf);
@@ -1910,7 +2050,10 @@ impl Widget for Table<'_> {
         // Apply base style to entire table area.
         buf.set_style(table_area, self.style);
 
-        let col_widths = self.get_column_widths(table_area.width);
+        let col_widths = match self.resolved_widths {
+            Some(ref w) if !w.is_empty() => w.clone(),
+            _ => self.get_column_widths(table_area.width),
+        };
         let mut y = table_area.y;
 
         // Render header
@@ -1964,6 +2107,18 @@ impl Widget for Table<'_> {
             }
             y += row.height;
         }
+    }
+}
+
+impl Widget for Table<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.render_ref(area, buf);
+    }
+}
+
+impl Widget for &Table<'_> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.render_ref(area, buf);
     }
 }
 
@@ -2565,7 +2720,12 @@ mod tests {
     fn symbol_size_stays_within_old_string_footprint() {
         // The whole point of the inline layout: no growth per cell versus the
         // previous `symbol: String` field.
-        assert!(std::mem::size_of::<Symbol>() <= std::mem::size_of::<String>());
+        assert_eq!(std::mem::size_of::<Symbol>(), 16);
+        assert_eq!(
+            std::mem::size_of::<BufferCell>(),
+            std::mem::size_of::<Symbol>() + 16 // fg + bg + modifier + continuation + padding
+        );
+        assert!(std::mem::size_of::<BufferCell>() <= 32);
     }
 
     #[test]

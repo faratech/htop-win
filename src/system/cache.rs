@@ -25,6 +25,10 @@ pub mod config {
     pub const EXE_STATUS_TTL_SECS: u64 = 10;
     /// Maximum exe status cache entries before eviction
     pub const EXE_CACHE_MAX_SIZE: usize = 1000;
+    /// Per-tick cap on exe-status filesystem stats. Entries past their
+    /// (jittered) deadline are restated across following ticks in whatever
+    /// order they come due, so the whole set never stats in one tick.
+    pub const EXE_STATS_PER_TICK: u32 = 96;
 }
 
 /// FILETIME of the Unix epoch (1601-01-01 → 1970-01-01) in 100ns ticks, used
@@ -33,6 +37,10 @@ const UNIX_EPOCH_FILETIME_100NS: u64 = 116444736000000000;
 
 /// How long an exe-status entry stays fresh before its file is re-stat'd.
 const EXE_STATUS_TTL: Duration = Duration::from_secs(config::EXE_STATUS_TTL_SECS);
+
+/// Upper bound of the per-entry freshness jitter. Spreading deadlines keeps
+/// same-tick entries from expiring (and re-stat'ing) together.
+const EXE_STATUS_MAX_JITTER: Duration = Duration::from_secs(config::EXE_STATUS_TTL_SECS / 2);
 
 /// Per-PID cache entry containing all cached process data
 #[derive(Clone)]
@@ -99,6 +107,10 @@ pub struct ExeStatusEntry {
     /// Monotonic instant of the filesystem stat backing this entry. `Instant`
     /// (not wall-clock) so TTL freshness is immune to clock changes.
     pub checked_at: Instant,
+    /// Freshness deadline: `checked_at + TTL + jitter`. Kept separate from
+    /// `checked_at` so per-entry jitter can de-synchronize re-stat bursts
+    /// while eviction (which graces on `checked_at`) still runs on schedule.
+    next_check: Instant,
 }
 
 /// Exe-status cache layout: `path -> (process create FILETIME -> entry)`.
@@ -108,9 +120,32 @@ pub struct ExeStatusEntry {
 /// hashes and compares through `str`) instead of allocating a `String` per call.
 type ExeStatusMap = HashMap<Box<str>, HashMap<u64, ExeStatusEntry>>;
 
-/// An entry is fresh while its last stat is younger than the TTL.
+/// An entry is fresh while `now` is before its (jittered) deadline.
 fn exe_entry_is_fresh(entry: &ExeStatusEntry, now: Instant) -> bool {
-    now.saturating_duration_since(entry.checked_at) < EXE_STATUS_TTL
+    now < entry.next_check
+}
+
+/// An entry is retained until twice the TTL has passed since its stat. The
+/// grace covers the jitter window plus ticks deferred by the per-tick budget,
+/// so entries waiting to be restated keep their last verdict.
+fn exe_entry_retained(entry: &ExeStatusEntry, now: Instant) -> bool {
+    now.saturating_duration_since(entry.checked_at) < EXE_STATUS_TTL + EXE_STATUS_TTL
+}
+
+/// Deterministic per-entry jitter in `[0, EXE_STATUS_MAX_JITTER)`, hashed from
+/// path and create time so entries created in the same tick get different
+/// deadlines without touching a wall clock or RNG.
+fn exe_status_jitter(exe_path: &str, start_time_100ns: u64) -> Duration {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325; // FNV-1a offset basis
+    for byte in exe_path.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3); // FNV-1a prime
+    }
+    hash ^= start_time_100ns;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^= hash >> 33;
+    let nanos = hash % EXE_STATUS_MAX_JITTER.as_nanos().max(1) as u64;
+    Duration::from_nanos(nanos)
 }
 
 /// Total number of cached entries across every path.
@@ -118,17 +153,17 @@ fn exe_status_len(map: &ExeStatusMap) -> usize {
     map.values().map(HashMap::len).sum()
 }
 
-/// Drop entries whose TTL has lapsed, pruning paths left without any entry.
-/// Returns the number of entries removed.
+/// Drop entries past the retention grace, pruning paths left without any
+/// entry. Returns the number of entries removed.
 fn evict_expired_entries(map: &mut ExeStatusMap, now: Instant) -> usize {
     let mut removed = 0usize;
     map.retain(|_, by_start| {
         by_start.retain(|_, entry| {
-            let fresh = exe_entry_is_fresh(entry, now);
-            if !fresh {
+            let retained = exe_entry_retained(entry, now);
+            if !retained {
                 removed += 1;
             }
-            fresh
+            retained
         });
         !by_start.is_empty()
     });
@@ -159,6 +194,8 @@ pub struct ProcessCache {
     exe_status: RwLock<ExeStatusMap>,
     /// Cleanup counter for periodic maintenance
     cleanup_counter: AtomicU32,
+    /// Remaining exe-status stats allowed this tick (see `begin_exe_tick`)
+    exe_budget: AtomicU32,
 }
 
 impl ProcessCache {
@@ -168,7 +205,22 @@ impl ProcessCache {
             entries: RwLock::new(HashMap::new()),
             exe_status: RwLock::new(HashMap::new()),
             cleanup_counter: AtomicU32::new(0),
+            exe_budget: AtomicU32::new(0),
         }
+    }
+
+    /// Open a new collection tick with a fresh exe-stat budget. Entries past
+    /// their jittered deadline are restated across ticks under this cap so a
+    /// large process set never stats in a single tick.
+    pub fn begin_exe_tick(&self, budget: u32) {
+        self.exe_budget.store(budget, Ordering::Relaxed);
+    }
+
+    /// Take one stat from the budget, if any remain.
+    fn take_exe_budget(&self) -> bool {
+        self.exe_budget
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
+            .is_ok()
     }
 
     /// Batch update CPU times and I/O bytes for multiple PIDs (single lock acquisition)
@@ -178,15 +230,40 @@ impl ProcessCache {
         &self,
         updates: &[(u32, u64, u64, u64, u64, u64)],
     ) -> HashMap<u32, (u64, u64)> {
-        self.update_times_batch_at(updates, Instant::now())
+        let mut io_rates = HashMap::with_capacity(updates.len());
+        self.update_times_batch_into(updates, &mut io_rates);
+        io_rates
     }
 
+    /// [`ProcessCache::update_times_batch`] filling a caller-owned map so the
+    /// per-tick rate map's capacity can be reused across ticks.
+    pub fn update_times_batch_into(
+        &self,
+        updates: &[(u32, u64, u64, u64, u64, u64)],
+        io_rates: &mut HashMap<u32, (u64, u64)>,
+    ) {
+        self.update_times_batch_at_into(updates, Instant::now(), io_rates)
+    }
+
+    /// Explicit-instant variant for TTL tests.
+    #[cfg(test)]
     fn update_times_batch_at(
         &self,
         updates: &[(u32, u64, u64, u64, u64, u64)],
         now: Instant,
     ) -> HashMap<u32, (u64, u64)> {
         let mut io_rates = HashMap::with_capacity(updates.len());
+        self.update_times_batch_at_into(updates, now, &mut io_rates);
+        io_rates
+    }
+
+    fn update_times_batch_at_into(
+        &self,
+        updates: &[(u32, u64, u64, u64, u64, u64)],
+        now: Instant,
+        io_rates: &mut HashMap<u32, (u64, u64)>,
+    ) {
+        io_rates.clear();
         if let Ok(mut cache) = self.entries.write() {
             for &(pid, kernel_time, user_time, create_time, io_read, io_write) in updates {
                 let entry = cache.entry(pid).or_default();
@@ -228,7 +305,6 @@ impl ProcessCache {
                 entry.io_updated = now;
             }
         }
-        io_rates
     }
 
     /// Cache username for a PID
@@ -253,16 +329,40 @@ impl ProcessCache {
     /// Check exe status with caching
     /// Returns (exe_updated, exe_deleted)
     pub fn check_exe_status(&self, exe_path: &str, start_time_100ns: u64) -> (bool, bool) {
-        self.check_exe_status_at(exe_path, start_time_100ns, Instant::now())
+        self.check_exe_status_impl(exe_path, start_time_100ns, Instant::now(), false, false)
+    }
+
+    /// [`ProcessCache::check_exe_status`] under the collector's staggered
+    /// regime: jittered per-entry deadlines spread re-stats out, and the
+    /// per-tick budget (see [`ProcessCache::begin_exe_tick`]) defers entries
+    /// whose deadline passed until a later tick, keeping their last verdict.
+    pub fn check_exe_status_staggered(
+        &self,
+        exe_path: &str,
+        start_time_100ns: u64,
+    ) -> (bool, bool) {
+        self.check_exe_status_impl(exe_path, start_time_100ns, Instant::now(), true, true)
     }
 
     /// [`ProcessCache::check_exe_status`] evaluated at an explicit instant,
     /// mirroring `update_times_batch_at` so TTL behavior is testable.
+    #[cfg(test)]
     fn check_exe_status_at(
         &self,
         exe_path: &str,
         start_time_100ns: u64,
         now: Instant,
+    ) -> (bool, bool) {
+        self.check_exe_status_impl(exe_path, start_time_100ns, now, false, false)
+    }
+
+    fn check_exe_status_impl(
+        &self,
+        exe_path: &str,
+        start_time_100ns: u64,
+        now: Instant,
+        jitter: bool,
+        budgeted: bool,
     ) -> (bool, bool) {
         use std::fs;
 
@@ -272,16 +372,31 @@ impl ProcessCache {
 
         // Hot path: borrowed lookup through `Box<str>: Borrow<str>`, so the hit
         // case allocates nothing and reads no wall clock. Only the monotonic
-        // `now` decides freshness.
-        if let Ok(cache) = self.exe_status.read()
-            && let Some(by_start) = cache.get(exe_path)
-            && let Some(entry) = by_start.get(&start_time_100ns)
-            && exe_entry_is_fresh(entry, now)
+        // `now` decides freshness. Verdicts are copied out so the lock guard
+        // can drop before any filesystem work.
+        let existing: Option<(bool, bool, bool)> = if let Ok(cache) = self.exe_status.read() {
+            cache
+                .get(exe_path)
+                .and_then(|by_start| by_start.get(&start_time_100ns))
+                .map(|e| (e.updated, e.deleted, exe_entry_is_fresh(e, now)))
+        } else {
+            None
+        };
+        if let Some((updated, deleted, fresh)) = existing
+            && fresh
         {
-            return (entry.updated, entry.deleted);
+            return (updated, deleted);
         }
 
-        // Cache miss or stale - do filesystem check. The comparison only needs
+        // The entry's deadline passed (or it does not exist yet). Under the
+        // budget, defer the restat to a later tick: report the last known
+        // verdict unchanged, leaving the entry due where it is. First-seen
+        // entries report the neutral verdict uncached.
+        if budgeted && !self.take_exe_budget() {
+            return existing.map_or((false, false), |(updated, deleted, _)| (updated, deleted));
+        }
+
+        // Cache miss or due - do filesystem check. The comparison only needs
         // the file's own mtime converted into FILETIME units; no wall-clock
         // read is required here.
         let result = match fs::metadata(exe_path) {
@@ -306,6 +421,11 @@ impl ProcessCache {
         // Update cache (size-capped; shed expired entries before clearing)
         if let Ok(mut cache) = self.exe_status.write() {
             enforce_exe_cache_limit(&mut cache, now);
+            let jitter = if jitter {
+                exe_status_jitter(exe_path, start_time_100ns)
+            } else {
+                Duration::ZERO
+            };
             cache
                 .entry(Box::from(exe_path))
                 .or_default()
@@ -315,6 +435,7 @@ impl ProcessCache {
                         updated: result.0,
                         deleted: result.1,
                         checked_at: now,
+                        next_check: now + EXE_STATUS_TTL + jitter,
                     },
                 );
         }
@@ -386,6 +507,12 @@ impl Default for ProcessCache {
 mod tests {
     use super::*;
     use std::time::SystemTime;
+
+    impl ProcessCache {
+        fn with_exe_status<R>(&self, f: impl FnOnce(&ExeStatusMap) -> R) -> R {
+            f(&self.exe_status.read().expect("exe_status lock"))
+        }
+    }
 
     #[test]
     fn test_batch_update_and_io_rates() {
@@ -604,6 +731,7 @@ mod tests {
                     updated: false,
                     deleted: false,
                     checked_at,
+                    next_check: checked_at + EXE_STATUS_TTL,
                 },
             );
         }
@@ -616,9 +744,10 @@ mod tests {
     #[test]
     fn cap_eviction_sheds_expired_entries_and_keeps_fresh_ones() {
         let t0 = Instant::now();
-        // `later` is one tick past the TTL, so entries stamped at t0 expire
-        // while entries stamped at `later` are still fresh.
-        let later = t0 + EXE_STATUS_TTL + Duration::from_secs(1);
+        // `later` is past the retention grace (2x TTL: TTL plus the jitter +
+        // deferral window), so entries stamped at t0 are shed while entries
+        // stamped at `later` are still retained.
+        let later = t0 + EXE_STATUS_TTL + EXE_STATUS_TTL + Duration::from_secs(1);
 
         let mut map = ExeStatusMap::new();
         add_synthetic_entries(&mut map, 0..600, t0); // will be expired
@@ -633,6 +762,7 @@ mod tests {
                         updated: true,
                         deleted: false,
                         checked_at: t0,
+                        next_check: t0 + EXE_STATUS_TTL,
                     },
                 ),
                 (
@@ -641,6 +771,7 @@ mod tests {
                         updated: false,
                         deleted: false,
                         checked_at: later,
+                        next_check: later + EXE_STATUS_TTL,
                     },
                 ),
             ]),
@@ -699,7 +830,7 @@ mod tests {
     #[test]
     fn expired_only_paths_are_pruned_from_the_outer_map() {
         let t0 = Instant::now();
-        let later = t0 + EXE_STATUS_TTL + Duration::from_secs(1);
+        let later = t0 + EXE_STATUS_TTL + EXE_STATUS_TTL + Duration::from_secs(1);
         let mut map = ExeStatusMap::new();
         add_synthetic_entries(&mut map, 0..4, t0);
         add_synthetic_entries(&mut map, 100..102, later);
@@ -709,5 +840,92 @@ mod tests {
         assert_eq!(map.len(), 2);
         assert!(contains_path(&map, "C:\\apps\\app100.exe"));
         assert!(contains_path(&map, "C:\\apps\\app101.exe"));
+    }
+
+    #[test]
+    fn staggered_checks_defer_when_budget_is_exhausted() {
+        let cache = ProcessCache::new();
+        let t0 = Instant::now();
+        // No budget opened: nothing gets stat'd or cached.
+        let path = "C:\\defer\\app.exe";
+        assert_eq!(
+            cache.check_exe_status_impl(path, 1, t0, true, true),
+            (false, false)
+        );
+        assert!(cache.with_exe_status(|m| m.is_empty()));
+
+        // Open a 1-stat budget: the first due entry stats and caches, the
+        // second defers with the neutral verdict and stays uncached.
+        cache.begin_exe_tick(1);
+        assert_eq!(
+            cache.check_exe_status_impl(path, 1, t0, true, true),
+            (false, true) // nonexistent path -> deleted
+        );
+        let path2 = "C:\\defer\\app2.exe";
+        assert_eq!(
+            cache.check_exe_status_impl(path2, 2, t0, true, true),
+            (false, false)
+        );
+        assert!(cache.with_exe_status(|m| !m.contains_key(path2)));
+    }
+
+    #[test]
+    fn staggered_checks_keep_last_verdict_while_deferred() {
+        let cache = ProcessCache::new();
+        let t0 = Instant::now();
+        cache.begin_exe_tick(1);
+        // A deleted exe is stat'd once and cached as deleted.
+        let path = "C:\\gone\\app.exe";
+        assert_eq!(
+            cache.check_exe_status_impl(path, 1, t0, true, true),
+            (false, true)
+        );
+        // Past its deadline with the budget drained: the cached (deleted)
+        // verdict holds until a later tick restats - no flicker to (f,t).
+        cache.begin_exe_tick(0);
+        let later = t0 + EXE_STATUS_TTL + Duration::from_secs(60);
+        assert_eq!(
+            cache.check_exe_status_impl(path, 1, later, true, true),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn staggered_jitter_spreads_deadlines_across_the_window() {
+        // Same-tick entries must not share a deadline: the jitter over 200
+        // synthetic keys should cover most of [0, MAX_JITTER).
+        let mut deadlines: Vec<u128> = (0..200)
+            .map(|i| {
+                let path = format!("C:\\apps\\spread{}.exe", i);
+                (EXE_STATUS_TTL + exe_status_jitter(&path, 10_000 + i)).as_millis()
+            })
+            .collect();
+        deadlines.sort_unstable();
+        let min = deadlines[0];
+        let max = deadlines[deadlines.len() - 1];
+        let ttl = EXE_STATUS_TTL.as_millis();
+        assert!(min < ttl + EXE_STATUS_MAX_JITTER.as_millis() / 4);
+        assert!(max > ttl + EXE_STATUS_MAX_JITTER.as_millis() * 3 / 4);
+        // Deterministic: same inputs, same deadline.
+        assert_eq!(
+            exe_status_jitter("C:\\a.exe", 7),
+            exe_status_jitter("C:\\a.exe", 7)
+        );
+    }
+
+    #[test]
+    fn staggered_entries_converge_within_a_few_ticks() {
+        let cache = ProcessCache::new();
+        let t0 = Instant::now();
+        // 50 entries come due in the same instant (as a real tick produces);
+        // the budget paces their initial caching, and everything is cached
+        // after enough ticks.
+        cache.begin_exe_tick(config::EXE_STATS_PER_TICK);
+        for i in 0..50u64 {
+            let path = format!("C:\\conv\\app{}.exe", i);
+            cache.check_exe_status_impl(&path, 1_000 + i, t0, true, true);
+        }
+        let cached = cache.with_exe_status(|m| m.values().map(|b| b.len()).sum::<usize>());
+        assert_eq!(cached, 50, "budget of {} covers 50 entries", config::EXE_STATS_PER_TICK);
     }
 }

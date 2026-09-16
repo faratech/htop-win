@@ -1,4 +1,5 @@
 //! One test in a separate process so LOCALAPPDATA overrides are isolated.
+#![cfg(windows)] // needs the Windows exe + PE metadata; skipped on non-Windows hosts
 use htop_win::installer::get_installed_version;
 use std::path::PathBuf;
 

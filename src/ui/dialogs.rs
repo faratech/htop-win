@@ -794,12 +794,12 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
     let content = {
         let proc = &**target;
         let status_desc = match proc.status {
-            'R' => "Running",
-            'S' => "Sleeping",
-            'I' => "Idle",
-            'Z' => "Zombie",
-            'T' => "Stopped",
-            '?' => "Unknown (not exposed by Windows native process query)",
+            b'R' => "Running",
+            b'S' => "Sleeping",
+            b'I' => "Idle",
+            b'Z' => "Zombie",
+            b'T' => "Stopped",
+            b'?' => "Unknown (not exposed by Windows native process query)",
             _ => "Unknown",
         };
 
@@ -850,8 +850,8 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
              \n\
              Threads         {}\n\
              Handles         {}\n\
-             CPU Usage       {:.1}%\n\
-             Memory Usage    {:.1}%\n\
+             CPU Usage       {}%\n\
+             Memory Usage    {}%\n\
              Virtual Memory  {}\n\
              Resident Memory {}\n\
              Shared Memory   {}\n\
@@ -886,8 +886,8 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
             efficiency_str,
             proc.thread_count,
             proc.handle_count,
-            proc.cpu_percent,
-            proc.mem_percent,
+            crate::numfmt::tenths_str(proc.cpu_percent, 0),
+            crate::numfmt::tenths_str(proc.mem_percent, 0),
             format_bytes(proc.virtual_mem),
             format_bytes(proc.resident_mem),
             format_bytes(proc.shared_mem),

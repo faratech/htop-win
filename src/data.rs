@@ -230,9 +230,34 @@ impl DataCollector {
         }
         let mut published_enrichment = enrichment;
 
+        // Fixed-schedule pacing: sleep until a deadline that advances by the
+        // tick rate, so the real period is exactly `rate` instead of
+        // `rate + collect time` (sleep-based pacing drifts by the work done).
+        let mut last_rate = tick_rate_ms.load(Ordering::Relaxed);
+        let mut next_tick = Instant::now() + Duration::from_millis(last_rate.max(1));
+        // While paused, collection is skipped entirely; the first tick after
+        // resume clears stale gap-averaged rates (see below).
+        let mut was_paused = false;
+
         loop {
             let rate = tick_rate_ms.load(Ordering::Relaxed);
-            std::thread::sleep(Duration::from_millis(rate));
+            if rate != last_rate {
+                // Rate changed (config edit / benchmark mode): re-derive the
+                // schedule from now.
+                last_rate = rate;
+                next_tick = Instant::now() + Duration::from_millis(rate.max(1));
+            }
+            let now = Instant::now();
+            if next_tick > now {
+                std::thread::sleep(next_tick - now);
+            } else {
+                // Ran past the deadline (collect > rate): don't accumulate
+                // debt, just run again immediately.
+                next_tick = now;
+            }
+            next_tick += Duration::from_millis(last_rate.max(1));
+
+            let paused_now = paused.load(Ordering::Relaxed);
 
             // Pick up recycled vec if available (reuses string allocations)
             // Drain to latest to avoid accumulation
@@ -240,7 +265,38 @@ impl DataCollector {
                 processes = recycled;
             }
 
-            // Always collect (even when paused) to keep cache deltas accurate
+            // Paused: skip collection entirely (idle, near-zero cost). A
+            // dialog that needs metadata not yet published still forces one
+            // collect+publish so it can fill its fields.
+            if paused_now {
+                was_paused = true;
+                let enrichment = ProcessEnrichmentRequirements::from_bits(
+                    enrichment_requirements.load(Ordering::Acquire),
+                );
+                if !published_enrichment.contains(enrichment) {
+                    let start = Instant::now();
+                    metrics.refresh();
+                    metrics.update_processes_native(&mut processes);
+                    hydrate_processes_from_cache(&mut processes);
+                    if enrichment.any() {
+                        enrich_processes_for(&mut processes, enrichment);
+                    }
+                    let duration = start.elapsed();
+                    match data_tx.publish(SystemSnapshot {
+                        metrics: metrics.clone(),
+                        processes: std::mem::take(&mut processes),
+                        refresh_duration: duration,
+                        enrichment,
+                    }) {
+                        Ok(Some(recycled)) => processes = recycled,
+                        Ok(None) => {}
+                        Err(_) => break,
+                    }
+                    published_enrichment = enrichment;
+                }
+                continue;
+            }
+
             let start = Instant::now();
             metrics.refresh();
             metrics.update_processes_native(&mut processes);
@@ -252,6 +308,25 @@ impl DataCollector {
                 enrich_processes_for(&mut processes, enrichment);
             }
             let duration = start.elapsed();
+
+            if was_paused {
+                was_paused = false;
+                // Rates on the first tick after a pause would be averages
+                // over the whole paused span (every rate denominator uses
+                // real elapsed time). Show a clean zero-rate tick instead;
+                // baselines were refreshed by this collection, so the next
+                // tick shows normal values.
+                for process in processes.iter_mut() {
+                    process.cpu_percent = 0.0;
+                    process.io_read_rate = 0;
+                    process.io_write_rate = 0;
+                }
+                metrics.cpu.core_usage.fill(0.0);
+                metrics.net_rx_rate = 0;
+                metrics.net_tx_rate = 0;
+                metrics.disk_read_rate = 0;
+                metrics.disk_write_rate = 0;
+            }
 
             let expands_metadata_coverage = !published_enrichment.contains(enrichment);
             if !paused.load(Ordering::Relaxed) || expands_metadata_coverage {

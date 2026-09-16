@@ -281,20 +281,19 @@ impl MemoryInfo {
 
 /// Format bytes into human-readable string
 pub fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    const TB: u64 = GB * 1024;
+    use crate::numfmt::{scaled_bytes, scaled_bytes_round0};
 
-    if bytes >= TB {
-        format!("{:.1}T", bytes as f64 / TB as f64)
-    } else if bytes >= GB {
-        format!("{:.1}G", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.0}M", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.0}K", bytes as f64 / KB as f64)
+    // Byte formatters use integer math (crate::numfmt) so the frame path
+    // never touches core::fmt's float machinery. Exponent = log2 of the unit.
+    if bytes >= (1u64 << 40) {
+        format!("{}T", scaled_bytes(bytes, 40))
+    } else if bytes >= (1u64 << 30) {
+        format!("{}G", scaled_bytes(bytes, 30))
+    } else if bytes >= (1u64 << 20) {
+        format!("{}M", scaled_bytes_round0(bytes, 20))
+    } else if bytes >= (1u64 << 10) {
+        format!("{}K", scaled_bytes_round0(bytes, 10))
     } else {
-        format!("{}B", bytes)
+        format!("{bytes}B")
     }
 }

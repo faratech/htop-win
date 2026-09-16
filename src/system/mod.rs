@@ -45,11 +45,14 @@ mod d3dkmt {
 
     pub fn set_gpu_process_stats_enabled(_enabled: bool) {}
     pub fn set_npu_process_stats_enabled(_enabled: bool) {}
-    pub fn set_gpu_selection(_name: Option<String>) {}
+    pub fn set_gpu_selection(_name: Option<&str>) {}
     pub fn gpu_names() -> Vec<String> {
         Vec::new()
     }
     pub fn process_stats_enabled() -> bool {
+        false
+    }
+    pub fn has_tracked_adapters() -> bool {
         false
     }
     pub fn refresh() -> AdapterSnapshot {
@@ -70,8 +73,8 @@ mod process;
 
 pub use cpu::{CpuInfo, debug_dump as cpu_debug_dump};
 pub use d3dkmt::{
-    GpuInfo, NpuInfo, debug_dump as gpu_debug_dump, gpu_names, set_gpu_process_stats_enabled,
-    set_gpu_selection, set_npu_process_stats_enabled,
+    GpuInfo, NpuInfo, debug_dump as gpu_debug_dump, gpu_names, has_tracked_adapters,
+    set_gpu_process_stats_enabled, set_gpu_selection, set_npu_process_stats_enabled,
 };
 pub use memory::{MemoryInfo, format_bytes};
 // Part of the library API (used by tests/visual_test.rs); the binary target
@@ -110,6 +113,13 @@ pub struct SystemMetrics {
     // Battery
     pub battery_percent: Option<f32>,
     pub battery_charging: bool,
+    /// Consecutive refreshes since a battery was last reported; drives the
+    /// absent-battery repoll latch in `update_battery`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    battery_absent_ticks: u32,
+    /// Gates active on the previous `refresh` (transition detection).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    last_collect_gates: u8,
     // GPU (None when no render-capable hardware adapter exists)
     pub gpu: Option<GpuInfo>,
     // NPU (None when no MCDM compute-only adapter exists)
@@ -118,9 +128,9 @@ pub struct SystemMetrics {
     prev_network: Option<HashMap<u64, NetworkCounters>>,
     prev_net_sample: Option<Instant>,
     // Native process enumeration state
-    /// Capacity baseline for process CPU%; re-queried every tick so hot-add or
-    /// processor-group changes move the denominator with the layout instead of
-    /// staying frozen at the value captured at startup.
+    /// Capacity baseline for process CPU%; follows the cached topology (30 s
+    /// TTL) so hot-add or processor-group changes move the denominator with
+    /// the layout instead of staying frozen at the value captured at startup.
     #[cfg_attr(not(windows), allow(dead_code))]
     logical_processor_count: usize,
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -148,6 +158,8 @@ impl Default for SystemMetrics {
             disk_write_rate: 0,
             battery_percent: None,
             battery_charging: false,
+            battery_absent_ticks: 0,
+            last_collect_gates: 0, // != ALL so the first refresh re-primes baselines
             gpu: None,
             npu: None,
             prev_network: None,
@@ -216,11 +228,6 @@ struct NetworkCounters {
     tx_bytes: u64,
 }
 
-/// Network interface statistics keyed by the Windows interface LUID.
-struct NetworkStats {
-    interfaces: HashMap<u64, NetworkCounters>,
-}
-
 #[inline]
 fn bytes_per_second(delta: u64, elapsed_secs: f64) -> u64 {
     if elapsed_secs <= 0.0 {
@@ -267,17 +274,10 @@ fn process_cpu_percentage(time_delta: u64, capacity_delta: u64) -> f32 {
 
 #[cfg(windows)]
 fn active_logical_processor_count() -> usize {
-    use windows::Win32::System::Threading::{
-        GetActiveProcessorCount, GetActiveProcessorGroupCount,
-    };
-
-    let count = unsafe {
-        let groups = GetActiveProcessorGroupCount();
-        (0..groups)
-            .map(|group| GetActiveProcessorCount(group) as usize)
-            .sum::<usize>()
-    };
-    count.max(1)
+    // Cached topology (30 s TTL): the per-tick capacity denominator and the
+    // CPU refresh share one enumeration instead of querying every group twice
+    // per tick. Hot-add still propagates via `tick_processor_count`.
+    cpu::cached_processor_layout_len().max(1)
 }
 
 #[cfg(not(windows))]
@@ -338,59 +338,129 @@ fn is_displayed_task(pid: u32) -> bool {
     pid != 0
 }
 
-/// Get network I/O stats using native Windows IP Helper API
+thread_local! {
+    /// Current interface counters, cleared and refilled each tick; swapped
+    /// into `SystemMetrics::prev_network` afterwards so both maps keep their
+    /// capacity instead of one side being rebuilt per tick.
+    static NETWORK_INTERFACES: std::cell::RefCell<HashMap<u64, NetworkCounters>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+/// Fill [`NETWORK_INTERFACES`] with the up (non-loopback) interface counters.
+/// Returns false when the IP Helper query failed (callers keep last values).
 #[cfg(windows)]
-fn get_network_stats() -> Option<NetworkStats> {
+fn get_network_stats() -> bool {
     use windows::Win32::Foundation::WIN32_ERROR;
     use windows::Win32::NetworkManagement::IpHelper::{
         FreeMibTable, GetIfTable2, IF_TYPE_SOFTWARE_LOOPBACK, MIB_IF_TABLE2,
     };
     use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 
-    let mut interfaces = HashMap::new();
-
     unsafe {
         let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
         if GetIfTable2(&mut table) != WIN32_ERROR(0) || table.is_null() {
-            return None;
+            return false;
         }
 
         let num_entries = (*table).NumEntries as usize;
         let entries = std::slice::from_raw_parts((*table).Table.as_ptr(), num_entries);
 
-        for entry in entries {
-            // Skip loopback and non-operational interfaces. Omitting a down
-            // interface also discards its baseline so reconnecting starts at 0.
-            if entry.OperStatus == IfOperStatusUp && entry.Type != IF_TYPE_SOFTWARE_LOOPBACK {
-                interfaces.insert(
-                    entry.InterfaceLuid.Value,
-                    NetworkCounters {
-                        rx_bytes: entry.InOctets,
-                        tx_bytes: entry.OutOctets,
-                    },
-                );
+        NETWORK_INTERFACES.with(|cell| {
+            let mut interfaces = cell.borrow_mut();
+            interfaces.clear();
+            for entry in entries {
+                // Skip loopback and non-operational interfaces. Omitting a down
+                // interface also discards its baseline so reconnecting starts at 0.
+                if entry.OperStatus == IfOperStatusUp
+                    && entry.Type != IF_TYPE_SOFTWARE_LOOPBACK
+                {
+                    interfaces.insert(
+                        entry.InterfaceLuid.Value,
+                        NetworkCounters {
+                            rx_bytes: entry.InOctets,
+                            tx_bytes: entry.OutOctets,
+                        },
+                    );
+                }
             }
-        }
+        });
 
         FreeMibTable(table as *const _);
     }
 
-    Some(NetworkStats { interfaces })
+    true
 }
 
 #[cfg(not(windows))]
-fn get_network_stats() -> Option<NetworkStats> {
-    Some(NetworkStats {
-        interfaces: HashMap::new(),
-    })
+fn get_network_stats() -> bool {
+    NETWORK_INTERFACES.with(|cell| cell.borrow_mut().clear());
+    false
+}
+
+// Scratch PID→slot index reused across refresh ticks. Thread-local storage
+// needs no synchronization, keeps `SystemMetrics` cheap to clone for every
+// snapshot sent to the UI thread, and stays correct when the UI-thread
+// fallback refresh (`App::refresh_system`) runs this on another thread (each
+// thread simply reuses its own instance).
+#[cfg(windows)]
+thread_local! {
+    static PID_INDEX_SCRATCH: std::cell::RefCell<HashMap<u32, usize>> =
+        std::cell::RefCell::new(HashMap::new());
+    /// Survivor-liveness flags, one per entry of the incoming process vec.
+    static ALIVE_SCRATCH: std::cell::RefCell<Vec<bool>> = std::cell::RefCell::new(Vec::new());
+    /// Processes that appeared in this tick's raw list but not in the vec.
+    static NEW_PROCESSES: std::cell::RefCell<Vec<ProcessInfo>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// Which subsystems `SystemMetrics::refresh` collects this tick. Gates mirror
+/// the UI's meter visibility (see `App::canonical_collect_requirements`); a
+/// gated-off subsystem keeps its last collected values. All bits set = collect
+/// everything (the default, so headless runs and tests see full collection).
+pub mod collect_gates {
+    pub const NET: u8 = 1 << 0;
+    pub const BATTERY: u8 = 1 << 1;
+    pub const CPU: u8 = 1 << 2;
+    pub const GPU: u8 = 1 << 3;
+    pub const NPU: u8 = 1 << 4;
+    pub const ALL: u8 = NET | BATTERY | CPU | GPU | NPU;
+}
+
+static COLLECT_GATES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(collect_gates::ALL);
+
+/// Absent-battery latch: confirm absence for this many ticks, then repoll
+/// only every [`BATTERY_ABSENT_REPOLL_TICKS`] (≈30 s at the default rate).
+const BATTERY_ABSENT_CONFIRM_TICKS: u32 = 8;
+const BATTERY_ABSENT_REPOLL_TICKS: u32 = 20;
+
+/// Update the per-tick collection gates (called from the UI thread when meter
+/// visibility changes).
+pub fn set_collect_gates(bits: u8) {
+    COLLECT_GATES.store(bits, std::sync::atomic::Ordering::Relaxed);
 }
 
 impl SystemMetrics {
     /// Refresh system metrics (CPU, memory, uptime, hostname, battery, network)
     /// Does NOT refresh processes - use get_processes_native() for that
     pub fn refresh(&mut self) {
+        // Gate transitions re-prime rate baselines so the first tick after a
+        // subsystem is re-enabled reports a clean zero rate instead of a
+        // gap-averaged value.
+        let gates = COLLECT_GATES.load(std::sync::atomic::Ordering::Relaxed);
+        let newly_enabled = gates & !self.last_collect_gates;
+        self.last_collect_gates = gates;
+        if newly_enabled & collect_gates::NET != 0 {
+            self.prev_net_sample = None;
+        }
+        if newly_enabled & collect_gates::CPU != 0 {
+            cpu::reset_first_sample();
+        }
+
         // Update CPU info using native API
-        self.cpu = CpuInfo::from_native();
+        // In-place refresh keeps the per-core vecs' capacity across ticks.
+        if gates & collect_gates::CPU != 0 {
+            self.cpu.refresh_in_place();
+        }
 
         // Update memory info using native API
         self.memory = MemoryInfo::from_native();
@@ -404,35 +474,57 @@ impl SystemMetrics {
         }
 
         // Update network I/O using native API
-        if let Some(net_stats) = get_network_stats() {
+        if gates & collect_gates::NET != 0 && get_network_stats() {
             let now = Instant::now();
             let elapsed = self
                 .prev_net_sample
                 .map(|sample| now.duration_since(sample).as_secs_f64())
                 .unwrap_or(0.0);
-            let (rx_bytes, tx_bytes, rx_rate, tx_rate) = network_totals_and_rates(
-                &net_stats.interfaces,
-                self.prev_network.as_ref(),
-                elapsed,
-            );
-            self.net_rx_bytes = rx_bytes;
-            self.net_tx_bytes = tx_bytes;
-            self.net_rx_rate = rx_rate;
-            self.net_tx_rate = tx_rate;
-            self.prev_network = Some(net_stats.interfaces);
+            NETWORK_INTERFACES.with(|cell| {
+                let mut interfaces = cell.borrow_mut();
+                let (rx_bytes, tx_bytes, rx_rate, tx_rate) = network_totals_and_rates(
+                    &interfaces,
+                    self.prev_network.as_ref(),
+                    elapsed,
+                );
+                self.net_rx_bytes = rx_bytes;
+                self.net_tx_bytes = tx_bytes;
+                self.net_rx_rate = rx_rate;
+                self.net_tx_rate = tx_rate;
+                // Swap so the old baseline map becomes next tick's scratch and
+                // both sides keep their capacity.
+                match self.prev_network.as_mut() {
+                    Some(prev) => std::mem::swap(prev, &mut interfaces),
+                    None => self.prev_network = Some(std::mem::take(&mut interfaces)),
+                }
+            });
             self.prev_net_sample = Some(now);
         }
 
         // Update battery status
-        self.update_battery();
+        if gates & collect_gates::BATTERY != 0 {
+            self.update_battery();
+        }
 
         // Update GPU/NPU metrics (no-op on machines without tracked adapters)
-        let adapters = d3dkmt::refresh();
-        self.gpu = adapters.gpu;
-        self.npu = adapters.npu;
+        if gates & (collect_gates::GPU | collect_gates::NPU) != 0 {
+            let adapters = d3dkmt::refresh();
+            self.gpu = adapters.gpu;
+            self.npu = adapters.npu;
+        }
     }
 
     fn update_battery(&mut self) {
+        // Absent-battery latch: on desktops (no battery) this would otherwise
+        // poll GetSystemPowerStatus every tick forever. After a few absent
+        // reads, repoll only every ~30 s so hot-docking still recovers.
+        self.battery_absent_ticks = self.battery_absent_ticks.saturating_add(1);
+        if self.battery_percent.is_none()
+            && self.battery_absent_ticks > BATTERY_ABSENT_CONFIRM_TICKS
+            && !self.battery_absent_ticks.is_multiple_of(BATTERY_ABSENT_REPOLL_TICKS)
+        {
+            return;
+        }
         // Use Windows API for battery status
         #[cfg(windows)]
         {
@@ -442,6 +534,7 @@ impl SystemMetrics {
                 if GetSystemPowerStatus(&mut status).is_ok() {
                     if status.BatteryLifePercent <= 100 {
                         self.battery_percent = Some(status.BatteryLifePercent as f32);
+                        self.battery_absent_ticks = 0;
                     } else {
                         self.battery_percent = None; // No battery or unknown
                     }
@@ -462,16 +555,19 @@ impl SystemMetrics {
     #[cfg(windows)]
     pub fn update_processes_native(&mut self, processes: &mut Vec<ProcessInfo>) {
         use self::cache::CACHE;
-        use self::native::{calculate_process_rates, with_process_list};
-        use std::collections::HashSet;
+        use self::native::{calculate_process_rates, with_process_list, with_process_rates};
+
+        // Open the tick's exe-stat budget so due re-stats spread across ticks
+        // instead of stat-bombing the filesystem in one synchronized burst.
+        CACHE.begin_exe_tick(cache::config::EXE_STATS_PER_TICK);
 
         // On query failure (None), keep the previous process list and baselines
         // untouched rather than blanking the table for a frame.
         let _ = with_process_list(|proc_list| {
-            // Update time tracking for CPU delta calculation. The core layout
-            // is re-enumerated every tick, so the capacity denominator must be
-            // re-derived too: a hot-add or processor-group change would
-            // otherwise skew every percentage until restart.
+            // Update time tracking for CPU delta calculation. The capacity
+            // denominator follows the cached topology (30 s TTL): a hot-add
+            // or processor-group change propagates at the next re-enumeration
+            // instead of skewing every percentage until restart.
             let now = Instant::now();
             self.logical_processor_count = tick_processor_count(
                 self.logical_processor_count,
@@ -497,7 +593,8 @@ impl SystemMetrics {
             }
 
             // Get CPU percentages and I/O rates based on cache deltas
-            let rates = calculate_process_rates(&proc_list, cpu_capacity);
+            // (fills thread-local rate tables; read back via with_process_rates)
+            calculate_process_rates(&proc_list, cpu_capacity);
 
             // Update global stats
             self.tasks_total = tasks_total;
@@ -507,22 +604,28 @@ impl SystemMetrics {
             self.tasks_sleeping = 0;
             self.threads_total = threads_total;
 
-            (self.disk_read_rate, self.disk_write_rate) = aggregate_io_rates(&rates.io_rates);
+            (self.disk_read_rate, self.disk_write_rate) =
+                with_process_rates(|rates| aggregate_io_rates(&rates.io_rates));
             self.disk_read_bytes = total_disk_read;
             self.disk_write_bytes = total_disk_write;
 
             let total_mem = MemoryInfo::total_memory();
 
-            // Track which processes we've seen in this update
-            let mut seen_pids = HashSet::with_capacity(processes.len());
-
-            // Build a map of existing processes index by PID for fast lookup
-            let mut existing_map: HashMap<u32, usize> = HashMap::with_capacity(processes.len());
-            for (i, p) in processes.iter().enumerate() {
-                existing_map.insert(p.pid, i);
-            }
-
-            let mut new_processes = Vec::new();
+            // Index of existing processes by PID for fast lookup. The map
+            // lives in thread-local scratch so the per-tick table allocation
+            // disappears; `clear` keeps the capacity for the next tick.
+            // Liveness of survivors is tracked with one flag per existing
+            // slot instead of a second hashed set: the merge loop below is
+            // the only writer, so the dead-removal pass needs no hashing.
+            // (Sound because this function maintains 1:1 PID uniqueness:
+            // survivors are a subset of the previous output and new entries
+            // are disjoint from them, starting from an empty vector.)
+            // Liveness flags and the new-processes vec also live in
+            // thread-local scratch so a steady-state tick allocates nothing.
+            ALIVE_SCRATCH.with(|alive_cell| {
+                let mut alive = alive_cell.borrow_mut();
+                alive.clear();
+                alive.resize(processes.len(), false);
 
             // Per-process GPU/NPU stats (empty unless the hardware exists and
             // one of its columns is currently visible or sorted). Skip allocating
@@ -539,55 +642,87 @@ impl SystemMetrics {
             };
 
             // Iterate raw processes
-            for raw_proc in proc_list.iter() {
-                let pid = raw_proc.pid();
-                seen_pids.insert(pid);
-                let cpu_pct = rates.cpu_percentages.get(&pid).copied().unwrap_or(0.0);
-                let (io_read_rate, io_write_rate) =
-                    rates.io_rates.get(&pid).copied().unwrap_or((0, 0));
-                let proc_adapter = adapter_stats.get(&pid).copied().unwrap_or_default();
-
-                if let Some(&idx) = existing_map.get(&pid) {
-                    let native_start = raw_proc.create_time();
-                    let existing_proc = &mut processes[idx];
-
-                    if native_start == existing_proc.create_time_100ns {
-                        // Update existing process (reuses string allocations)
-                        existing_proc.update_from_raw(&raw_proc, cpu_pct, total_mem);
-                    } else {
-                        // PID reuse: replace entirely
-                        *existing_proc = ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem);
-                    }
-                    existing_proc.io_read_rate = io_read_rate;
-                    existing_proc.io_write_rate = io_write_rate;
-                    existing_proc.gpu_percent = proc_adapter.gpu_percent;
-                    existing_proc.gpu_memory = proc_adapter.gpu_memory;
-                    existing_proc.npu_percent = proc_adapter.npu_percent;
-                    existing_proc.npu_memory = proc_adapter.npu_memory;
-                } else {
-                    let mut proc_info = ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem);
-                    proc_info.io_read_rate = io_read_rate;
-                    proc_info.io_write_rate = io_write_rate;
-                    proc_info.gpu_percent = proc_adapter.gpu_percent;
-                    proc_info.gpu_memory = proc_adapter.gpu_memory;
-                    proc_info.npu_percent = proc_adapter.npu_percent;
-                    proc_info.npu_memory = proc_adapter.npu_memory;
-                    new_processes.push(proc_info);
+            PID_INDEX_SCRATCH.with(|scratch| {
+                let mut existing_map = scratch.borrow_mut();
+                existing_map.clear();
+                existing_map.reserve(processes.len());
+                for (i, p) in processes.iter().enumerate() {
+                    existing_map.insert(p.pid, i);
                 }
-            }
+                NEW_PROCESSES.with(|new_cell| {
+                    let mut new_processes = new_cell.borrow_mut();
+                    new_processes.clear();
+                with_process_rates(|rates| {
+                    for raw_proc in proc_list.iter() {
+                        let pid = raw_proc.pid();
+                        let cpu_pct = rates.cpu_percentages.get(&pid).copied().unwrap_or(0.0);
+                        let (io_read_rate, io_write_rate) =
+                            rates.io_rates.get(&pid).copied().unwrap_or((0, 0));
+                        let proc_adapter = adapter_stats.get(&pid).copied().unwrap_or_default();
 
-            // Remove dead processes
-            processes.retain(|p| seen_pids.contains(&p.pid));
+                        if let Some(&idx) = existing_map.get(&pid) {
+                            alive[idx] = true;
+                            let native_start = raw_proc.create_time();
+                            let existing_proc = &mut processes[idx];
 
-            // Append new processes
-            if !new_processes.is_empty() {
-                processes.append(&mut new_processes);
-            }
+                            if native_start == existing_proc.create_time_100ns {
+                                // Update existing process (reuses string allocations)
+                                existing_proc.update_from_raw(&raw_proc, cpu_pct, total_mem);
+                            } else {
+                                // PID reuse: replace entirely
+                                *existing_proc =
+                                    ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem);
+                            }
+                            existing_proc.io_read_rate = io_read_rate;
+                            existing_proc.io_write_rate = io_write_rate;
+                            existing_proc.gpu_percent = proc_adapter.gpu_percent;
+                            existing_proc.gpu_memory = proc_adapter.gpu_memory;
+                            existing_proc.npu_percent = proc_adapter.npu_percent;
+                            existing_proc.npu_memory = proc_adapter.npu_memory;
+                        } else {
+                            let mut proc_info =
+                                ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem);
+                            proc_info.io_read_rate = io_read_rate;
+                            proc_info.io_write_rate = io_write_rate;
+                            proc_info.gpu_percent = proc_adapter.gpu_percent;
+                            proc_info.gpu_memory = proc_adapter.gpu_memory;
+                            proc_info.npu_percent = proc_adapter.npu_percent;
+                            proc_info.npu_memory = proc_adapter.npu_memory;
+                            new_processes.push(proc_info);
+                        }
+                    }
+                });
+                });
+            });
+
+                // Remove dead processes. Order-preserving and hash-free: `alive`
+                // was sized to `processes` before the merge above, and appending
+                // happens after, so indices still line up.
+                let mut slot = 0;
+                processes.retain(|_| {
+                    let keep = alive[slot];
+                    slot += 1;
+                    keep
+                });
+            });
+
+            // Append new processes (append drains the vec but keeps its
+            // capacity in the thread-local for the next tick)
+            NEW_PROCESSES.with(|new_cell| {
+                let mut new_processes = new_cell.borrow_mut();
+                if !new_processes.is_empty() {
+                    processes.append(&mut new_processes);
+                }
+            });
 
             // Only a successful kernel query may evict cached identities. The
             // input vector can legitimately be empty while awaiting UI reuse.
+            // The live set is built only on cleanup ticks (every
+            // CLEANUP_INTERVAL refreshes) instead of on every tick.
             if CACHE.should_cleanup() {
-                self::process::cleanup_stale_caches(&seen_pids);
+                let live_pids: std::collections::HashSet<u32> =
+                    processes.iter().map(|p| p.pid).collect();
+                self::process::cleanup_stale_caches(&live_pids);
             }
         });
     }
@@ -729,5 +864,31 @@ mod tests {
         );
         assert!(ProcessEnrichmentRequirements::visible(true).contains(required));
         assert!(!ProcessEnrichmentRequirements::default().contains(required));
+    }
+
+    #[test]
+    fn gated_subsystems_keep_last_values() {
+        use super::collect_gates;
+        use super::set_collect_gates;
+
+        let mut metrics = SystemMetrics::default();
+        metrics.net_rx_bytes = 42;
+        metrics.net_tx_bytes = 43;
+        metrics.cpu.core_usage = vec![7.5];
+        metrics.battery_percent = Some(88.0);
+
+        // All gates off: refresh leaves every gated value untouched.
+        set_collect_gates(0);
+        metrics.refresh();
+        assert_eq!(metrics.net_rx_bytes, 42);
+        assert_eq!(metrics.net_tx_bytes, 43);
+        assert_eq!(metrics.cpu.core_usage, vec![7.5]);
+        assert_eq!(metrics.battery_percent, Some(88.0));
+
+        // Restored gates: refresh runs normally (values may change, but the
+        // collection path must execute without panicking on any platform).
+        set_collect_gates(collect_gates::ALL);
+        metrics.refresh();
+        set_collect_gates(collect_gates::ALL);
     }
 }

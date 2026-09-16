@@ -2,8 +2,9 @@
 
 #[cfg(windows)]
 use std::collections::HashMap;
-use std::sync::Arc;
+#[cfg(not(windows))]
 use std::time::Duration;
+use std::sync::Arc;
 
 #[cfg(windows)]
 use super::native::{SystemProcess, filetime_to_unix};
@@ -91,7 +92,8 @@ pub fn enable_debug_privilege() -> bool {
 #[cfg(windows)]
 #[inline]
 fn check_exe_status(exe_path: &str, start_time_100ns: u64) -> (bool, bool) {
-    super::cache::CACHE.check_exe_status(exe_path, start_time_100ns)
+    // Staggered: jittered deadlines + per-tick stat budget (see cache.rs).
+    super::cache::CACHE.check_exe_status_staggered(exe_path, start_time_100ns)
 }
 
 #[cfg(not(windows))]
@@ -155,6 +157,18 @@ pub enum ProcessArch {
 }
 
 impl ProcessArch {
+    /// Sort rank matching the byte order of [`ProcessArch::as_str`]
+    /// (`""` < `"ARM"` < `"x64"` < `"x86"`), so sorting compares one byte
+    /// instead of two display strings. NOT the declaration order.
+    pub fn sort_rank(&self) -> u8 {
+        match self {
+            ProcessArch::Native => 0,
+            ProcessArch::ARM64 => 1,
+            ProcessArch::X64 => 2,
+            ProcessArch::X86 => 3,
+        }
+    }
+
     /// Short display string for the architecture
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -555,27 +569,63 @@ pub fn enrich_processes_for(
     use super::cache::{CACHE, config};
     use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
 
-    // Clone only the visible PIDs' cache entries under a short read lock, instead
-    // of cloning the entire cache map (`snapshot()`) every refresh. The lock is
-    // released before the per-process syscalls below — those must NOT run while
-    // holding it, or they would stall the collector thread's cache write lock.
-    let cache_snapshot: HashMap<u32, super::cache::ProcessCacheEntry> = CACHE.with_read(|cache| {
+    // Extract only the cached facts the pass reads, under a short read lock,
+    // instead of cloning whole `ProcessCacheEntry` values (each clone copies
+    // its exe_path String). The lock is released before the per-process
+    // syscalls below — those must NOT run while holding it, or they would
+    // stall the collector thread's cache write lock.
+    struct CachedFacts {
+        elevation: Option<bool>,
+        arch: Option<ProcessArch>,
+        exe_path: Option<String>,
+        user: Option<Arc<str>>,
+        efficiency_mode: Option<bool>,
+        efficiency_valid: bool,
+        query_suppressed: bool,
+    }
+    let now = std::time::Instant::now();
+    let cache_facts: Vec<CachedFacts> = CACHE.with_read(|cache| {
         processes
             .iter()
-            .filter_map(|process| {
-                cache
+            .map(|process| {
+                let entry = cache
                     .get(&process.pid)
-                    .filter(|entry| entry.create_time == process.create_time_100ns)
-                    .map(|entry| (process.pid, entry.clone()))
+                    .filter(|entry| entry.create_time == process.create_time_100ns);
+                let efficiency_valid = entry
+                    .and_then(|e| e.efficiency_updated)
+                    .map(|updated| {
+                        now.saturating_duration_since(updated).as_millis()
+                            < config::EFFICIENCY_TTL_MS
+                    })
+                    .unwrap_or(false);
+                CachedFacts {
+                    elevation: entry.and_then(|e| e.is_elevated),
+                    arch: entry.and_then(|e| e.arch),
+                    exe_path: entry.and_then(|e| e.exe_path.clone()),
+                    user: entry.and_then(|e| e.user.clone()),
+                    efficiency_mode: if efficiency_valid {
+                        entry.and_then(|e| e.efficiency_mode)
+                    } else {
+                        None
+                    },
+                    efficiency_valid,
+                    query_suppressed: entry
+                        .and_then(|e| e.query_failed_at)
+                        .map(|at| {
+                            now.saturating_duration_since(at).as_millis()
+                                < config::QUERY_FAILURE_TTL_MS
+                        })
+                        .unwrap_or(false),
+                }
             })
             .collect()
     });
-    let now = std::time::Instant::now();
 
     // Query data sequentially - parallel overhead exceeds benefit for this workload
     let enriched_data: Vec<EnrichedProcessData> = processes
         .iter()
-        .map(|p| {
+        .enumerate()
+        .map(|(row_idx, p)| {
             let identity = p.identity();
             let pid = identity.pid;
             if pid == 0 || pid == 4 {
@@ -596,40 +646,22 @@ pub fn enrich_processes_for(
                 };
             }
 
-            // Get cached entry from unified snapshot
-            let cached_entry = cache_snapshot.get(&pid);
-
-            // Check each cached fact independently. A failed query for one field
-            // must not cause unrelated cached facts to be ignored or overwritten
+            // Facts extracted under this pass's read lock (see cache_facts).
+            // Each field is independent: a failed query for one field must
+            // not cause unrelated cached facts to be ignored or overwritten
             // with fabricated defaults.
-            let cached_elevation = cached_entry.and_then(|e| e.is_elevated);
-            let cached_arch = cached_entry.and_then(|e| e.arch);
-            let cached_exe_path = cached_entry.and_then(|e| e.exe_path.clone());
-            let cached_user = cached_entry.and_then(|e| e.user.clone());
-
-            // Check if efficiency cache is still valid (within TTL)
-            let efficiency_valid = cached_entry
-                .and_then(|e| e.efficiency_updated)
-                .map(|updated| {
-                    now.saturating_duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS
-                })
-                .unwrap_or(false);
+            let facts = &cache_facts[row_idx];
+            let cached_elevation = facts.elevation;
+            let cached_arch = facts.arch;
+            let cached_exe_path = facts.exe_path.clone();
+            let cached_user = facts.user.clone();
+            let efficiency_valid = facts.efficiency_valid;
             let cached_efficiency_mode = if efficiency_valid {
-                cached_entry.and_then(|e| e.efficiency_mode)
+                facts.efficiency_mode
             } else {
                 None
             };
-
-            // Negative cache: if a query for this PID failed within the TTL,
-            // the facts are "unknown but recently tried" — skip the doomed
-            // retries (OpenProcess + failing syscalls) until it lapses. Facts
-            // that succeeded are cached normally and unaffected.
-            let query_suppressed = cached_entry
-                .and_then(|e| e.query_failed_at)
-                .map(|at| {
-                    now.saturating_duration_since(at).as_millis() < config::QUERY_FAILURE_TTL_MS
-                })
-                .unwrap_or(false);
+            let query_suppressed = facts.query_suppressed;
 
             // Determine what we need to query
             let need_arch = requirements.arch && cached_arch.is_none() && !query_suppressed;
@@ -1069,21 +1101,23 @@ pub struct ProcessInfo {
     pub exe_path: Arc<str>, // Full executable path
     pub command: Arc<str>,  // Executable path or name; arguments are not collected
     pub user: Arc<str>,
-    pub status: char,
+    pub status: u8, // ASCII code of the status letter ('S', 'R', …); see status_char()
     pub cpu_percent: f32,
     pub mem_percent: f32,
     pub virtual_mem: u64,
     pub resident_mem: u64,
     pub shared_mem: u64,
     pub priority: i32,
-    pub cpu_time: Duration,
-    pub tree_depth: usize,
+    /// Cumulative CPU time in 100 ns ticks (was a 16 B `Duration`; the ticks
+    /// are the native unit the collector already hands us).
+    pub cpu_time: u64,
+    pub tree_depth: u16,
     pub tree_prefix: String, // Tree display prefix (├─, └─, │, etc.)
     // New fields for extended features
     pub has_children: bool,     // Has child processes (for tree view)
     pub is_collapsed: bool,     // Is collapsed in tree view
     pub thread_count: u32,      // Number of threads
-    pub start_time: u64,        // Process start time (Unix timestamp)
+    pub start_time: u32,        // Process start time (Unix timestamp; good to 2106)
     pub create_time_100ns: u64, // Raw Windows FILETIME process creation timestamp
     pub handle_count: u32,      // Number of handles (Windows)
     pub io_read_bytes: u64,     // I/O bytes read (cumulative)
@@ -1124,11 +1158,12 @@ impl ProcessInfo {
 
     /// Format CPU time as HH:MM:SS or MM:SS.ms
     pub fn format_cpu_time(&self) -> String {
-        let secs = self.cpu_time.as_secs();
+        // cpu_time is 100 ns ticks: 10_000_000 ticks = 1 s, 100_000 = 1 cs.
+        let secs = self.cpu_time / 10_000_000;
         let hours = secs / 3600;
         let mins = (secs % 3600) / 60;
         let secs = secs % 60;
-        let centis = self.cpu_time.subsec_millis() / 10;
+        let centis = (self.cpu_time % 10_000_000) / 100_000;
 
         if hours > 0 {
             format!("{:02}:{:02}:{:02}", hours, mins, secs)
@@ -1160,14 +1195,11 @@ impl ProcessInfo {
 
         self.parent_pid = proc.parent_pid();
 
-        let total_100ns = proc.kernel_time() + proc.user_time();
-        self.cpu_time = Duration::new(
-            total_100ns / 10_000_000,
-            ((total_100ns % 10_000_000) * 100) as u32,
-        );
+        // Native unit passthrough: ticks need no conversion.
+        self.cpu_time = proc.kernel_time() + proc.user_time();
 
         self.create_time_100ns = proc.create_time();
-        self.start_time = filetime_to_unix(self.create_time_100ns);
+        self.start_time = filetime_to_unix(self.create_time_100ns) as u32;
 
         let (exe_updated, exe_deleted) = check_exe_status(&self.exe_path, self.create_time_100ns);
         self.exe_updated = exe_updated;
@@ -1234,13 +1266,9 @@ impl ProcessInfo {
             0.0
         };
 
-        let total_100ns = proc.kernel_time() + proc.user_time();
-        let cpu_time = Duration::new(
-            total_100ns / 10_000_000,
-            ((total_100ns % 10_000_000) * 100) as u32,
-        );
+        let cpu_time = proc.kernel_time() + proc.user_time();
 
-        let start_time = filetime_to_unix(create_time_100ns);
+        let start_time = filetime_to_unix(create_time_100ns) as u32;
 
         // Parse name only here (allocation)
         let name: Arc<str> = proc.name().into();
@@ -1268,7 +1296,7 @@ impl ProcessInfo {
             exe_path,
             command,
             user,
-            status: '?',
+            status: b'?',
             cpu_percent,
             mem_percent,
             virtual_mem: proc.virtual_size(),
@@ -1524,5 +1552,44 @@ mod lookup_account_retry_tests {
     fn bails_on_implausible_size_instead_of_allocating_it() {
         assert_eq!(lookup_account_retry_sizes(256, 256, u32::MAX, 10), None);
         assert_eq!(lookup_account_retry_sizes(256, 256, 10, u32::MAX), None);
+    }
+}
+
+#[cfg(test)]
+mod arch_sort_rank_tests {
+    use super::ProcessArch;
+
+    #[test]
+    fn arch_sort_rank_matches_display_string_order() {
+        let all = [
+            ProcessArch::Native,
+            ProcessArch::X86,
+            ProcessArch::X64,
+            ProcessArch::ARM64,
+        ];
+        for a in all {
+            for b in all {
+                assert_eq!(
+                    a.sort_rank().cmp(&b.sort_rank()),
+                    a.as_str().cmp(b.as_str()),
+                    "{a:?} vs {b:?}: rank order diverges from as_str order"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::ProcessInfo;
+
+    #[test]
+    fn process_info_stays_at_shrunk_size() {
+        // Round 3 shrank this from 296 B (Duration cpu_time, usize
+        // tree_depth, u64 start_time, char status → 280). Reaching 272 would
+        // additionally require packing the 7 bools + status + arch into one
+        // flag byte, which costs accessor churn across every consumer for 8
+        // bytes per slot (~22 KB total) — declined.
+        assert_eq!(std::mem::size_of::<ProcessInfo>(), 280);
     }
 }

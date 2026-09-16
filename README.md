@@ -25,7 +25,7 @@
 Windows Task Manager is fine, but power users deserve better. **htop-win** brings the beloved Unix htop experience to Windows with:
 
 - **Blazing fast performance** - Direct Windows API calls, no wrappers
-- **Tiny footprint** - ~500KB binary with minimal dependencies
+- **Small footprint** - ~930KB self-contained binary with minimal dependencies
 - **Full htop compatibility** - Same keyboard shortcuts you already know
 - **Windows-native features** - Efficiency Mode, CPU affinity, elevation detection
 - **GPU/NPU monitoring** - Task Manager parity via D3DKMT, auto-enabled when hardware exists
@@ -149,7 +149,7 @@ htop --update --force
 git clone https://github.com/faratech/htop-win.git
 cd htop-win
 
-# Build optimized release (~500KB binary)
+# Build optimized release (~930KB binary)
 cargo build --release
 
 # Run
@@ -414,10 +414,10 @@ Minimal dependency set optimized for small binary size:
 
 htop-win is designed for efficiency:
 
-- **~500KB binary** - Minimal dependencies, LTO optimization
-- **Efficiency Mode by default** - Runs with reduced CPU priority
-- **Smart caching** - Minimizes Windows API calls
-- **Background data collection** - System metrics refresh off the UI thread
+- **~930KB binary** - Minimal dependencies, LTO, size-optimized release profile
+- **Buffered rendering** - One terminal flush per frame; 32-byte packed cells
+- **Smart caching & gating** - Subsystems collect only when their meters are visible
+- **Background data collection** - System metrics refresh off the UI thread; idle when paused
 - **Diff-based rendering** - Only updates changed terminal cells
 - **Direct API access** - No abstraction layers
 
@@ -437,7 +437,7 @@ htop-win is designed for efficiency:
 | I/O per-process | Yes | No | Yes |
 | Custom columns | Yes | Limited | Yes |
 | Color themes | 8 themes | No | No |
-| Binary size | ~500KB | N/A | ~2MB |
+| Binary size | ~930KB | N/A | ~2MB |
 | Auto-update | Yes | N/A | No |
 
 ---

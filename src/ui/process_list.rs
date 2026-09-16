@@ -3,7 +3,74 @@ use crate::terminal::{
 };
 
 use crate::app::{App, SortColumn};
+use crate::system::ProcessArch;
 use crate::ui::colors::Theme;
+
+thread_local! {
+    /// Recycled cell strings. The render path hands owned `String`s to
+    /// `Span`s; after each frame the strings are cleared and returned here so
+    /// a steady-state frame allocates almost nothing (~500 short strings).
+    static SPAN_POOL: std::cell::RefCell<Vec<String>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+/// Pop a cleared string from the render pool (or start a fresh one).
+fn pooled_string() -> String {
+    SPAN_POOL.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        let mut s = pool.pop().unwrap_or_default();
+        s.clear();
+        s
+    })
+}
+
+/// Return an owned span string to the render pool (capacity is kept).
+fn recycle_string(mut s: String) {
+    s.clear();
+    SPAN_POOL.with(|pool| pool.borrow_mut().push(s));
+}
+
+/// Recycle a frame's owned span strings. Borrowed spans pass through.
+fn recycle_row(row: &mut Row<'_>) {
+    for cell in row.cells_mut() {
+        for span in &mut cell.content_mut().spans {
+            if let std::borrow::Cow::Owned(text) = &mut span.content {
+                let taken = std::mem::take(text);
+                recycle_string(taken);
+            }
+        }
+    }
+}
+
+/// Format into a pooled String (recycled after render by `recycle_row`).
+macro_rules! pfmt {
+    ($($arg:tt)*) => {{
+        let mut s = pooled_string();
+        let _ = std::fmt::Write::write_fmt(&mut s, format_args!($($arg)*));
+        s
+    }};
+}
+
+/// Float cells: exact integer-tenths formatting straight into a pooled
+/// string (replaces format!'s float machinery on the hottest cells).
+macro_rules! fmt_tenths {
+    ($val:expr, $width:expr) => {{
+        let mut s = pooled_string();
+        crate::numfmt::tenths_into(&mut s, $val, $width);
+        s
+    }};
+}
+
+/// Scaled byte cells with a unit suffix, same pooled-string treatment.
+macro_rules! fmt_scaled_bytes {
+    ($bytes:expr, $pow:expr, $unit:literal) => {{
+        let mut s = pooled_string();
+        crate::numfmt::scaled_bytes_into(&mut s, $bytes, $pow);
+        s.push_str($unit);
+        s
+    }};
+}
 
 /// Format CPU time with multi-colored output like htop's Row_printTime
 /// Optimized: returns single span when colors are uniform (selected or !highlight_large_numbers)
@@ -53,15 +120,15 @@ fn format_time_colored<'a>(
     if use_uniform {
         // Single span - no multi-color needed
         let text = if total_mins < 60 {
-            format!("{:2}:{:02}.{:02}", total_mins, secs, centis)
+            pfmt!("{:2}:{:02}.{:02}", total_mins, secs, centis)
         } else if total_hours < 24 {
-            format!("{:2}h{:02}:{:02}", total_hours, mins, secs)
+            pfmt!("{:2}h{:02}:{:02}", total_hours, mins, secs)
         } else if total_days < 365 {
-            format!("{:3}d {:02}h", total_days, hours)
+            pfmt!("{:3}d {:02}h", total_days, hours)
         } else {
             let years = total_days / 365;
             let days = total_days % 365;
-            format!("{:3}y{:03}d", years, days)
+            pfmt!("{:3}y{:03}d", years, days)
         };
         return vec![Span::styled(text, Style::default().fg(base_color))];
     }
@@ -73,17 +140,17 @@ fn format_time_colored<'a>(
 
     if total_mins < 60 {
         vec![Span::styled(
-            format!("{:2}:{:02}.{:02}", total_mins, secs, centis),
+            pfmt!("{:2}:{:02}.{:02}", total_mins, secs, centis),
             Style::default().fg(base_color),
         )]
     } else if total_hours < 24 {
         vec![
             Span::styled(
-                format!("{:2}h", total_hours),
+                pfmt!("{:2}h", total_hours),
                 Style::default().fg(hour_color),
             ),
             Span::styled(
-                format!("{:02}:{:02}", mins, secs),
+                pfmt!("{:02}:{:02}", mins, secs),
                 Style::default().fg(base_color),
             ),
         ]
@@ -91,17 +158,17 @@ fn format_time_colored<'a>(
         // "{:3}d " (5) + "{:02}h" (3) = same 8-char width as the other scales
         vec![
             Span::styled(
-                format!("{:3}d ", total_days),
+                pfmt!("{:3}d ", total_days),
                 Style::default().fg(day_color),
             ),
-            Span::styled(format!("{:02}h", hours), Style::default().fg(hour_color)),
+            Span::styled(pfmt!("{:02}h", hours), Style::default().fg(hour_color)),
         ]
     } else {
         let years = total_days / 365;
         let days = total_days % 365;
         vec![
-            Span::styled(format!("{:3}y", years), Style::default().fg(year_color)),
-            Span::styled(format!("{:03}d", days), Style::default().fg(day_color)),
+            Span::styled(pfmt!("{:3}y", years), Style::default().fg(year_color)),
+            Span::styled(pfmt!("{:03}d", days), Style::default().fg(day_color)),
         ]
     }
 }
@@ -129,15 +196,15 @@ fn format_bytes_colored<'a>(
     // Fast path: uniform color (selected or no highlighting)
     if is_selected || !highlight_large_numbers {
         let text = if bytes >= TB {
-            format!("{:.1}T", bytes as f64 / TB as f64)
+            fmt_scaled_bytes!(bytes, 40, "T")
         } else if bytes >= GB {
-            format!("{:.1}G", bytes as f64 / GB as f64)
+            fmt_scaled_bytes!(bytes, 30, "G")
         } else if bytes >= MB {
-            format!("{:.0}M", bytes as f64 / MB as f64)
+            fmt_scaled_bytes!(bytes, 20, "M")
         } else if bytes >= KB {
-            format!("{:.0}K", bytes as f64 / KB as f64)
+            fmt_scaled_bytes!(bytes, 10, "K")
         } else {
-            format!("{}B", bytes)
+            pfmt!("{}B", bytes)
         };
         return vec![Span::styled(text, Style::default().fg(base_color))];
     }
@@ -148,49 +215,50 @@ fn format_bytes_colored<'a>(
     let color_tb = theme.large_number;
 
     if bytes >= TB {
-        let tb = bytes as f64 / TB as f64;
         vec![Span::styled(
-            format!("{:.1}T", tb),
+            pfmt!("{}T", crate::numfmt::scaled_bytes(bytes, 40)),
             Style::default().fg(color_tb),
         )]
     } else if bytes >= GB {
-        let gb = bytes as f64 / GB as f64;
-        if gb < 10.0 {
-            let int_part = gb as u64;
-            let dec_part = ((gb - int_part as f64) * 10.0) as u64;
+        // floor(bytes*10 / 2^30) reproduces the old float truncation exactly
+        let tenths_total = (u128::from(bytes) * 10 / (1u128 << 30)) as u64;
+        if tenths_total < 100 {
+            let (int_part, dec_part) = (tenths_total / 10, tenths_total % 10);
             vec![
-                Span::styled(format!("{}", int_part), Style::default().fg(color_gb)),
-                Span::styled(format!(".{}G", dec_part), Style::default().fg(color_mb)),
+                Span::styled(pfmt!("{}", int_part), Style::default().fg(color_gb)),
+                Span::styled(pfmt!(".{}G", dec_part), Style::default().fg(color_mb)),
             ]
         } else {
             vec![
-                Span::styled(format!("{:.0}", gb), Style::default().fg(color_gb)),
+                Span::styled(
+                    pfmt!("{}", crate::numfmt::scaled_bytes_round0(bytes, 30)),
+                    Style::default().fg(color_gb),
+                ),
                 Span::styled("G", Style::default().fg(color_mb)), // Use static str
             ]
         }
     } else if bytes >= MB {
-        let mb = bytes as f64 / MB as f64;
-        if mb < 10.0 {
-            let int_part = mb as u64;
-            let dec_part = ((mb - int_part as f64) * 10.0) as u64;
+        let tenths_total = (u128::from(bytes) * 10 / (1u128 << 20)) as u64;
+        if tenths_total < 100 {
+            let (int_part, dec_part) = (tenths_total / 10, tenths_total % 10);
             vec![
-                Span::styled(format!("{}", int_part), Style::default().fg(color_mb)),
-                Span::styled(format!(".{}M", dec_part), Style::default().fg(base_color)),
+                Span::styled(pfmt!("{}", int_part), Style::default().fg(color_mb)),
+                Span::styled(pfmt!(".{}M", dec_part), Style::default().fg(base_color)),
             ]
         } else {
             vec![Span::styled(
-                format!("{:.0}M", mb),
+                pfmt!("{}M", crate::numfmt::scaled_bytes_round0(bytes, 20)),
                 Style::default().fg(color_mb),
             )]
         }
     } else if bytes >= KB {
         vec![Span::styled(
-            format!("{:.0}K", bytes as f64 / KB as f64),
+            pfmt!("{}K", crate::numfmt::scaled_bytes_round0(bytes, 10)),
             Style::default().fg(base_color),
         )]
     } else {
         vec![Span::styled(
-            format!("{}B", bytes),
+            pfmt!("{}B", bytes),
             Style::default().fg(base_color),
         )]
     }
@@ -229,8 +297,9 @@ fn get_shadow_prefix_len(path: &str) -> usize {
 /// is scaled down proportionally so every column stays visible — columns
 /// shrink instead of getting cut off at the right edge.
 ///
-/// Shared with `ui::mod::calculate_column_bounds` so the click-region x/width
-/// bookkeeping matches what the Table widget actually renders.
+/// Resolved once per frame by `ui::draw` and shared with both the click-region
+/// bookkeeping (`ui::mod::calculate_column_bounds`) and the Table widget below,
+/// so both agree on column x/width by construction.
 pub fn adaptive_column_widths(columns: &[SortColumn], area_width: u16) -> Vec<Constraint> {
     const COLUMN_SPACING: u16 = 1;
     /// Minimum rendered width for any non-Command column — picked so values like
@@ -322,7 +391,10 @@ pub fn adaptive_column_widths(columns: &[SortColumn], area_width: u16) -> Vec<Co
         .collect()
 }
 
-pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
+/// Draw the process table. Column widths are resolved once per frame by the
+/// caller (`ui::draw`) and shared with the click-region bookkeeping there, so
+/// the adaptive sizing math runs once instead of twice with identical inputs.
+pub fn draw(frame: &mut Frame, app: &App, area: Rect, column_widths: &[Constraint]) {
     let theme = &app.theme;
 
     // Use cached visible columns (updated when config changes)
@@ -344,16 +416,22 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             } else {
                 ""
             };
-            Cell::new(format!("{}{}", name, indicator))
+            // Two borrowed spans render identically to the formatted string
+            // (set_line concatenates with no separator) without per-column
+            // String allocations.
+            Cell::from(Line::from(vec![
+                Span::raw(name),
+                Span::raw(indicator),
+            ]))
         })
         .collect();
 
     let header = Row::new(header_cells).style(header_style).height(1);
 
-    // Column widths for visible columns only. Use adaptive sizing so columns
-    // shrink proportionally when the terminal is too narrow to fit them all at
-    // natural width, instead of getting cut off.
-    let widths: Vec<Constraint> = adaptive_column_widths(visible_columns, area.width);
+    // Column widths arrive pre-resolved from `ui::draw` (shared with the
+    // click-region bookkeeping so both agree exactly). `Table::new` copies the
+    // small slice into its owned vec; the adaptive math itself runs once.
+    let widths: &[Constraint] = column_widths;
 
     // Cache current time for start_time formatting (avoid syscall per process)
     let now_secs = std::time::SystemTime::now()
@@ -368,16 +446,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     // mem::take() and start from an empty one next call. Each cell then costs
     // exactly one allocation (the write! growth), same as format!, but without
     // the extra deep copy.
-    use std::fmt::Write;
-    let mut fmt_buf = String::new();
-
-    // Macro to format into `fmt_buf` and take ownership of it as an owned
-    // String; `mem::take` leaves `fmt_buf` empty for the next call.
+    // Cell strings come from the recycled span pool (see SPAN_POOL); the
+    // pooled strings are returned after render in `recycle_row`.
     macro_rules! fmt {
-        ($($arg:tt)*) => {{
-            write!(fmt_buf, $($arg)*).unwrap();
-            std::mem::take(&mut fmt_buf)
-        }};
+        ($($arg:tt)*) => {{ pfmt!($($arg)*) }};
     }
 
     // Build rows
@@ -392,19 +464,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             let is_tagged = app.tagged_pids.contains(&proc.identity());
             let matches_search = proc.matches_search;
 
-            // Tree prefix for tree view (avoid allocation when not in tree mode)
-            let tree_prefix: std::borrow::Cow<str> = if app.tree_view {
-                if proc.has_children {
-                    if proc.is_collapsed {
-                        format!("{}[+]", proc.tree_prefix).into()
-                    } else {
-                        format!("{}[-]", proc.tree_prefix).into()
-                    }
-                } else {
-                    std::borrow::Cow::Borrowed(&proc.tree_prefix)
-                }
+            // Tree prefix for tree view (zero-allocation: borrows the stored
+            // prefix; the collapsed/expanded marker rides as a second static
+            // span instead of a format!-allocated "[+]/[-]" suffix).
+            let tree_prefix: &str = if app.tree_view { &proc.tree_prefix } else { "" };
+            // Static collapse marker for parents in tree view (same tree color
+            // as the prefix, so rendering is identical to one merged span).
+            let tree_marker: &str = if app.tree_view && proc.has_children {
+                if proc.is_collapsed { "[+]" } else { "[-]" }
             } else {
-                std::borrow::Cow::Borrowed("")
+                ""
             };
 
             // Choose between full command path or just the program name.
@@ -453,10 +522,17 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                         }
 
                         // Architecture indicator - use theme's megabytes color (cyan in default)
-                        let arch_str = proc.arch.as_str();
-                        if !arch_str.is_empty() {
+                        // Static tags: the only non-native arches are x86/x64/ARM,
+                        // so no format! allocation is needed.
+                        let arch_tag: &str = match proc.arch {
+                            ProcessArch::Native => "",
+                            ProcessArch::X86 => "[x86] ",
+                            ProcessArch::X64 => "[x64] ",
+                            ProcessArch::ARM64 => "[ARM] ",
+                        };
+                        if !arch_tag.is_empty() {
                             spans.push(Span::styled(
-                                format!("[{}] ", arch_str),
+                                arch_tag,
                                 Style::default().fg(if is_selected {
                                     theme.selection_fg
                                 } else {
@@ -465,16 +541,19 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             ));
                         }
 
-                        // Tree prefix with tree color (avoid clone when empty)
-                        if !tree_prefix.is_empty() {
-                            spans.push(Span::styled(
-                                tree_prefix.to_string(),
-                                Style::default().fg(if is_selected {
-                                    theme.selection_fg
-                                } else {
-                                    theme.process_tree
-                                }),
-                            ));
+                        // Tree prefix with tree color (both parts borrowed)
+                        if !tree_prefix.is_empty() || !tree_marker.is_empty() {
+                            let tree_style = Style::default().fg(if is_selected {
+                                theme.selection_fg
+                            } else {
+                                theme.process_tree
+                            });
+                            if !tree_prefix.is_empty() {
+                                spans.push(Span::styled(tree_prefix, tree_style));
+                            }
+                            if !tree_marker.is_empty() {
+                                spans.push(Span::styled(tree_marker, tree_style));
+                            }
                         }
 
                         // htop style command coloring:
@@ -701,7 +780,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                                 if is_selected {
                                     theme.selection_fg
                                 } else {
-                                    theme.status_color(proc.status)
+                                    theme.status_color(char::from(proc.status))
                                 },
                             )
                         }
@@ -715,7 +794,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 theme.process // htop uses default/white for normal values
                             };
-                            (fmt!("{:>5.1}", proc.cpu_percent), color)
+                            (fmt_tenths!(proc.cpu_percent, 5), color)
                         }
                         SortColumn::Mem => {
                             // htop Row_printPercentage: default color, >= 99.9% is cyan (when highlight_large_numbers)
@@ -727,12 +806,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 theme.process // htop uses default/white for normal values
                             };
-                            (fmt!("{:>5.1}", proc.mem_percent), color)
+                            (fmt_tenths!(proc.mem_percent, 5), color)
                         }
                         SortColumn::Time => {
                             // htop: Multi-colored time display (when highlight_large_numbers enabled)
                             let spans = format_time_colored(
-                                proc.cpu_time,
+                                std::time::Duration::from_nanos(proc.cpu_time * 100),
                                 theme,
                                 is_selected,
                                 app.config.highlight_large_numbers,
@@ -740,7 +819,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             return Cell::from(Line::from(spans));
                         }
                         SortColumn::StartTime => {
-                            let time_str = format_start_time(proc.start_time, now_secs);
+                            let time_str = format_start_time(u64::from(proc.start_time), now_secs);
                             (
                                 fmt!("{:>7}", time_str),
                                 if is_selected {
@@ -875,7 +954,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 theme.process
                             };
-                            (fmt!("{:>5.1}", proc.gpu_percent), color)
+                            (fmt_tenths!(proc.gpu_percent, 5), color)
                         }
                         SortColumn::GpuMem => {
                             if proc.gpu_memory == 0 {
@@ -909,7 +988,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             } else {
                                 theme.process
                             };
-                            (fmt!("{:>5.1}", proc.npu_percent), color)
+                            (fmt_tenths!(proc.npu_percent, 5), color)
                         }
                         SortColumn::NpuMem => {
                             if proc.npu_memory == 0 {
@@ -941,7 +1020,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                     let style = if *col == SortColumn::Cpu && proc.cpu_percent > 50.0 {
                         Style::default().fg(color).add_modifier(Modifier::BOLD)
                     } else if *col == SortColumn::Status
-                        && (proc.status == 'R' || proc.status == 'D' || proc.status == 'Z')
+                        && (proc.status == b'R' || proc.status == b'D' || proc.status == b'Z')
                     {
                         // htop: Running is green, D/Z states are A_BOLD | Red
                         Style::default().fg(color).add_modifier(Modifier::BOLD)
@@ -962,7 +1041,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             let highlight_duration_secs = app.config.highlight_duration_ms / 1000;
             let is_new_process = app.config.highlight_new_processes
                 && proc.start_time > 0
-                && now_secs.saturating_sub(proc.start_time) < highlight_duration_secs;
+                && now_secs.saturating_sub(u64::from(proc.start_time)) < highlight_duration_secs;
 
             // Row styling - always set background from theme
             // htop uses A_BOLD for selected and tagged processes
@@ -992,11 +1071,30 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
 
-    let table = Table::new(rows, widths)
+    // Reuse the widths Layout::split already resolved for this frame's click
+    // regions (ui::draw -> app.ui_bounds.columns) so paint and hit-testing
+    // cannot drift apart, and the table skips its own constraint pass.
+    let resolved: Vec<u16> = if app.ui_bounds.columns.len() == visible_columns.len() {
+        app.ui_bounds.columns.iter().map(|b| b.width).collect()
+    } else {
+        Vec::new()
+    };
+    let mut table = Table::new(rows, widths)
         .header(header)
         .block(Block::default().borders(Borders::NONE))
         .row_highlight_style(Style::default())
-        .column_spacing(1);
+        .column_spacing(1)
+        .column_widths_resolved(resolved);
+
+    // Render by reference so `rows` stay caller-owned, then hand every owned
+    // span string back to the pool for the next frame.
+    frame.render_widget(&table, area);
+    if let Some(header) = table.header_mut() {
+        recycle_row(header);
+    }
+    for row in table.rows_mut() {
+        recycle_row(row);
+    }
 
     frame.render_widget(table, area);
 }
@@ -1043,17 +1141,17 @@ fn format_start_time(start_time: u64, now: u64) -> std::borrow::Cow<'static, str
     // If started today, show as HH:MM
     // If started more than a day ago, show as days
     Cow::Owned(if elapsed_secs < 60 {
-        format!("{}s", elapsed_secs)
+        pfmt!("{}s", elapsed_secs)
     } else if elapsed_secs < 3600 {
-        format!("{}m", elapsed_secs / 60)
+        pfmt!("{}m", elapsed_secs / 60)
     } else if elapsed_secs < 86400 {
-        format!("{}h{}m", elapsed_secs / 3600, (elapsed_secs % 3600) / 60)
+        pfmt!("{}h{}m", elapsed_secs / 3600, (elapsed_secs % 3600) / 60)
     } else {
         let days = elapsed_secs / 86400;
         if days > 99 {
-            format!("{}d", days)
+            pfmt!("{}d", days)
         } else {
-            format!("{}d{}h", days, (elapsed_secs % 86400) / 3600)
+            pfmt!("{}d{}h", days, (elapsed_secs % 86400) / 3600)
         }
     })
 }

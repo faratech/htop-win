@@ -1,6 +1,6 @@
 [package]
 name = "htop-win"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2024"
 description = "A Windows clone of htop - interactive process viewer"
 authors = ["htop-win contributors"]
@@ -28,8 +28,6 @@ windows = { version = "0.62", features = [
     "Win32_Storage_FileSystem",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
-    "Win32_UI_Shell",
-    "Win32_System_Com",
     "Win32_Networking_WinHttp",
     "Wdk_System_SystemInformation",
     "Wdk_Graphics_Direct3D",
@@ -39,7 +37,7 @@ windows = { version = "0.62", features = [
 embed-resource = "3"
 
 [profile.release]
-opt-level = "z"      # Optimize for size
+opt-level = "s"      # Optimize for size while keeping reasonable speed
 lto = true
 codegen-units = 1
 panic = "abort"      # Smaller binary, no unwinding

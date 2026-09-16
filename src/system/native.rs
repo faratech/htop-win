@@ -8,10 +8,12 @@ use std::os::windows::ffi::OsStringExt;
 use windows::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
 use windows::Win32::Foundation::{HANDLE, UNICODE_STRING};
 
-// Reusable buffer for NtQuerySystemInformation to avoid repeated allocations
+// Reusable buffer for NtQuerySystemInformation to avoid repeated allocations.
+// Starts at 256 KB (typical lists are ~400 KB, so one grow usually happens)
+// instead of eagerly holding a full 1 MiB; the loop below grows on demand.
 thread_local! {
     static QUERY_BUFFER: std::cell::RefCell<Vec<usize>> =
-        std::cell::RefCell::new(Vec::with_capacity(bytes_to_words(1024 * 1024)));
+        std::cell::RefCell::new(Vec::with_capacity(bytes_to_words(256 * 1024)));
 }
 
 #[inline]
@@ -158,7 +160,7 @@ where
 {
     QUERY_BUFFER.with(|buf| {
         let mut buffer = buf.borrow_mut();
-        let min_words = bytes_to_words(1024 * 1024);
+        let min_words = bytes_to_words(256 * 1024);
         let cap = buffer.capacity();
         if cap < min_words {
             buffer.reserve(min_words - cap);
@@ -213,73 +215,93 @@ where
 // It was used in from_native, so we might need a version of it or update from_native.
 // We'll update from_native to use SystemProcess.
 
-/// CPU and I/O rate data computed from cache deltas
+/// CPU and I/O rate data computed from cache deltas. Lives in thread-local
+/// scratch (see `PROCESS_RATES`) and is cleared+refilled each tick so the
+/// per-tick table allocations disappear; `Default` gives the empty starting
+/// state.
+#[derive(Default)]
 pub struct ProcessRates {
     pub cpu_percentages: HashMap<u32, f32>,
     pub io_rates: HashMap<u32, (u64, u64)>, // (read_rate, write_rate)
 }
 
+thread_local! {
+    /// Per-tick rate tables (see [`ProcessRates`]). Borrowed through
+    /// `with_process_rates` during the merge pass; never re-entered from
+    /// inside that closure.
+    static PROCESS_RATES: std::cell::RefCell<ProcessRates> =
+        std::cell::RefCell::new(ProcessRates::default());
+    /// Per-tick cache-update tuples (48 B/process), capacity kept.
+    static CACHE_UPDATES: std::cell::RefCell<Vec<(u32, u64, u64, u64, u64, u64)>> =
+        std::cell::RefCell::new(Vec::new());
+}
+
+/// Runs `f` with the rate tables filled by the most recent
+/// [`calculate_process_rates`] call on this thread.
+pub fn with_process_rates<R>(f: impl FnOnce(&ProcessRates) -> R) -> R {
+    PROCESS_RATES.with(|rates| f(&rates.borrow()))
+}
+
 /// Calculate CPU percentages and I/O rates for all processes using cache deltas.
 /// `cpu_capacity_delta` is monotonic wall time multiplied by all logical CPUs,
 /// expressed in the same 100-nanosecond units as each process CPU counter.
-pub fn calculate_process_rates(list: &SystemProcessList, cpu_capacity_delta: u64) -> ProcessRates {
+pub fn calculate_process_rates(list: &SystemProcessList, cpu_capacity_delta: u64) {
     use super::cache::CACHE;
 
     let now = std::time::Instant::now();
-    let mut updates = Vec::with_capacity(500);
 
-    let cpu_percentages = CACHE.with_read(|cache_snapshot| {
-        let mut percentages = HashMap::with_capacity(500);
+    CACHE_UPDATES.with(|updates_cell| {
+        let mut updates = updates_cell.borrow_mut();
+        updates.clear();
+        PROCESS_RATES.with(|rates_cell| {
+            let mut rates = rates_cell.borrow_mut();
+            rates.cpu_percentages.clear();
+            CACHE.with_read(|cache_snapshot| {
+                for proc in list.iter() {
+                    let pid = proc.pid();
+                    let create_time = proc.create_time();
 
-        for proc in list.iter() {
-            let pid = proc.pid();
-            let create_time = proc.create_time();
+                    if pid == 0 {
+                        rates.cpu_percentages.insert(0, 0.0);
+                        continue;
+                    }
 
-            if pid == 0 {
-                percentages.insert(0, 0.0);
-                continue;
-            }
+                    let total_time = proc.kernel_time() + proc.user_time();
 
-            let total_time = proc.kernel_time() + proc.user_time();
+                    let cpu_percent = if let Some(entry) = cache_snapshot.get(&pid) {
+                        let prev_total = entry.kernel_time + entry.user_time;
+                        let time_delta = total_time.saturating_sub(prev_total);
 
-            let cpu_percent = if let Some(entry) = cache_snapshot.get(&pid) {
-                let prev_total = entry.kernel_time + entry.user_time;
-                let time_delta = total_time.saturating_sub(prev_total);
+                        if entry.create_time == create_time
+                            && now > entry.cpu_time_updated
+                            && cpu_capacity_delta > 0
+                        {
+                            super::process_cpu_percentage(time_delta, cpu_capacity_delta)
+                        } else {
+                            0.0
+                        }
+                    } else {
+                        0.0
+                    };
 
-                if entry.create_time == create_time
-                    && now > entry.cpu_time_updated
-                    && cpu_capacity_delta > 0
-                {
-                    super::process_cpu_percentage(time_delta, cpu_capacity_delta)
-                } else {
-                    0.0
+                    rates.cpu_percentages.insert(pid, cpu_percent);
+
+                    updates.push((
+                        pid,
+                        proc.kernel_time(),
+                        proc.user_time(),
+                        proc.create_time(),
+                        proc.read_bytes(),
+                        proc.write_bytes(),
+                    ));
                 }
-            } else {
-                0.0
-            };
+            });
 
-            percentages.insert(pid, cpu_percent);
-
-            updates.push((
-                pid,
-                proc.kernel_time(),
-                proc.user_time(),
-                proc.create_time(),
-                proc.read_bytes(),
-                proc.write_bytes(),
-            ));
-        }
-
-        percentages
+            // Batch update cache and collect I/O rates in place (outside the
+            // with_read closure; the entries lock is not re-entered here).
+            CACHE.update_times_batch_into(&updates, &mut rates.io_rates);
+        });
     });
-
-    // Batch update cache and get I/O rates back
-    let io_rates = CACHE.update_times_batch(&updates);
-
-    ProcessRates {
-        cpu_percentages,
-        io_rates,
-    }
 }
 
 /// Convert FILETIME (100-ns intervals since 1601) to Unix timestamp

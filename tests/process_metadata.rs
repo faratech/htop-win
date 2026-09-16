@@ -1,4 +1,5 @@
 //! Isolated Windows process-metadata regression fixture. No process actions run.
+#![cfg(windows)] // VirtualAlloc + NtQuerySystemInformation; skipped on non-Windows hosts
 use htop_win::system::cache::CACHE;
 use htop_win::system::{ProcessEnrichmentRequirements, SystemMetrics, enrich_processes_for};
 use std::time::{Duration, Instant};

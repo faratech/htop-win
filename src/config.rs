@@ -191,21 +191,19 @@ impl Config {
     /// Get the config file path
     #[cfg(windows)]
     pub fn config_path() -> Option<PathBuf> {
-        // Use Windows API directly instead of `directories` crate
-        use windows::Win32::UI::Shell::{
-            FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
-        };
-        use windows::core::PWSTR;
-
-        unsafe {
-            let path: PWSTR =
-                SHGetKnownFolderPath(&FOLDERID_RoamingAppData, KF_FLAG_DEFAULT, None).ok()?;
-            let len = (0..).take_while(|&i| *path.0.add(i) != 0).count();
-            let slice = std::slice::from_raw_parts(path.0, len);
-            let appdata = PathBuf::from(String::from_utf16_lossy(slice));
-            windows::Win32::System::Com::CoTaskMemFree(Some(path.0 as *const _));
-            Some(appdata.join("htop-win").join("config").join("config.json"))
+        // %APPDATA% is set system-wide for interactive sessions and is what
+        // SHGetKnownFolderPath(FOLDERID_RoamingAppData) resolves to; using the
+        // env var directly keeps the Shell/COM API surface out of the binary.
+        let appdata = std::env::var_os("APPDATA")?;
+        if appdata.is_empty() {
+            return None;
         }
+        Some(
+            PathBuf::from(appdata)
+                .join("htop-win")
+                .join("config")
+                .join("config.json"),
+        )
     }
 
     #[cfg(not(windows))]

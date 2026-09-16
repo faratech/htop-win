@@ -2,6 +2,9 @@ use crate::terminal::{Frame, Line, Modifier, Paragraph, Rect, Span, Style};
 
 use crate::app::{App, DialogState, FocusRegion};
 
+/// Blank run for empty footer slots (max slot width: label 6 + gap 1 + key 1).
+const FOOTER_BLANKS: &str = "                                ";
+
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let function_keys = get_function_keys_with_num(app);
     let theme = &app.theme;
@@ -13,7 +16,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     // Compute the label width that will fit in this terminal. Labels max out at
     // 6 chars (htop's default) but shrink down to 0 on very narrow widths so at
     // least the key numbers stay visible.
-    let label_width = compute_label_width(&function_keys, area.width);
+    let label_width = compute_label_width(function_keys, area.width);
     let slot_gap = 1;
     let empty_slot_width = label_width + slot_gap + 1; // 1 char stand-in for missing key + label + gap
 
@@ -28,8 +31,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             if key_str.is_empty() {
                 // Empty key/label pair — fill with blanks sized to match other slots
                 x_pos += empty_slot_width;
-                let blanks = " ".repeat(empty_slot_width as usize);
-                vec![Span::styled(blanks, Style::default().bg(theme.background))]
+                vec![Span::styled(
+                    &FOOTER_BLANKS[..empty_slot_width as usize],
+                    Style::default().bg(theme.background),
+                )]
             } else {
                 let key_width = key_str.len() as u16;
                 let total_width = key_width + label_width + slot_gap;
@@ -78,9 +83,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
                 };
 
                 vec![
-                    Span::styled(key_str.to_string(), Style::default().fg(key_fg).bg(key_bg)),
+                    Span::styled(*key_str, Style::default().fg(key_fg).bg(key_bg)),
                     Span::styled(label_padded, Style::default().fg(label_fg).bg(label_bg)),
-                    Span::styled(" ".to_string(), Style::default().bg(theme.background)),
+                    Span::styled(" ", Style::default().bg(theme.background)),
                 ]
             }
         })
@@ -127,9 +132,10 @@ fn compute_label_width(
 
 /// Returns function keys with: (Option<function_key_number>, key_text, label)
 /// The function key number is used for registering click regions (e.g., Some(1) for F1)
-fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'static str)> {
+fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str, &'static str)] {
     match &app.dialog {
-        DialogState::Help { .. } => vec![
+        DialogState::Help { .. } => &[
+
             (Some(1), "F1", ""),
             (Some(2), "F2", ""),
             (Some(3), "F3", ""),
@@ -141,7 +147,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (Some(9), "F9", ""),
             (Some(10), "F10", "Quit"),
         ],
-        DialogState::Search { .. } => vec![
+        DialogState::Search { .. } => &[
+
             (None, "Enter", "Done"),
             (None, "Esc", "Cancel"),
             (Some(3), "F3", "Next"),
@@ -153,7 +160,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::Filter { .. } => vec![
+        DialogState::Filter { .. } => &[
+
             (None, "Enter", "Done"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
@@ -165,7 +173,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::SortSelect { .. } => vec![
+        DialogState::SortSelect { .. } => &[
+
             (None, "Enter", "Select"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
@@ -177,7 +186,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::Kill { .. } => vec![
+        DialogState::Kill { .. } => &[
+
             (None, "Enter", "Terminate"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
@@ -189,7 +199,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::Priority { .. } => vec![
+        DialogState::Priority { .. } => &[
+
             (None, "↑/↓", "Select"),
             (None, "Enter", "Set"),
             (None, "Esc", "Cancel"),
@@ -201,7 +212,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::UserSelect { .. } => vec![
+        DialogState::UserSelect { .. } => &[
+
             (None, "Enter", "Select"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
@@ -213,7 +225,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::Environment { .. } => vec![
+        DialogState::Environment { .. } => &[
+
             (None, "Esc", "Close"),
             (None, "↑↓", "Scroll"),
             (None, "", ""),
@@ -225,7 +238,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::ColorScheme { .. } | DialogState::GpuSelect { .. } => vec![
+        DialogState::ColorScheme { .. } | DialogState::GpuSelect { .. } => &[
+
             (None, "Enter", "Select"),
             (None, "Esc", "Back"),
             (None, "", ""),
@@ -237,7 +251,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::CommandWrap { .. } => vec![
+        DialogState::CommandWrap { .. } => &[
+
             (None, "Esc", "Close"),
             (None, "↑↓", "Scroll"),
             (None, "", ""),
@@ -249,7 +264,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::ColumnConfig { .. } => vec![
+        DialogState::ColumnConfig { .. } => &[
+
             (None, "Space", "Toggle"),
             (None, "Shift+↑↓", "Order"),
             (None, "Esc", "Done"),
@@ -261,7 +277,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::Affinity { .. } => vec![
+        DialogState::Affinity { .. } => &[
+
             (None, "Space", "Toggle"),
             (None, "a", "All"),
             (None, "n", "None"),
@@ -273,7 +290,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::ProcessInfo { .. } => vec![
+        DialogState::ProcessInfo { .. } => &[
+
             (None, "Esc", "Close"),
             (None, "↑↓", "Scroll"),
             (None, "", ""),
@@ -285,7 +303,8 @@ fn get_function_keys_with_num(app: &App) -> Vec<(Option<u8>, &'static str, &'sta
             (None, "", ""),
             (None, "", ""),
         ],
-        DialogState::None | DialogState::Setup { .. } => vec![
+        DialogState::None | DialogState::Setup { .. } => &[
+
             (Some(1), "F1", "Help"),
             (Some(2), "F2", "Setup"),
             (Some(3), "F3", "Search"),

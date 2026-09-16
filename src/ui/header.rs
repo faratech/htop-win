@@ -1,7 +1,4 @@
-use crate::terminal::{
-    Block, Borders, Constraint, Direction, Frame, Layout, Line, Modifier, Paragraph, Rect, Span,
-    Style,
-};
+use crate::terminal::{Block, Borders, Frame, Line, Modifier, Paragraph, Rect, Span, Style};
 use std::collections::VecDeque;
 
 use crate::app::{App, UIElement, UIRegion};
@@ -181,6 +178,44 @@ fn col_hosts_fillers(col_idx: usize, col_count: usize) -> bool {
     col_idx > 0 && col_idx < col_count - 1
 }
 
+/// Whether the Net / Dsk / Bat fillers render in the current layout, in fill
+/// order. Computed from the same slot arithmetic the draw walk uses (empty
+/// CPU slots in filler-hosting columns, left to right), so collection gating
+/// (`App::canonical_collect_requirements`) can mirror render visibility
+/// exactly instead of drifting from it.
+pub(crate) fn filler_plan(app: &App) -> [bool; 3] {
+    let mut plan = [false; 3];
+    if !app.show_header {
+        return plan;
+    }
+    let cpu_count = visible_cpu_count(app);
+    let cols = calculate_meter_columns(app.terminal_width, cpu_count);
+    if cols < 2 {
+        // Single-column layout hosts no fillers.
+        return plan;
+    }
+    let meter_rows = meter_rows_for(cpu_count, cols);
+    let mut cursor = 0usize;
+    for col_idx in 0..cols {
+        if !col_hosts_fillers(col_idx, cols) {
+            continue;
+        }
+        // CPUs assigned to this column (column-major: cpu_idx = row*cols+col).
+        let shown = if cpu_count > col_idx {
+            (((cpu_count - col_idx - 1) / cols) + 1).min(meter_rows)
+        } else {
+            0
+        };
+        for _ in 0..meter_rows.saturating_sub(shown) {
+            if cursor < 3 {
+                plan[cursor] = true;
+            }
+            cursor += 1;
+        }
+    }
+    plan
+}
+
 /// Compute the meter-row count (CPU block height in each column).
 /// Pads to min 4 on multi-column layouts so Net/Dsk/Bat fillers stay visible
 /// even on low-CPU systems (matches htop-win's historical behavior).
@@ -207,6 +242,50 @@ pub fn calculate_header_height(app: &App) -> u16 {
     (meter_rows + extras) as u16
 }
 
+/// Replicates `Layout::split` for `cols` x `Constraint::Ratio(1, cols)`
+/// horizontal, spacing 0: every column gets `width / cols`, and the
+/// floor-division remainder goes to the last column (Layout's all-fixed path).
+fn ratio_column_rect(inner: Rect, col_idx: usize, cols: usize) -> Rect {
+    // Layout::split bails out with default rects for an empty area.
+    if inner.is_empty() {
+        return Rect::default();
+    }
+    let base = inner.width as usize / cols;
+    let rem = inner.width as usize % cols;
+    let width = if col_idx + 1 == cols { base + rem } else { base };
+    Rect::new(
+        inner.x + (base * col_idx) as u16,
+        inner.y,
+        width as u16,
+        inner.height,
+    )
+}
+
+/// Replicates `Layout::split` for `n` x `Constraint::Length(1)` vertical,
+/// spacing 0: rows past the available height collapse to 0, and the last row
+/// absorbs the leftover height (Layout's all-fixed path).
+fn length_row_rect(area: Rect, row_idx: usize, n: usize) -> Rect {
+    // Layout::split bails out with default rects for an empty area.
+    if area.is_empty() {
+        return Rect::default();
+    }
+    let h_avail = area.height as usize;
+    let height = if row_idx + 1 == n {
+        // 1 for the row itself plus any leftover, saturating to 0 past the end
+        h_avail.saturating_sub(n - 1)
+    } else {
+        usize::from(row_idx < h_avail)
+    };
+    // y accumulates the computed heights of all preceding rows: 1 each until
+    // the available height runs out, then 0.
+    Rect::new(
+        area.x,
+        area.y + row_idx.min(h_avail) as u16,
+        area.width,
+        height as u16,
+    )
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let theme = &app.theme;
     let block = Block::default()
@@ -220,26 +299,19 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let cols = calculate_meter_columns(inner.width, cpu_count);
     let meter_rows = meter_rows_for(cpu_count, cols);
 
-    let constraints: Vec<Constraint> = (0..cols)
-        .map(|_| Constraint::Ratio(1, cols as u32))
-        .collect();
-
-    let column_rects = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(constraints)
-        .split(inner);
-
     // Shared cursor so Net/Dsk/Bat fillers spread across any middle columns
     // left-to-right instead of all landing in the first filler-hosting column.
+    let plan = filler_plan(app);
     let mut filler_cursor = 0usize;
-    for (col_idx, col_area) in column_rects.iter().enumerate() {
+    for col_idx in 0..cols {
         draw_meter_column(
             frame,
             app,
-            *col_area,
+            ratio_column_rect(inner, col_idx, cols),
             col_idx,
             cols,
             meter_rows,
+            &plan,
             &mut filler_cursor,
         );
     }
@@ -251,6 +323,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
 /// After the CPU block each column appends its role-specific extras (see
 /// `extras_for_column`). In 3-column mode, the middle column has no mandatory
 /// extras so its empty CPU slots are filled with Net / Dsk / Bat info.
+#[allow(clippy::too_many_arguments)] // layout params are all distinct concerns
 fn draw_meter_column(
     frame: &mut Frame,
     app: &mut App,
@@ -258,6 +331,7 @@ fn draw_meter_column(
     col_idx: usize,
     col_count: usize,
     meter_rows: usize,
+    filler_plan: &[bool; 3],
     filler_cursor: &mut usize,
 ) {
     let cpu_count = visible_cpu_count(app);
@@ -275,18 +349,13 @@ fn draw_meter_column(
         return;
     }
 
-    let constraints: Vec<Constraint> = (0..total_rows).map(|_| Constraint::Length(1)).collect();
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
-
     let hosts_fillers = col_hosts_fillers(col_idx, col_count);
 
     // CPU block (up to meter_rows). Empty CPU slots in filler-hosting columns
     // advance the shared filler cursor (Net → Dsk → Bat); empty slots in other
     // columns stay blank.
-    for (row_idx, &row) in rows.iter().enumerate().take(meter_rows) {
+    for row_idx in 0..meter_rows {
+        let row = length_row_rect(area, row_idx, total_rows);
         let cpu_idx = row_idx * col_count + col_idx;
         if cpu_idx < cpu_count {
             app.ui_bounds.add_region(UIRegion {
@@ -304,11 +373,15 @@ fn draw_meter_column(
                 row,
             );
         } else if hosts_fillers && *filler_cursor < 3 {
-            match *filler_cursor {
-                0 => draw_network_info(frame, app, row),
-                1 => draw_disk_info(frame, app, row),
-                2 => draw_battery_info(frame, app, row),
-                _ => {}
+            // The plan decides whether this filler renders anywhere; a gated
+            //-off filler leaves the slot blank on purpose.
+            if filler_plan[*filler_cursor] {
+                match *filler_cursor {
+                    0 => draw_network_info(frame, app, row),
+                    1 => draw_disk_info(frame, app, row),
+                    2 => draw_battery_info(frame, app, row),
+                    _ => {}
+                }
             }
             *filler_cursor += 1;
         }
@@ -351,10 +424,10 @@ fn draw_meter_column(
     }
 
     for (extra_row, meter) in (meter_rows..).zip(order[..order_len].iter()) {
-        if extra_row >= rows.len() {
+        if extra_row >= total_rows {
             break;
         }
-        let row = rows[extra_row];
+        let row = length_row_rect(area, extra_row, total_rows);
         match meter {
             ExtraMeter::Memory => {
                 app.ui_bounds.add_region(UIRegion {
@@ -436,7 +509,7 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
                 ),
                 Span::styled(": ", Style::default().fg(theme.text)),
                 Span::styled(
-                    format!("{:5.1}%", usage_clamped),
+                    format!("{}%", crate::numfmt::tenths_str(usage_clamped, 5)),
                     Style::default()
                         .fg(theme.cpu_color(usage_clamped))
                         .add_modifier(Modifier::BOLD),
@@ -469,7 +542,7 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("{:5.1}%]", usage_clamped),
+                    format!("{}%]", crate::numfmt::tenths_str(usage_clamped, 5)),
                     Style::default().fg(theme.text),
                 ),
             ])
@@ -479,7 +552,7 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
             // htop uses: nice(blue) + user(green) + system(red) + iowait(gray)
             let bar_width =
                 (area.width.saturating_sub(11) as usize).min(max_bar_width(area.width as usize));
-            let percent = format!("{:5.1}%]", usage_clamped);
+            let percent = format!("{}%]", crate::numfmt::tenths_str(usage_clamped, 5));
 
             let breakdown = app.system_metrics.cpu.core_breakdown.get(cpu_idx).copied();
 
@@ -625,7 +698,7 @@ fn draw_memory_bar(frame: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("{:5.1}%", usage),
+                    format!("{}%", crate::numfmt::tenths_str(usage, 5)),
                     Style::default()
                         .fg(theme.memory_used)
                         .add_modifier(Modifier::BOLD),
@@ -766,7 +839,7 @@ fn draw_swap_bar(frame: &mut Frame, app: &App, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    format!("{:5.1}%", usage),
+                    format!("{}%", crate::numfmt::tenths_str(usage, 5)),
                     Style::default().fg(theme.swap).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(format!(" ({})", swap_info), Style::default().fg(theme.text)),
@@ -845,13 +918,13 @@ fn draw_gpu_bar(frame: &mut Frame, app: &App, area: Rect) {
     // utilization % at the right edge so it lines up with the CPU meters.
     let gpu_info = if mem_total > 0 {
         format!(
-            "{}/{} {:.1}%",
+            "{}/{} {}%",
             format_bytes(mem_used),
             format_bytes(mem_total),
-            usage
+            crate::numfmt::tenths_str(usage, 0)
         )
     } else {
-        format!("{} {:.1}%", format_bytes(mem_used), usage)
+        format!("{} {}%", format_bytes(mem_used), crate::numfmt::tenths_str(usage, 0))
     };
 
     let line = match mode {
@@ -863,7 +936,7 @@ fn draw_gpu_bar(frame: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:5.1}%", usage),
+                format!("{}%", crate::numfmt::tenths_str(usage, 5)),
                 Style::default()
                     .fg(theme.cpu_color(usage))
                     .add_modifier(Modifier::BOLD),
@@ -944,13 +1017,13 @@ fn draw_npu_bar(frame: &mut Frame, app: &App, area: Rect) {
     // utilization % at the right edge so it lines up with the CPU meters.
     let npu_info = if mem_total > 0 {
         format!(
-            "{}/{} {:.1}%",
+            "{}/{} {}%",
             format_bytes(mem_used),
             format_bytes(mem_total),
-            usage
+            crate::numfmt::tenths_str(usage, 0)
         )
     } else {
-        format!("{} {:.1}%", format_bytes(mem_used), usage)
+        format!("{} {}%", format_bytes(mem_used), crate::numfmt::tenths_str(usage, 0))
     };
 
     let line = match mode {
@@ -962,7 +1035,7 @@ fn draw_npu_bar(frame: &mut Frame, app: &App, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:5.1}%", usage),
+                format!("{}%", crate::numfmt::tenths_str(usage, 5)),
                 Style::default()
                     .fg(theme.cpu_color(usage))
                     .add_modifier(Modifier::BOLD),
@@ -1091,7 +1164,7 @@ fn draw_uptime_info(frame: &mut Frame, app: &App, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
-            format!("{:5.1}%", cpu_percent),
+            format!("{}%", crate::numfmt::tenths_str(cpu_percent, 5)),
             Style::default()
                 .fg(theme.cpu_color(cpu_percent))
                 .add_modifier(Modifier::BOLD),
@@ -1223,7 +1296,7 @@ fn draw_battery_info(frame: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{:.0}%", percent),
+                format!("{}%", crate::numfmt::round0_str(percent)),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
@@ -1253,4 +1326,94 @@ fn draw_battery_info(frame: &mut Frame, app: &App, area: Rect) {
 
     let paragraph = Paragraph::new(line);
     frame.render_widget(paragraph, area);
+}
+
+#[cfg(test)]
+mod layout_equivalence_tests {
+    use super::{length_row_rect, ratio_column_rect};
+    use crate::terminal::{Constraint, Direction, Layout, Rect};
+
+    #[test]
+    fn ratio_columns_match_layout_split() {
+        for width in 1u16..=300 {
+            for cols in 1usize..=4 {
+                let inner = Rect::new(3, 7, width, 5);
+                let constraints: Vec<Constraint> = (0..cols)
+                    .map(|_| Constraint::Ratio(1, cols as u32))
+                    .collect();
+                let expected = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(constraints)
+                    .split(inner);
+                for col_idx in 0..cols {
+                    assert_eq!(
+                        ratio_column_rect(inner, col_idx, cols),
+                        expected[col_idx],
+                        "width={width} cols={cols} col={col_idx}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn length_rows_match_layout_split() {
+        for height in 0u16..=20 {
+            for n in 1usize..=12 {
+                let area = Rect::new(2, 4, 30, height);
+                let constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Length(1)).collect();
+                let expected = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(constraints)
+                    .split(area);
+                for row_idx in 0..n {
+                    assert_eq!(
+                        length_row_rect(area, row_idx, n),
+                        expected[row_idx],
+                        "height={height} n={n} row={row_idx}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod filler_plan_tests {
+    use super::filler_plan;
+    use crate::app::App;
+    use crate::config::Config;
+
+    fn app_with_cores(cpus: usize, width: u16, show_header: bool) -> App {
+        let mut app = App::new(Config::default());
+        app.show_header = show_header;
+        app.terminal_width = width;
+        app.system_metrics.cpu.core_usage = vec![0.0; cpus];
+        app
+    }
+
+    #[test]
+    fn filler_plan_follows_slot_arithmetic() {
+        // Hidden header: nothing collects.
+        let app = app_with_cores(8, 120, false);
+        assert_eq!(filler_plan(&app), [false, false, false]);
+
+        // Single column: no filler-hosting columns.
+        let app = app_with_cores(8, 60, true);
+        assert_eq!(filler_plan(&app), [false, false, false]);
+
+        // 2 columns @ 8 CPUs / 4 meter rows: both columns are full, so no
+        // filler renders anywhere.
+        let app = app_with_cores(8, 120, true);
+        assert_eq!(filler_plan(&app), [false, false, false]);
+
+        // 2 columns @ 6 CPUs / 4 meter rows: the right column hosts fillers
+        // and has one empty CPU slot → Net only.
+        let app = app_with_cores(6, 120, true);
+        assert_eq!(filler_plan(&app), [true, false, false]);
+
+        // 2 columns @ 4 CPUs / 4 meter rows: two empty slots → Net then Dsk.
+        let app = app_with_cores(4, 120, true);
+        assert_eq!(filler_plan(&app), [true, true, false]);
+    }
 }

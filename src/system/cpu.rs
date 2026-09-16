@@ -35,6 +35,80 @@ impl CpuInfo {
     pub fn from_native() -> Self {
         Self::default()
     }
+
+    /// In-place refresh reusing `core_usage`/`core_breakdown` capacity across
+    /// ticks (the vecs only resize on hot-add, where PDH re-registers anyway).
+    #[cfg(windows)]
+    pub fn refresh_in_place(&mut self) {
+        get_cpu_info_pdh_into(&mut self.core_usage, &mut self.core_breakdown);
+    }
+
+    #[cfg(not(windows))]
+    pub fn refresh_in_place(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Re-prime flag for [`reset_first_sample`]: the PDH state lives inside
+/// `get_cpu_info_pdh_into`, so the reset is requested via this flag and
+/// applied on the next collection.
+#[cfg(windows)]
+static PDH_REPRIME: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Re-prime PDH so the first collection after the CPU gate is re-enabled
+/// re-baselines (reports 0%) instead of a gap-averaged rate.
+#[cfg(windows)]
+pub(crate) fn reset_first_sample() {
+    PDH_REPRIME.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(windows))]
+pub(crate) fn reset_first_sample() {}
+
+/// How often the processor topology is re-enumerated. Hot-add and processor-group
+/// changes are rare, but per-tick enumeration costs a syscall per group on
+/// every refresh *and* on every CPU% capacity-denominator update. Thirty
+/// seconds matches the D3DKMT adapter topology check interval.
+#[cfg(windows)]
+const LAYOUT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cached processor topology shared by the per-tick CPU refresh and the CPU%
+/// capacity denominator so neither enumerates processor groups every tick.
+#[cfg(windows)]
+static LAYOUT_CACHE: std::sync::Mutex<Option<(Vec<(u16, u32)>, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// Runs `f` against the cached layout, refreshing it under the lock when the
+/// TTL has lapsed. Shared by the full-clone accessor and the clone-free len
+/// accessor used on the per-tick hot paths.
+#[cfg(windows)]
+fn with_layout<R>(f: impl FnOnce(&[(u16, u32)]) -> R) -> R {
+    let mut guard = LAYOUT_CACHE.lock().unwrap();
+    let stale = guard
+        .as_ref()
+        .is_none_or(|(_, sampled_at)| sampled_at.elapsed() >= LAYOUT_TTL);
+    if stale {
+        *guard = Some((processor_layout(), std::time::Instant::now()));
+    }
+    f(guard
+        .as_ref()
+        .map(|(layout, _)| layout.as_slice())
+        .unwrap_or(&[]))
+}
+
+/// Cached processor layout (see [`LAYOUT_TTL`]). The vector is tiny (one entry
+/// per logical processor); cold paths (counter registration, debug dumps) may
+/// as well clone it — hot paths should prefer [`cached_processor_layout_len`].
+#[cfg(windows)]
+pub(crate) fn cached_processor_layout() -> Vec<(u16, u32)> {
+    with_layout(<[(u16, u32)]>::to_vec)
+}
+
+/// Logical-processor count from the cached topology, without cloning the
+/// layout vector (the per-tick callers only need the count).
+#[cfg(windows)]
+pub(crate) fn cached_processor_layout_len() -> usize {
+    with_layout(<[(u16, u32)]>::len)
 }
 
 /// Flat list of (group, processor-in-group) for every active logical processor
@@ -80,6 +154,16 @@ fn processor_layout() -> Vec<(u16, u32)> {
 /// This is the same method Task Manager uses
 #[cfg(windows)]
 fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
+    let mut core_usage = Vec::new();
+    let mut core_breakdown = Vec::new();
+    get_cpu_info_pdh_into(&mut core_usage, &mut core_breakdown);
+    (core_usage, core_breakdown)
+}
+
+/// [`get_cpu_info_pdh`] writing into caller-owned vecs so per-tick capacity
+/// is reused (core count changes re-register the PDH state anyway).
+#[cfg(windows)]
+fn get_cpu_info_pdh_into(core_usage: &mut Vec<f32>, breakdowns: &mut Vec<CpuBreakdown>) {
     use std::sync::Mutex;
     use windows::Win32::System::Performance::{
         PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY,
@@ -167,10 +251,22 @@ fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
     let mut state_guard = PDH_STATE.lock().unwrap();
     let state = state_guard.get_or_insert_with(PdhState::default);
 
+    if PDH_REPRIME.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        state.first_sample_done = false;
+    }
+
     // Every logical processor across all processor groups (handles >64-CPU
-    // systems, which Windows splits into groups of up to 64).
-    let layout = processor_layout();
-    let cpu_count = layout.len();
+    // systems, which Windows splits into groups of up to 64). Cached: topology
+    // only changes on hot-add or processor-group reassignment.
+    let cpu_count = cached_processor_layout_len();
+
+    // Re-register counters when the topology changed since init (hot-add or a
+    // new processor group); otherwise new cores stay invisible until restart.
+    // The replaced state's Drop closes the old query, so no manual close here
+    // (that would double-close the handle).
+    if state.initialized && state.core_counters.len() != cpu_count {
+        *state = PdhState::default();
+    }
 
     // Initialize PDH query if needed
     if !state.initialized {
@@ -179,28 +275,37 @@ fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
             let mut query = PDH_HQUERY::default();
             let status = PdhOpenQueryW(PCWSTR::null(), 0, &mut query);
             if status != 0 {
-                return fallback_cpu_info(cpu_count);
+                let (usage, breakdown) = fallback_cpu_info(cpu_count);
+                *core_usage = usage;
+                *breakdowns = breakdown;
+                return;
             }
             // Add per-processor counters using the group-aware "Processor
             // Information(group,n)" counterset so every group is covered:
             // - % User Time: time in user mode
             // - % Privileged Time: time in kernel mode (system)
             let mut core_counters = Vec::with_capacity(cpu_count);
-            for &(group, n) in &layout {
+            for &(group, n) in cached_processor_layout().iter() {
                 let user_path = format!("\\Processor Information({group},{n})\\% User Time");
                 let priv_path = format!("\\Processor Information({group},{n})\\% Privileged Time");
                 let user = match add_counter(query, &user_path) {
                     Some(c) => c,
                     None => {
                         let _ = PdhCloseQuery(query);
-                        return fallback_cpu_info(cpu_count);
+                        let (usage, breakdown) = fallback_cpu_info(cpu_count);
+                        *core_usage = usage;
+                        *breakdowns = breakdown;
+                        return;
                     }
                 };
                 let privileged = match add_counter(query, &priv_path) {
                     Some(c) => c,
                     None => {
                         let _ = PdhCloseQuery(query);
-                        return fallback_cpu_info(cpu_count);
+                        let (usage, breakdown) = fallback_cpu_info(cpu_count);
+                        *core_usage = usage;
+                        *breakdowns = breakdown;
+                        return;
                     }
                 };
                 core_counters.push(CoreCounters { user, privileged });
@@ -216,44 +321,56 @@ fn get_cpu_info_pdh() -> (Vec<f32>, Vec<CpuBreakdown>) {
     unsafe {
         let status = PdhCollectQueryData(state.query.as_query());
         if status != 0 {
-            return fallback_cpu_info(cpu_count);
+            let (usage, breakdown) = fallback_cpu_info(cpu_count);
+            *core_usage = usage;
+            *breakdowns = breakdown;
+            return;
         }
     }
 
     // First sample just initializes - PDH needs two samples for rate counters
     if !state.first_sample_done {
         state.first_sample_done = true;
-        // Return zeros for first sample
-        let core_usage = vec![0.0; cpu_count];
-        let breakdowns = vec![
+        // Zeros for the first sample
+        core_usage.clear();
+        core_usage.resize(cpu_count, 0.0);
+        breakdowns.clear();
+        breakdowns.resize(
+            cpu_count,
             CpuBreakdown {
                 user: 0.0,
                 system: 0.0,
-                idle: 100.0
-            };
-            cpu_count
-        ];
-        return (core_usage, breakdowns);
+                idle: 100.0,
+            },
+        );
+        return;
     }
 
-    // Get formatted counter values
-    let mut core_usage = Vec::with_capacity(cpu_count);
-    let mut breakdowns = Vec::with_capacity(cpu_count);
+    // Get formatted counter values in place
+    core_usage.clear();
+    core_usage.resize(cpu_count, 0.0);
+    breakdowns.clear();
+    breakdowns.resize(
+        cpu_count,
+        CpuBreakdown {
+            user: 0.0,
+            system: 0.0,
+            idle: 100.0,
+        },
+    );
 
-    for counters in &state.core_counters {
+    for (idx, counters) in state.core_counters.iter().enumerate() {
         let user_pct = unsafe { get_counter_value(&counters.user) };
         let system_pct = unsafe { get_counter_value(&counters.privileged) };
         let total = (user_pct + system_pct).min(100.0);
 
-        core_usage.push(total);
-        breakdowns.push(CpuBreakdown {
+        core_usage[idx] = total;
+        breakdowns[idx] = CpuBreakdown {
             user: user_pct,
             system: system_pct,
             idle: (100.0 - total).max(0.0),
-        });
+        };
     }
-
-    (core_usage, breakdowns)
 }
 
 /// Fallback CPU info when PDH fails (returns zeros)
@@ -304,8 +421,10 @@ pub fn debug_dump() -> String {
     for (i, (u, bd)) in usage.iter().zip(breakdown.iter()).enumerate() {
         let _ = writeln!(
             out,
-            "  CPU {i:>3}: {u:5.1}%  (user {:.1} sys {:.1})",
-            bd.user, bd.system
+            "  CPU {i:>3}: {}%  (user {} sys {})",
+            crate::numfmt::tenths_str(*u, 5),
+            crate::numfmt::tenths_str(bd.user, 0),
+            crate::numfmt::tenths_str(bd.system, 0)
         );
     }
     out

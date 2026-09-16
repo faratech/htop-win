@@ -4,8 +4,11 @@ mod footer;
 mod header;
 mod process_list;
 
+// Cross-module use (App computes collector gates from header visibility).
+pub(crate) use header::filler_plan;
+
 use crate::terminal::{
-    Block, Constraint, Direction, Frame, Layout, Line, Modifier, Paragraph, Rect, Span, Style,
+    Constraint, Direction, Frame, Layout, Line, Modifier, Paragraph, Rect, Span, Style,
 };
 
 use crate::app::{App, ColumnBounds, DialogState, SortColumn};
@@ -29,8 +32,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.dialog_scroll_rows = 0;
 
     // Fill entire screen with theme background color
-    let bg_block = Block::default().style(Style::default().bg(theme.background));
-    frame.render_widget(bg_block, size);
+    frame.buffer_mut().fill_bg(size, theme.background);
 
     // Main layout: header, tab bar, process list, footer
     // Header is hidden if app.show_header is false
@@ -76,8 +78,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.ui_bounds.process_list_y_end = chunks[2].y + chunks[2].height;
     app.ui_bounds.footer_y_start = chunks[3].y;
 
+    // Resolve column widths once per frame and share them between the
+    // click-region bookkeeping here and the Table widget in process_list::draw,
+    // so the adaptive sizing math runs once with identical inputs.
+    let column_widths =
+        process_list::adaptive_column_widths(&app.cached_visible_columns, chunks[2].width);
     // Calculate column bounds using the same constraint resolution as the Table widget
-    app.ui_bounds.columns = calculate_column_bounds(&app.cached_visible_columns, chunks[2]);
+    app.ui_bounds.columns =
+        calculate_column_bounds(&app.cached_visible_columns, chunks[2], &column_widths);
 
     // Draw header (CPU bars, memory, etc.) if visible
     if app.show_header {
@@ -93,7 +101,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.set_visible_height(chunks[2].height.saturating_sub(1) as usize);
 
     // Draw process list
-    process_list::draw(frame, app, chunks[2]);
+    process_list::draw(frame, app, chunks[2], &column_widths);
 
     // Draw footer (function keys)
     footer::draw(frame, app, chunks[3]);
@@ -208,17 +216,19 @@ pub fn centered_rect_fixed(width: u16, height: u16, r: Rect) -> Rect {
 
 /// Calculate column bounds based on visible columns and available area
 /// Uses ratatui's Layout to resolve constraints exactly as the Table widget does
-fn calculate_column_bounds(visible_columns: &[SortColumn], area: Rect) -> Vec<ColumnBounds> {
+fn calculate_column_bounds(
+    visible_columns: &[SortColumn],
+    area: Rect,
+    constraints: &[Constraint],
+) -> Vec<ColumnBounds> {
     if visible_columns.is_empty() {
         return Vec::new();
     }
 
-    // Use the same adaptive constraints that process_list::draw uses so click
-    // regions stay aligned with the actually-rendered columns.
-    let constraints = process_list::adaptive_column_widths(visible_columns, area.width);
-
     // Use Layout to resolve constraints to actual widths
-    // This matches how ratatui's Table internally calculates column positions
+    // This matches how ratatui's Table internally calculates column positions.
+    // Constraints arrive pre-resolved from the caller so click regions stay
+    // aligned with the actually-rendered columns by construction.
     let column_areas = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints)

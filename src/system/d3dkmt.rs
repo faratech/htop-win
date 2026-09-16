@@ -134,6 +134,10 @@ struct AdapterState {
     /// statistics failure so adapter presence (meters, hardware-aware default
     /// columns) doesn't flicker off while re-enumeration happens
     last_snapshot: AdapterSnapshot,
+    /// Earliest instant a FAILURE-driven re-enumeration may run (a sick
+    /// adapter must not force a full detection storm every tick). Topology-
+    /// driven re-enumerations leave this None and run immediately.
+    next_reenumeration: Option<Instant>,
 }
 
 /// Per-adapter fields the per-process sweep needs, copied out of
@@ -166,6 +170,22 @@ fn total_node_slots(adapters: &[ProcAdapterDesc]) -> usize {
 /// while running. One enumeration syscall when nothing changed.
 const TOPOLOGY_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
+/// How long to wait before retrying a FAILED re-enumeration (driver reset,
+/// adapter removal). Serves `last_snapshot` meanwhile; roughly two default
+/// ticks.
+const FAILURE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether any adapter is currently tracked. The UI uses this to keep the
+/// GPU/NPU collection gates open while adapters exist even when their meters
+/// are hidden (so presence is already known when a meter is re-enabled).
+pub fn has_tracked_adapters() -> bool {
+    ADAPTER_STATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|state| !state.adapters.is_empty())
+}
+
 static ADAPTER_STATE: Mutex<Option<AdapterState>> = Mutex::new(None);
 
 /// Per-process collection gates, set from the UI thread (a GPU/NPU column is
@@ -188,8 +208,12 @@ pub fn set_npu_process_stats_enabled(enabled: bool) {
 /// and per-process columns follow.
 static GPU_SELECTION: Mutex<Option<String>> = Mutex::new(None);
 
-pub fn set_gpu_selection(name: Option<String>) {
-    *GPU_SELECTION.lock().unwrap() = name;
+pub fn set_gpu_selection(name: Option<&str>) {
+    let mut guard = GPU_SELECTION.lock().unwrap();
+    // Skip the write (and the wake-up it can cause) when unchanged.
+    if guard.as_deref() != name {
+        *guard = name.map(str::to_string);
+    }
 }
 
 /// Names of the GPU adapters currently tracked, in enumeration order, for the
@@ -589,7 +613,9 @@ pub fn refresh() -> AdapterSnapshot {
         }
     }
 
-    if !state.detected || state.needs_reenumeration {
+    let reenumerate_now = !state.detected
+        || (state.needs_reenumeration && state.next_reenumeration.is_none_or(|t| now >= t));
+    if reenumerate_now {
         let old = std::mem::take(&mut state.adapters);
         // Flattened (LUID, node-count) sequence of the old adapter set: the
         // per-process baselines below are indexed by this layout.
@@ -621,6 +647,7 @@ pub fn refresh() -> AdapterSnapshot {
         state.pending_luids = pending;
         state.detected = true;
         state.needs_reenumeration = false;
+        state.next_reenumeration = None;
         state.last_topology_check = Some(now);
         // Keep last_sample so surviving adapters retain utilization continuity
         // (a counter reset clamps to 0% for one tick via running_time_to_percent).
@@ -656,6 +683,9 @@ pub fn refresh() -> AdapterSnapshot {
             // (meters, hardware-aware default columns) doesn't blink off for
             // one tick; re-detection decides whether it's really gone.
             state.needs_reenumeration = true;
+            // Back off the retry so a persistently sick adapter costs one
+            // detection every few ticks, not one per tick.
+            state.next_reenumeration = Some(now + FAILURE_RETRY_INTERVAL);
             return state.last_snapshot.clone();
         };
         per_adapter.push((adapter.class, metrics));
@@ -961,21 +991,27 @@ pub fn debug_dump() -> String {
     let snap = refresh();
     let _ = writeln!(out, "\n--- meter (via refresh + aggregation) ---");
     if let Some(g) = &snap.gpu {
-        let (u, t) = g.meter_memory();
+        let (_u, t) = g.meter_memory();
         let _ = writeln!(
             out,
-            "GPU: {} util={:.1}% mem={u}/{t} (dedicated {}/{}, shared_used {}, mem_total {})",
-            g.name, g.utilization, g.dedicated_used, g.dedicated_total, g.shared_used, g.mem_total
+            "GPU: {} util={}% mem={_u}/{t} (dedicated {}/{}, shared_used {}, mem_total {})",
+            g.name,
+            crate::numfmt::tenths_str(g.utilization, 0),
+            g.dedicated_used,
+            g.dedicated_total,
+            g.shared_used,
+            g.mem_total
         );
     } else {
         let _ = writeln!(out, "GPU: none");
     }
     if let Some(n) = &snap.npu {
-        let (u, t) = n.meter_memory();
+        let (_u, t) = n.meter_memory();
         let _ = writeln!(
             out,
-            "NPU: {} util={:.1}% mem={u}/{t}",
-            n.name, n.utilization
+            "NPU: {} util={}% mem={_u}/{t}",
+            n.name,
+            crate::numfmt::tenths_str(n.utilization, 0)
         );
     }
     out

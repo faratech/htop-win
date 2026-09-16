@@ -3,6 +3,7 @@ pub mod config;
 pub mod data;
 pub mod input;
 pub mod json;
+pub(crate) mod numfmt;
 pub mod system;
 pub mod terminal;
 pub mod ui;
