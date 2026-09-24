@@ -292,7 +292,42 @@ pub enum Color {
     Indexed(u8),
 }
 
+/// Hashed as one packed word (row keys hash thousands of colors per frame).
+impl std::hash::Hash for Color {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u32(self.packed());
+    }
+}
+
 impl Color {
+    /// Injective `u32` encoding: named colors 0..=16, RGB and indexed colors
+    /// tagged in the top byte. Never `u32::MAX` (used for "no color").
+    fn packed(self) -> u32 {
+        match self {
+            Color::Reset => 0,
+            Color::Black => 1,
+            Color::Red => 2,
+            Color::Green => 3,
+            Color::Yellow => 4,
+            Color::Blue => 5,
+            Color::Magenta => 6,
+            Color::Cyan => 7,
+            Color::Gray => 8,
+            Color::DarkGray => 9,
+            Color::LightRed => 10,
+            Color::LightGreen => 11,
+            Color::LightYellow => 12,
+            Color::LightBlue => 13,
+            Color::LightMagenta => 14,
+            Color::LightCyan => 15,
+            Color::White => 16,
+            Color::Rgb(r, g, b) => {
+                0x0100_0000 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
+            }
+            Color::Indexed(i) => 0x0200_0000 | u32::from(i),
+        }
+    }
+
     fn to_crossterm(self) -> CtColor {
         match self {
             Color::Reset => CtColor::Reset,
@@ -320,7 +355,7 @@ impl Color {
 
 bitflags::bitflags! {
     /// Text modifiers
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
     pub struct Modifier: u16 {
         const BOLD = 0b0000_0001;
         const DIM = 0b0000_0010;
@@ -341,6 +376,17 @@ pub struct Style {
     pub bg: Option<Color>,
     pub add_modifier: Modifier,
     pub sub_modifier: Modifier,
+}
+
+/// Hashed as two packed words instead of one write per field and tag.
+impl std::hash::Hash for Style {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let color = |c: Option<Color>| u64::from(c.map_or(u32::MAX, Color::packed));
+        state.write_u64((color(self.fg) << 32) | color(self.bg));
+        state.write_u32(
+            (u32::from(self.add_modifier.bits()) << 16) | u32::from(self.sub_modifier.bits()),
+        );
+    }
 }
 
 impl Style {
@@ -392,7 +438,7 @@ impl Style {
 // ============================================================================
 
 /// Styled text segment
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Span<'a> {
     pub content: std::borrow::Cow<'a, str>,
     pub style: Style,
@@ -436,7 +482,7 @@ impl<'a> From<String> for Span<'a> {
 }
 
 /// Line of spans
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct Line<'a> {
     pub spans: Vec<Span<'a>>,
     pub style: Style,
@@ -584,6 +630,16 @@ pub struct Symbol {
 
 impl Clone for Symbol {
     fn clone(&self) -> Self {
+        // Inline symbols are plain bytes: copy the fields instead of
+        // re-validating and re-pushing the text (the per-cell hot path of
+        // buffer clears and copies).
+        if self.meta != SYMBOL_HEAP_TAG {
+            return Symbol {
+                head: self.head,
+                tail: self.tail,
+                meta: self.meta,
+            };
+        }
         let mut cloned = SYMBOL_INLINE_EMPTY;
         cloned.push_raw(self.as_str());
         cloned
@@ -591,6 +647,31 @@ impl Clone for Symbol {
 }
 
 impl Symbol {
+    /// A one-byte inline symbol (`byte` must be printable ASCII).
+    const fn inline_ascii(byte: u8) -> Symbol {
+        let mut bytes = [0u8; std::mem::size_of::<usize>()];
+        bytes[0] = byte;
+        Symbol {
+            head: usize::from_ne_bytes(bytes),
+            tail: [0; 7],
+            meta: 1,
+        }
+    }
+
+    /// Replace the text with one printable ASCII byte. Writes the same raw
+    /// bytes as `clear` + `push_raw`, so inline equality is unaffected.
+    #[inline]
+    fn set_ascii(&mut self, byte: u8) {
+        if self.meta == SYMBOL_HEAP_TAG {
+            drop(self.take_heap_box());
+        }
+        let mut bytes = [0u8; std::mem::size_of::<usize>()];
+        bytes[0] = byte;
+        self.head = usize::from_ne_bytes(bytes);
+        self.tail = [0; 7];
+        self.meta = 1;
+    }
+
     fn clear(&mut self) {
         // Back to inline empty; drops any heap allocation immediately so a
         // reused cell does not pin a Box across frames. (ptr::write rather
@@ -795,6 +876,16 @@ pub struct BufferCell {
     pub is_continuation: bool,
 }
 
+/// A pristine cell (space, default colors), usable in `const` contexts so
+/// clears are plain field stores rather than a per-cell symbol rebuild.
+pub const DEFAULT_CELL: BufferCell = BufferCell {
+    symbol: Symbol::inline_ascii(b' '),
+    fg: Color::Reset,
+    bg: Color::Reset,
+    modifier: Modifier::empty(),
+    is_continuation: false,
+};
+
 impl Default for BufferCell {
     fn default() -> Self {
         Self {
@@ -818,6 +909,20 @@ impl BufferCell {
         self.symbol.clear();
         self.symbol.push_sanitized_char(ch);
         self
+    }
+
+    /// Write one ASCII byte as a width-1 symbol, sanitized exactly like
+    /// `set_char` (tab → space, other controls → U+FFFD).
+    #[inline]
+    fn set_ascii_byte(&mut self, byte: u8) {
+        match byte {
+            b'\t' => self.symbol.set_ascii(b' '),
+            0x20..=0x7e => self.symbol.set_ascii(byte),
+            _ => {
+                self.set_char(char::from(byte));
+            }
+        }
+        self.is_continuation = false;
     }
 
     pub fn set_style(&mut self, style: Style) -> &mut Self {
@@ -914,20 +1019,26 @@ fn terminal_symbols(text: &str) -> impl Iterator<Item = TerminalSymbol<'_>> {
         })
 }
 
+/// Row changed since the compositor last diffed it against the screen.
+const ROW_DIRTY: u8 = 1 << 0;
+/// Row written during the current frame phase (base layer or overlays); lets
+/// the compositor tell its own row paints from other writes.
+const ROW_TOUCHED: u8 = 1 << 1;
+
 /// 2D buffer of cells
 #[derive(Debug, Clone, Default)]
 pub struct Buffer {
     pub area: Rect,
-    pub content: Vec<BufferCell>,
+    /// Crate-private so every write goes through `get_mut` (or a bulk helper)
+    /// and keeps `row_flags` truthful for the retained compositor.
+    pub(crate) content: Vec<BufferCell>,
+    /// Per-row `ROW_DIRTY` / `ROW_TOUCHED` bits.
+    row_flags: Vec<u8>,
 }
 
 impl Buffer {
     pub fn empty(area: Rect) -> Self {
-        let size = area.area();
-        Self {
-            area,
-            content: vec![BufferCell::default(); size],
-        }
+        Self::filled(area, DEFAULT_CELL)
     }
 
     pub fn filled(area: Rect, cell: BufferCell) -> Self {
@@ -935,7 +1046,68 @@ impl Buffer {
         Self {
             area,
             content: vec![cell; size],
+            row_flags: vec![ROW_DIRTY; usize::from(area.height)],
         }
+    }
+
+    /// Row `row` (0-based from `area.y`) as an index range into `content`.
+    fn row_range(&self, row: usize) -> std::ops::Range<usize> {
+        let width = usize::from(self.area.width);
+        let start = row * width;
+        start..(start + width).min(self.content.len())
+    }
+
+    /// Overwrite every cell with `template` and mark every row dirty.
+    pub(crate) fn fill_all(&mut self, template: &BufferCell) {
+        for cell in &mut self.content {
+            cell.clone_from(template);
+        }
+        self.mark_all_dirty();
+    }
+
+    /// Overwrite one row with `template` (marks it dirty, not touched: this
+    /// is the compositor's own reset, not a widget write).
+    pub(crate) fn reset_row(&mut self, row: usize, template: &BufferCell) {
+        let range = self.row_range(row);
+        for cell in &mut self.content[range] {
+            cell.clone_from(template);
+        }
+        if let Some(flags) = self.row_flags.get_mut(row) {
+            *flags |= ROW_DIRTY;
+        }
+    }
+
+    pub(crate) fn mark_all_dirty(&mut self) {
+        for flags in &mut self.row_flags {
+            *flags |= ROW_DIRTY;
+        }
+    }
+
+    fn row_touched(&self, row: usize) -> bool {
+        self.row_flags
+            .get(row)
+            .is_some_and(|flags| flags & ROW_TOUCHED != 0)
+    }
+
+    fn clear_touched(&mut self, row: usize) {
+        if let Some(flags) = self.row_flags.get_mut(row) {
+            *flags &= !ROW_TOUCHED;
+        }
+    }
+
+    /// Whether row `y` changed since the last diff.
+    pub fn row_is_dirty(&self, y: u16) -> bool {
+        y.checked_sub(self.area.y)
+            .and_then(|row| self.row_flags.get(usize::from(row)))
+            .is_some_and(|flags| flags & ROW_DIRTY != 0)
+    }
+
+    /// Rows changed since the last diff (what the next flush will visit).
+    pub fn dirty_rows(&self) -> usize {
+        self.row_flags
+            .iter()
+            .filter(|flags| **flags & ROW_DIRTY != 0)
+            .count()
     }
 
     /// Resize in place to `area`, reusing the existing cell allocation.
@@ -949,10 +1121,10 @@ impl Buffer {
         let size = area.area();
         self.area = area;
         self.content.truncate(size);
-        self.content.resize(size, BufferCell::default());
-        for cell in &mut self.content {
-            *cell = BufferCell::default();
-        }
+        self.content.resize(size, DEFAULT_CELL);
+        self.content.fill(DEFAULT_CELL);
+        self.row_flags.clear();
+        self.row_flags.resize(usize::from(area.height), ROW_DIRTY);
     }
 
     fn index_of(&self, x: u16, y: u16) -> usize {
@@ -967,6 +1139,9 @@ impl Buffer {
             && y >= self.area.y
             && y < self.area.y + self.area.height
         {
+            if let Some(flags) = self.row_flags.get_mut(usize::from(y - self.area.y)) {
+                *flags |= ROW_DIRTY | ROW_TOUCHED;
+            }
             let idx = self.index_of(x, y);
             self.content.get_mut(idx)
         } else {
@@ -1004,6 +1179,22 @@ impl Buffer {
             .saturating_add(max_width)
             .min(self.area.x + self.area.width);
 
+        // ASCII fast path: every byte is one width-1 cell, so skip grapheme
+        // segmentation and width lookups entirely.
+        if string.is_ascii() {
+            for &byte in string.as_bytes() {
+                if col >= max_col {
+                    break;
+                }
+                if let Some(cell) = self.get_mut(col, y) {
+                    cell.set_ascii_byte(byte);
+                    cell.set_style(style);
+                }
+                col += 1;
+            }
+            return;
+        }
+
         let mut last_base_col = None;
         for symbol in terminal_symbols(string) {
             let width = symbol.width;
@@ -1025,47 +1216,100 @@ impl Buffer {
     }
 
     pub fn set_line(&mut self, x: u16, y: u16, line: &Line<'_>, max_width: u16) {
-        let mut col = x;
+        self.set_spans(x, y, &line.spans, line.style, max_width);
+    }
+
+    /// `set_line` for a line with these spans and style.
+    pub(crate) fn set_spans(
+        &mut self,
+        x: u16,
+        y: u16,
+        spans: &[Span<'_>],
+        line_style: Style,
+        max_width: u16,
+    ) {
+        let Some(row) = self.row_of(y) else {
+            return;
+        };
         let max_col = x
             .saturating_add(max_width)
             .min(self.area.x + self.area.width);
-
-        let mut last_base_col = None;
-        for span in &line.spans {
-            let style = line.style.patch(span.style);
-            for symbol in terminal_symbols(&span.content) {
-                let width = symbol.width;
-                if width == 0 {
-                    if let Some(base_col) = last_base_col
-                        && let Some(cell) = self.get_mut(base_col, y)
-                    {
-                        cell.symbol.push_sanitized_str(symbol.text);
-                    }
-                    continue;
-                }
-                if col.saturating_add(width) > max_col {
-                    return;
-                }
-                self.set_symbol_at(col, y, symbol.text, width, style);
-                last_base_col = Some(col);
-                col = col.saturating_add(width);
-            }
+        let left = self.area.x;
+        let range = self.row_range(row);
+        let touched = RowCells {
+            cells: &mut self.content[range],
+            left,
+            touched: false,
+        }
+        .set_line(x, max_col, spans, line_style);
+        if touched {
+            self.row_flags[row] |= ROW_DIRTY | ROW_TOUCHED;
         }
     }
 
     fn set_symbol_at(&mut self, col: u16, y: u16, symbol: &str, width: u16, style: Style) {
-        if let Some(cell) = self.get_mut(col, y) {
-            cell.set_symbol(symbol);
-            cell.set_style(style);
-            cell.is_continuation = false;
+        let Some(row) = self.row_of(y) else {
+            return;
+        };
+        let left = self.area.x;
+        let range = self.row_range(row);
+        let mut cells = RowCells {
+            cells: &mut self.content[range],
+            left,
+            touched: false,
+        };
+        cells.set_symbol_at(col, symbol, width, style);
+        if cells.touched {
+            self.row_flags[row] |= ROW_DIRTY | ROW_TOUCHED;
         }
-        // These cells are occupied by the wide symbol but contain no content.
-        for i in 1..width {
-            if let Some(cont_cell) = self.get_mut(col + i, y) {
-                cont_cell.set_continuation();
-                cont_cell.set_style(style);
+    }
+
+    /// Row index of screen line `y`, if inside the buffer.
+    fn row_of(&self, y: u16) -> Option<usize> {
+        (y >= self.area.y && y < self.area.y + self.area.height)
+            .then(|| usize::from(y - self.area.y))
+    }
+
+    /// Paint row `row` from scratch: the same cells as `reset_row` to the
+    /// background, then `set_style` of `spec.base` over its span and, per
+    /// segment, `set_style` and `set_line`, in fewer passes (template fills,
+    /// then text written straight into the row).
+    pub(crate) fn paint_fresh_row(&mut self, row: usize, background: Color, spec: &RowSpec<'_>) {
+        let blank = blank_cell(background);
+        let mut base = blank.clone();
+        base.set_style(spec.base);
+        let left = self.area.x;
+        let range = self.row_range(row);
+        let cells = &mut self.content[range];
+        let len = cells.len();
+        let start = usize::from(spec.x.saturating_sub(left)).min(len);
+        let end =
+            usize::from(spec.x.saturating_add(spec.width).saturating_sub(left)).clamp(start, len);
+        for cell in &mut cells[..start] {
+            cell.clone_from(&blank);
+        }
+        for cell in &mut cells[start..end] {
+            cell.clone_from(&base);
+        }
+        for cell in &mut cells[end..] {
+            cell.clone_from(&blank);
+        }
+        let mut row_cells = RowCells {
+            cells,
+            left,
+            touched: true,
+        };
+        for seg in spec.segs {
+            if seg.style != Style::default() {
+                row_cells.patch_style(seg.x, seg.width, spec.base.patch(seg.style));
             }
+            let max_col = seg
+                .x
+                .saturating_add(seg.width)
+                .min(self.area.x + self.area.width);
+            row_cells.set_line(seg.x, max_col, seg.spans, seg.line_style);
         }
+        self.row_flags[row] |= ROW_DIRTY | ROW_TOUCHED;
     }
 
     pub fn set_span(&mut self, x: u16, y: u16, span: &Span<'_>, max_width: u16) {
@@ -1137,59 +1381,602 @@ impl io::Write for CrosstermBackend {
     }
 }
 
+// ============================================================================
+// Retained composition
+// ============================================================================
+
+/// One styled run within a screen row: a table cell, a header meter, or a
+/// whole line. Painted like `Table`/`Paragraph` paint cells.
+pub struct RowSeg<'a> {
+    pub x: u16,
+    pub width: u16,
+    /// Applied over the row's base style before the spans (skipped when default).
+    pub style: Style,
+    /// The line's own style, under each span's (`Line::style`).
+    pub line_style: Style,
+    /// The line's spans: any slice, so callers can paint straight from a
+    /// shared span buffer instead of building a `Line` per segment.
+    pub spans: &'a [Span<'a>],
+}
+
+impl<'a> RowSeg<'a> {
+    /// A segment painting `line`.
+    pub fn line(x: u16, width: u16, style: Style, line: &'a Line<'a>) -> Self {
+        Self {
+            x,
+            width,
+            style,
+            line_style: line.style,
+            spans: &line.spans,
+        }
+    }
+}
+
+/// Everything that paints one screen row. `Frame::paint_row` hashes it as the
+/// row's memo key, so the key covers exactly what the painter reads.
+pub struct RowSpec<'a> {
+    pub x: u16,
+    pub width: u16,
+    /// Applied across `x..x + width` first (a table row style, a paragraph style).
+    pub base: Style,
+    pub segs: &'a [RowSeg<'a>],
+}
+
+// Row keys cover every field; geometry is packed into one word per run.
+impl std::hash::Hash for RowSeg<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u32((u32::from(self.x) << 16) | u32::from(self.width));
+        self.style.hash(state);
+        self.line_style.hash(state);
+        self.spans.hash(state);
+    }
+}
+
+impl std::hash::Hash for RowSpec<'_> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u32((u32::from(self.x) << 16) | u32::from(self.width));
+        self.base.hash(state);
+        self.segs.hash(state);
+    }
+}
+
+/// Key domains, so a painted row can never share a key with a blank one.
+const PAINTED_ROW: u8 = 1;
+const BLANK_ROW: u8 = 2;
+
+/// Content key per row of the retained back buffer.
+pub(crate) struct RowMemo {
+    keys: Vec<Option<u64>>,
+    /// Keyed (per-process random) SipHash: a crafted process name cannot
+    /// force a collision that would leave a changed row unpainted.
+    hasher: std::hash::RandomState,
+}
+
+impl RowMemo {
+    fn new(height: u16) -> Self {
+        Self {
+            keys: vec![None; usize::from(height)],
+            hasher: std::hash::RandomState::new(),
+        }
+    }
+
+    fn reset(&mut self, height: u16) {
+        self.keys.clear();
+        self.keys.resize(usize::from(height), None);
+    }
+
+    fn invalidate_all(&mut self) {
+        self.keys.fill(None);
+    }
+
+    fn key<T: std::hash::Hash>(&self, value: &T) -> u64 {
+        use std::hash::BuildHasher;
+        self.hasher.hash_one(value)
+    }
+}
+
+/// A blank base-layer cell on `background`.
+/// One buffer row as a slice, addressed by screen column: the per-cell writes
+/// of `Buffer::set_line` without a bounds check and flag update per cell.
+struct RowCells<'a> {
+    cells: &'a mut [BufferCell],
+    /// Screen column of `cells[0]`.
+    left: u16,
+    /// Some cell was written (the caller marks the row).
+    touched: bool,
+}
+
+impl RowCells<'_> {
+    fn cell(&mut self, col: u16) -> Option<&mut BufferCell> {
+        let cell = self
+            .cells
+            .get_mut(usize::from(col.checked_sub(self.left)?))?;
+        self.touched = true;
+        Some(cell)
+    }
+
+    /// `Buffer::set_style` over columns `x..x + width` of this row.
+    fn patch_style(&mut self, x: u16, width: u16, style: Style) {
+        if style.fg.is_none()
+            && style.bg.is_none()
+            && style.add_modifier.is_empty()
+            && style.sub_modifier.is_empty()
+        {
+            return;
+        }
+        for col in x..x.saturating_add(width) {
+            if let Some(cell) = self.cell(col) {
+                cell.set_style(style);
+            }
+        }
+    }
+
+    /// `Buffer::set_line` of a line with these spans and style from column
+    /// `x`, stopping before `max_col`. Returns whether any cell was written.
+    fn set_line(&mut self, x: u16, max_col: u16, spans: &[Span<'_>], line_style: Style) -> bool {
+        let mut col = x;
+        let mut last_base_col = None;
+        for span in spans {
+            let style = line_style.patch(span.style);
+            // ASCII fast path (see `set_string_truncated`). Zero-width marks
+            // in a later non-ASCII span still attach to the last cell here.
+            if span.content.is_ascii() {
+                for &byte in span.content.as_bytes() {
+                    if col >= max_col {
+                        return self.touched;
+                    }
+                    if let Some(cell) = self.cell(col) {
+                        cell.set_ascii_byte(byte);
+                        cell.set_style(style);
+                    }
+                    last_base_col = Some(col);
+                    col += 1;
+                }
+                continue;
+            }
+            for symbol in terminal_symbols(&span.content) {
+                let width = symbol.width;
+                if width == 0 {
+                    if let Some(base_col) = last_base_col
+                        && let Some(cell) = self.cell(base_col)
+                    {
+                        cell.symbol.push_sanitized_str(symbol.text);
+                    }
+                    continue;
+                }
+                if col.saturating_add(width) > max_col {
+                    return self.touched;
+                }
+                self.set_symbol_at(col, symbol.text, width, style);
+                last_base_col = Some(col);
+                col = col.saturating_add(width);
+            }
+        }
+        self.touched
+    }
+
+    fn set_symbol_at(&mut self, col: u16, symbol: &str, width: u16, style: Style) {
+        if let Some(cell) = self.cell(col) {
+            cell.set_symbol(symbol);
+            cell.set_style(style);
+            cell.is_continuation = false;
+        }
+        // These cells are occupied by the wide symbol but contain no content.
+        for i in 1..width {
+            if let Some(cont_cell) = self.cell(col + i) {
+                cont_cell.set_continuation();
+                cont_cell.set_style(style);
+            }
+        }
+    }
+}
+
+fn blank_cell(background: Color) -> BufferCell {
+    let mut cell = DEFAULT_CELL;
+    cell.bg = background;
+    cell
+}
+
+/// Retained frame composer. The back buffer persists across frames, and only
+/// rows whose content key changed are reset and repainted (see
+/// [`Frame::paint_row`]); unchanged rows are not touched at all, which is
+/// what makes a frame cheap (its cost follows the memory it touches). Needs
+/// no console, so tests drive it directly.
+pub struct Compositor {
+    back: Buffer,
+    memo: RowMemo,
+}
+
+impl Compositor {
+    pub fn new(area: Rect) -> Self {
+        Self {
+            back: Buffer::empty(area),
+            memo: RowMemo::new(area.height),
+        }
+    }
+
+    pub fn area(&self) -> Rect {
+        self.back.area
+    }
+
+    /// The composed frame.
+    pub fn buffer(&self) -> &Buffer {
+        &self.back
+    }
+
+    /// Resize to `area`: everything repaints on the next frame.
+    pub fn resize(&mut self, area: Rect) {
+        self.back.resize(area);
+        self.memo.reset(area.height);
+    }
+
+    /// Forget all row keys and mark every row dirty (e.g. after the screen
+    /// was cleared underneath us).
+    pub fn invalidate(&mut self) {
+        self.memo.invalidate_all();
+        self.back.mark_all_dirty();
+    }
+
+    /// Compose one frame into the back buffer and return the requested cursor
+    /// position. Rows left dirty are what the next diff visits.
+    pub fn draw<F>(&mut self, area: Rect, f: F) -> Option<(u16, u16)>
+    where
+        F: FnOnce(&mut Frame),
+    {
+        if self.back.area != area {
+            self.resize(area);
+        }
+        let mut frame = Frame::retained(&mut self.back, &mut self.memo);
+        f(&mut frame);
+        frame.finish()
+    }
+
+    /// Treat the composed frame as delivered: clear every dirty flag without
+    /// emitting anything (tests measuring what a frame repainted).
+    pub fn acknowledge(&mut self) {
+        for flags in &mut self.back.row_flags {
+            *flags &= !ROW_DIRTY;
+        }
+    }
+}
+
+/// Receives the terminal commands a frame diff produces. The console writer
+/// implements it with crossterm; tests implement it with a screen emulator,
+/// so both run the exact same diff.
+pub(crate) trait DiffSink {
+    fn move_to(&mut self, x: u16, y: u16) -> io::Result<()>;
+    fn set_fg(&mut self, color: Color) -> io::Result<()>;
+    fn set_bg(&mut self, color: Color) -> io::Result<()>;
+    fn set_attribute(&mut self, attribute: Attribute) -> io::Result<()>;
+    fn print(&mut self, symbol: &str) -> io::Result<()>;
+}
+
+impl DiffSink for BufWriter<Stdout> {
+    fn move_to(&mut self, x: u16, y: u16) -> io::Result<()> {
+        self.queue(MoveTo(x, y)).map(|_| ())
+    }
+
+    fn set_fg(&mut self, color: Color) -> io::Result<()> {
+        self.queue(SetForegroundColor(color.to_crossterm()))
+            .map(|_| ())
+    }
+
+    fn set_bg(&mut self, color: Color) -> io::Result<()> {
+        self.queue(SetBackgroundColor(color.to_crossterm()))
+            .map(|_| ())
+    }
+
+    fn set_attribute(&mut self, attribute: Attribute) -> io::Result<()> {
+        self.queue(SetAttribute(attribute)).map(|_| ())
+    }
+
+    fn print(&mut self, symbol: &str) -> io::Result<()> {
+        self.queue(Print(symbol)).map(|_| ())
+    }
+}
+
+/// Display width of a cell's symbol (at least 1).
+fn cell_width(cell: &BufferCell) -> usize {
+    let symbol = cell.symbol.as_str();
+    if symbol.len() == 1 {
+        1
+    } else {
+        usize::from(terminal_symbol_width(symbol)).max(1)
+    }
+}
+
+/// Make a row renderable before diffing it: a wide lead whose continuation
+/// cells are missing becomes a blank, and a continuation cell no lead covers
+/// becomes a blank. Overlays (dialog borders) can land on half of a wide
+/// glyph; the terminal erases the whole glyph then, so without this `front`
+/// and the screen disagree and the remnant is never repaired.
+fn normalize_wide_row(buffer: &mut Buffer, row: usize) {
+    let range = buffer.row_range(row);
+    let cells = &mut buffer.content[range];
+    let mut covered_until = 0;
+    for x in 0..cells.len() {
+        if cells[x].is_continuation {
+            if x >= covered_until {
+                cells[x].symbol.set_ascii(b' ');
+                cells[x].is_continuation = false;
+            }
+            continue;
+        }
+        let width = cell_width(&cells[x]);
+        if width > 1 {
+            let end = x + width;
+            if end <= cells.len() && cells[x + 1..end].iter().all(|c| c.is_continuation) {
+                covered_until = end;
+            } else {
+                cells[x].symbol.set_ascii(b' ');
+            }
+        }
+    }
+}
+
+/// Diff the dirty rows of `back` against `front` (the mirror of the screen),
+/// emit commands for the cells that changed, and update `front` to match.
+/// Clean rows are skipped without being read. Returns false (emitting
+/// nothing) when no row was dirty.
+pub(crate) fn diff_frame(
+    back: &mut Buffer,
+    front: &mut Buffer,
+    sink: &mut impl DiffSink,
+) -> io::Result<bool> {
+    debug_assert_eq!(back.area, front.area);
+    if !back.row_flags.iter().any(|flags| flags & ROW_DIRTY != 0) {
+        return Ok(false);
+    }
+
+    sink.set_attribute(Attribute::Reset)?;
+    sink.set_fg(Color::Reset)?;
+    sink.set_bg(Color::Reset)?;
+    let mut last_fg = Color::Reset;
+    let mut last_bg = Color::Reset;
+    let mut last_modifier = Modifier::empty();
+
+    for row in 0..back.row_flags.len() {
+        if back.row_flags[row] & ROW_DIRTY == 0 {
+            continue;
+        }
+        back.row_flags[row] &= !ROW_DIRTY;
+        normalize_wide_row(back, row);
+
+        let range = back.row_range(row);
+        // Dirty is conservative (a repaint may reproduce the same cells).
+        if front.content.get(range.clone()) == back.content.get(range.clone()) {
+            continue;
+        }
+        let y = back.area.y + row as u16;
+        let base = range.start;
+        let width = range.len();
+        let mut need_move = true;
+        for x in 0..width {
+            let i = base + x;
+            let cell = &back.content[i];
+            if cell.is_continuation {
+                // Printed with its lead; the cursor is no longer sequential.
+                if front.content[i] != *cell {
+                    front.content[i].clone_from(cell);
+                }
+                need_move = true;
+                continue;
+            }
+            // A lead that is unchanged still has to be printed again when one
+            // of its continuation cells differs on screen.
+            let changed = front.content[i] != *cell
+                || (x + 1..width)
+                    .take_while(|&j| back.content[base + j].is_continuation)
+                    .any(|j| front.content[base + j] != back.content[base + j]);
+            if !changed {
+                need_move = true;
+                continue;
+            }
+
+            if need_move {
+                sink.move_to(back.area.x + x as u16, y)?;
+                need_move = false;
+            }
+            if cell.fg != last_fg {
+                sink.set_fg(cell.fg)?;
+                last_fg = cell.fg;
+            }
+            if cell.bg != last_bg {
+                sink.set_bg(cell.bg)?;
+                last_bg = cell.bg;
+            }
+            if cell.modifier != last_modifier {
+                // Only reset if we're removing attributes; add new ones directly
+                let removed = last_modifier.difference(cell.modifier);
+                if !removed.is_empty() {
+                    // Must reset to remove attributes, then re-apply what's needed
+                    sink.set_attribute(Attribute::Reset)?;
+                    sink.set_fg(cell.fg)?;
+                    sink.set_bg(cell.bg)?;
+                    last_fg = cell.fg;
+                    last_bg = cell.bg;
+                }
+                // Apply active modifiers (only new ones if no reset, all if reset occurred)
+                let to_apply = if removed.is_empty() {
+                    cell.modifier.difference(last_modifier)
+                } else {
+                    cell.modifier
+                };
+                for (flag, attribute) in [
+                    (Modifier::BOLD, Attribute::Bold),
+                    (Modifier::DIM, Attribute::Dim),
+                    (Modifier::ITALIC, Attribute::Italic),
+                    (Modifier::UNDERLINED, Attribute::Underlined),
+                    (Modifier::REVERSED, Attribute::Reverse),
+                ] {
+                    if to_apply.contains(flag) {
+                        sink.set_attribute(attribute)?;
+                    }
+                }
+                last_modifier = cell.modifier;
+            }
+
+            // Print the character. Defense-in-depth: cells are sanitized at
+            // write time, but sanitize again here so direct buffer mutation
+            // can never emit process-controlled ESC/C0/C1 controls.
+            let symbol = sanitized_terminal_symbol(&cell.symbol);
+            sink.print(symbol.as_ref())?;
+            front.content[i].clone_from(cell);
+        }
+    }
+
+    sink.set_attribute(Attribute::Reset)?;
+    sink.set_fg(Color::Reset)?;
+    sink.set_bg(Color::Reset)?;
+    Ok(true)
+}
+
+/// Timing and volume of the last `Terminal::draw` (benchmark reporting).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FrameStats {
+    /// Running the UI into the retained back buffer.
+    pub compose: std::time::Duration,
+    /// Diffing, encoding and writing to the console.
+    pub output: std::time::Duration,
+    /// Rows the diff visited (repainted or otherwise changed).
+    pub dirty_rows: u16,
+    /// Bytes written to the console.
+    pub bytes: usize,
+}
+
+/// Reads the console window size. On Windows it keeps one handle to the
+/// active screen buffer: crossterm's `terminal::size()` opens and closes
+/// `CONOUT$` around every query, three console round trips (~80 µs).
+struct ConsoleSize {
+    #[cfg(windows)]
+    handle: Option<windows::Win32::Foundation::HANDLE>,
+}
+
+impl ConsoleSize {
+    /// Open the handle to the screen buffer active now (so call after
+    /// entering the alternate screen).
+    fn open() -> Self {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+            use windows::Win32::Storage::FileSystem::{
+                CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+            };
+            let handle = unsafe {
+                CreateFileW(
+                    windows::core::w!("CONOUT$"),
+                    (GENERIC_READ | GENERIC_WRITE).0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    None,
+                    OPEN_EXISTING,
+                    FILE_FLAGS_AND_ATTRIBUTES(0),
+                    None,
+                )
+            };
+            Self {
+                handle: handle.ok(),
+            }
+        }
+        #[cfg(not(windows))]
+        Self {}
+    }
+
+    /// Window size in cells, like `terminal::size()` (its fallback).
+    fn read(&self) -> io::Result<(u16, u16)> {
+        #[cfg(windows)]
+        if let Some(handle) = self.handle {
+            use windows::Win32::System::Console::{
+                CONSOLE_SCREEN_BUFFER_INFO, GetConsoleScreenBufferInfo,
+            };
+            let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+            if unsafe { GetConsoleScreenBufferInfo(handle, &mut info) }.is_ok() {
+                let window = info.srWindow;
+                return Ok((
+                    (window.Right - window.Left + 1) as u16,
+                    (window.Bottom - window.Top + 1) as u16,
+                ));
+            }
+        }
+        terminal::size()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ConsoleSize {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(handle);
+            }
+        }
+    }
+}
+
 /// Terminal wrapper
 pub struct Terminal {
     backend: CrosstermBackend,
-    buffers: [Buffer; 2],
-    current: usize,
+    compositor: Compositor,
+    /// What the screen shows; the diff keeps it in step.
+    front: Buffer,
     hidden_cursor: bool,
+    last_frame: FrameStats,
+    console: ConsoleSize,
+    /// Console size as last read (see `refresh_size`).
+    size: Rect,
 }
 
 impl Terminal {
     pub fn new(backend: CrosstermBackend) -> io::Result<Self> {
-        let size = terminal::size()?;
-        let area = Rect::new(0, 0, size.0, size.1);
+        let console = ConsoleSize::open();
+        let (width, height) = console.read()?;
+        let area = Rect::new(0, 0, width, height);
         Ok(Self {
             backend,
-            buffers: [Buffer::empty(area), Buffer::empty(area)],
-            current: 0,
+            compositor: Compositor::new(area),
+            front: Buffer::empty(area),
             hidden_cursor: false,
+            last_frame: FrameStats::default(),
+            console,
+            size: area,
         })
     }
 
+    /// Re-read the console size; true when it changed (the caller redraws).
+    /// The event loop calls this after a frame is out and on resize events,
+    /// rather than `draw` querying the console before every frame.
+    pub fn refresh_size(&mut self) -> io::Result<bool> {
+        let (width, height) = self.console.read()?;
+        let size = Rect::new(0, 0, width, height);
+        let changed = size != self.size;
+        self.size = size;
+        Ok(changed)
+    }
+
+    /// Draw a frame at the size last read by `refresh_size`.
     pub fn draw<F>(&mut self, f: F) -> io::Result<()>
     where
         F: FnOnce(&mut Frame),
     {
-        // Resize if needed
-        let size = terminal::size()?;
-        let area = Rect::new(0, 0, size.0, size.1);
-        if self.buffers[self.current].area != area {
-            // Clear screen on resize to remove stale content
+        let area = self.size;
+        if self.compositor.area() != area {
+            // Clear screen on resize to remove stale content; the screen (and
+            // so `front`) is blank afterwards and every row repaints.
             self.backend.stdout.queue(CtClear(ClearType::All))?;
-            for buffer in &mut self.buffers {
-                buffer.resize(area);
-            }
+            self.front.resize(area);
+            self.compositor.resize(area);
         }
 
-        // Clear the current buffer
-        let buffer = &mut self.buffers[self.current];
-        // A pristine default cell is byte-equivalent to reset()'s output
-        // (see reused_cell_equals_fresh_default_cell); filling with a clone
-        // of one template is far cheaper than 4,800+ reset() calls.
-        buffer.content.fill(BufferCell::default());
+        let compose_start = std::time::Instant::now();
+        let cursor_position = self.compositor.draw(area, f);
+        let output_start = std::time::Instant::now();
+        let dirty_rows = self.compositor.back.dirty_rows();
 
-        // Run the drawing function
-        let mut frame = Frame {
-            buffer: &mut self.buffers[self.current],
-            cursor_position: None,
-        };
-        f(&mut frame);
-
-        let cursor_position = frame.cursor_position;
-
-        // Render diff to terminal
-        self.flush_diff()?;
+        diff_frame(
+            &mut self.compositor.back,
+            &mut self.front,
+            &mut self.backend.stdout,
+        )?;
 
         // Handle cursor
         if let Some((x, y)) = cursor_position {
@@ -1201,158 +1988,34 @@ impl Terminal {
             self.hidden_cursor = true;
         }
 
+        let bytes = self.backend.stdout.buffer().len();
         self.backend.flush()?;
-
-        // Swap buffers
-        self.current = 1 - self.current;
-
+        self.last_frame = FrameStats {
+            compose: output_start - compose_start,
+            output: output_start.elapsed(),
+            dirty_rows: dirty_rows.min(usize::from(u16::MAX)) as u16,
+            bytes,
+        };
         Ok(())
     }
 
-    fn flush_diff(&mut self) -> io::Result<()> {
-        let current = &self.buffers[self.current];
-        let previous = &self.buffers[1 - self.current];
-
-        self.backend.stdout.queue(SetAttribute(Attribute::Reset))?;
-        self.backend
-            .stdout
-            .queue(SetForegroundColor(CtColor::Reset))?;
-        self.backend
-            .stdout
-            .queue(SetBackgroundColor(CtColor::Reset))?;
-
-        let mut last_fg = Color::Reset;
-        let mut last_bg = Color::Reset;
-        let mut last_modifier = Modifier::empty();
-
-        let width = current.area.width as usize;
-
-        for y in current.area.y..current.area.bottom() {
-            // Skip entire row if unchanged from previous frame
-            let row_start = current.index_of(current.area.x, y);
-            let row_end = row_start + width;
-            if row_end <= current.content.len()
-                && row_end <= previous.content.len()
-                && current.content[row_start..row_end] == previous.content[row_start..row_end]
-            {
-                continue;
-            }
-
-            let mut skip = 0;
-            for x in current.area.x..current.area.right() {
-                let idx = current.index_of(x, y);
-                // Defense-in-depth: index via .get() rather than direct indexing so a
-                // stray out-of-range idx can never abort the process (panic = "abort").
-                let Some(cell) = current.content.get(idx) else {
-                    skip += 1;
-                    continue;
-                };
-                let prev = previous.content.get(idx);
-
-                // Skip continuation cells - they're placeholders for wide characters
-                // The wide char already printed and advanced the cursor past this position
-                if cell.is_continuation {
-                    skip += 1;
-                    continue;
-                }
-
-                // Skip if same as previous
-                if let Some(p) = prev
-                    && cell == p
-                {
-                    skip += 1;
-                    continue;
-                }
-
-                // Position cursor (skip if sequential)
-                if skip > 0 || x == current.area.x {
-                    self.backend.stdout.queue(MoveTo(x, y))?;
-                }
-                skip = 0;
-
-                // Set colors/modifiers if changed
-                if cell.fg != last_fg {
-                    self.backend
-                        .stdout
-                        .queue(SetForegroundColor(cell.fg.to_crossterm()))?;
-                    last_fg = cell.fg;
-                }
-                if cell.bg != last_bg {
-                    self.backend
-                        .stdout
-                        .queue(SetBackgroundColor(cell.bg.to_crossterm()))?;
-                    last_bg = cell.bg;
-                }
-                if cell.modifier != last_modifier {
-                    // Only reset if we're removing attributes; add new ones directly
-                    let removed = last_modifier.difference(cell.modifier);
-                    if !removed.is_empty() {
-                        // Must reset to remove attributes, then re-apply what's needed
-                        self.backend.stdout.queue(SetAttribute(Attribute::Reset))?;
-                        // Re-apply colors after reset
-                        self.backend
-                            .stdout
-                            .queue(SetForegroundColor(cell.fg.to_crossterm()))?;
-                        self.backend
-                            .stdout
-                            .queue(SetBackgroundColor(cell.bg.to_crossterm()))?;
-                        last_fg = cell.fg;
-                        last_bg = cell.bg;
-                    }
-                    // Apply active modifiers (only new ones if no reset, all if reset occurred)
-                    let to_apply = if removed.is_empty() {
-                        cell.modifier.difference(last_modifier) // only newly added
-                    } else {
-                        cell.modifier // all active (after reset)
-                    };
-                    if to_apply.contains(Modifier::BOLD) {
-                        self.backend.stdout.queue(SetAttribute(Attribute::Bold))?;
-                    }
-                    if to_apply.contains(Modifier::DIM) {
-                        self.backend.stdout.queue(SetAttribute(Attribute::Dim))?;
-                    }
-                    if to_apply.contains(Modifier::ITALIC) {
-                        self.backend.stdout.queue(SetAttribute(Attribute::Italic))?;
-                    }
-                    if to_apply.contains(Modifier::UNDERLINED) {
-                        self.backend
-                            .stdout
-                            .queue(SetAttribute(Attribute::Underlined))?;
-                    }
-                    if to_apply.contains(Modifier::REVERSED) {
-                        self.backend
-                            .stdout
-                            .queue(SetAttribute(Attribute::Reverse))?;
-                    }
-                    last_modifier = cell.modifier;
-                }
-
-                // Print the character. Defense-in-depth: cells are sanitized at
-                // write time, but sanitize again here so direct buffer mutation
-                // can never emit process-controlled ESC/C0/C1 controls.
-                let symbol = sanitized_terminal_symbol(&cell.symbol);
-                self.backend.stdout.queue(Print(symbol.as_ref()))?;
-            }
-        }
-
-        self.backend.stdout.queue(SetAttribute(Attribute::Reset))?;
-        self.backend
-            .stdout
-            .queue(SetForegroundColor(CtColor::Reset))?;
-        self.backend
-            .stdout
-            .queue(SetBackgroundColor(CtColor::Reset))?;
-
-        Ok(())
+    /// Timing and volume of the last `draw`.
+    pub fn last_frame(&self) -> FrameStats {
+        self.last_frame
     }
 
+    /// Clear the screen and repaint everything on the next `draw` (Ctrl+L).
     pub fn clear(&mut self) -> io::Result<()> {
         self.backend.stdout.execute(CtClear(ClearType::All))?;
-        // Reset both buffers
-        let size = terminal::size()?;
-        let area = Rect::new(0, 0, size.0, size.1);
-        for buffer in &mut self.buffers {
-            buffer.resize(area);
+        self.refresh_size()?;
+        let area = self.size;
+        // A cleared screen holds default cells, so that is what `front` says;
+        // retained rows must be sent again even though their keys still match.
+        self.front.resize(area);
+        if self.compositor.area() == area {
+            self.compositor.invalidate();
+        } else {
+            self.compositor.resize(area);
         }
         Ok(())
     }
@@ -1374,18 +2037,41 @@ impl Terminal {
     }
 }
 
-/// Frame for rendering widgets
+/// Frame for rendering widgets.
+///
+/// The base layer (header, tabs, table, footer) is painted row by row through
+/// [`Frame::paint_row`] between [`Frame::begin`] and [`Frame::finish_base`];
+/// overlays (dialogs, error banner) are ordinary widgets drawn afterwards. In
+/// a retained frame (from [`Compositor`]) unchanged rows are skipped; a
+/// standalone frame (`Frame::new`) always paints everything.
 pub struct Frame<'a> {
     buffer: &'a mut Buffer,
+    memo: Option<&'a mut RowMemo>,
     cursor_position: Option<(u16, u16)>,
+    /// Base-layer background, set by `begin`.
+    background: Option<Color>,
+    /// Rows claimed by `paint_row` this frame.
+    claimed: Vec<bool>,
+    base_finished: bool,
 }
 
 impl<'a> Frame<'a> {
     pub fn new(buffer: &'a mut Buffer) -> Self {
+        let rows = usize::from(buffer.area.height);
         Self {
             buffer,
+            memo: None,
             cursor_position: None,
+            background: None,
+            claimed: vec![false; rows],
+            base_finished: false,
         }
+    }
+
+    fn retained(buffer: &'a mut Buffer, memo: &'a mut RowMemo) -> Self {
+        let mut frame = Self::new(buffer);
+        frame.memo = Some(memo);
+        frame
     }
 
     pub fn area(&self) -> Rect {
@@ -1394,6 +2080,127 @@ impl<'a> Frame<'a> {
 
     pub fn buffer_mut(&mut self) -> &mut Buffer {
         self.buffer
+    }
+
+    /// Start the base layer on `background`. A standalone frame clears the
+    /// whole buffer to it; a retained frame leaves unchanged rows alone.
+    pub fn begin(&mut self, background: Color) {
+        self.background = Some(background);
+        if self.memo.is_none() {
+            self.buffer.fill_all(&blank_cell(background));
+        }
+    }
+
+    /// Paint one base-layer row: reset it to the background, apply
+    /// `spec.base` across `spec.x..spec.x + spec.width`, then each segment's
+    /// style and line (exactly how `Table` and `Paragraph` paint). In a
+    /// retained frame the row is left untouched when its key (a hash of
+    /// `spec` and the background) matches what it already shows.
+    pub fn paint_row(&mut self, y: u16, spec: &RowSpec<'_>) {
+        let area = self.buffer.area;
+        if y < area.y || y >= area.bottom() {
+            return;
+        }
+        let row = usize::from(y - area.y);
+        let background = self.background.unwrap_or(Color::Reset);
+        let repeat = std::mem::replace(&mut self.claimed[row], true);
+        debug_assert!(!repeat, "row {y} painted twice in one frame");
+
+        if let Some(memo) = self.memo.as_deref_mut() {
+            let key = memo.key(&(PAINTED_ROW, background, spec));
+            if !repeat && !self.buffer.row_touched(row) && memo.keys[row] == Some(key) {
+                return;
+            }
+            // A second paint layers onto the first; its key is not the row's.
+            memo.keys[row] = (!repeat).then_some(key);
+        }
+
+        if repeat {
+            self.buffer
+                .set_style(Rect::new(spec.x, y, spec.width, 1), spec.base);
+            for seg in spec.segs {
+                if seg.style != Style::default() {
+                    self.buffer.set_style(
+                        Rect::new(seg.x, y, seg.width, 1),
+                        spec.base.patch(seg.style),
+                    );
+                }
+                self.buffer
+                    .set_spans(seg.x, y, seg.spans, seg.line_style, seg.width);
+            }
+        } else {
+            self.buffer.paint_fresh_row(row, background, spec);
+        }
+        if self.memo.is_some() && !repeat {
+            self.buffer.clear_touched(row);
+        }
+    }
+
+    /// A single styled line in `area` (a one-line `Paragraph`).
+    pub fn paint_line(&mut self, area: Rect, line: &Line<'_>, style: Style) {
+        if area.is_empty() {
+            return;
+        }
+        let segs = [RowSeg::line(area.x, area.width, Style::default(), line)];
+        self.paint_row(
+            area.y,
+            &RowSpec {
+                x: area.x,
+                width: area.width,
+                base: style,
+                segs: &segs,
+            },
+        );
+    }
+
+    /// End the base layer: rows no `paint_row` claimed become blank (reset
+    /// only if they weren't already). Everything drawn afterwards is an
+    /// overlay, whose rows repaint on the next frame.
+    pub fn finish_base(&mut self) {
+        if std::mem::replace(&mut self.base_finished, true) {
+            return;
+        }
+        let Some(memo) = self.memo.as_deref_mut() else {
+            return;
+        };
+        let background = self.background.unwrap_or(Color::Reset);
+        let blank_key = memo.key(&(BLANK_ROW, background));
+        let blank = blank_cell(background);
+        let mut stray = false;
+        for (row, claimed) in self.claimed.iter().enumerate() {
+            let touched = self.buffer.row_touched(row);
+            // A base-layer write outside paint_row bypassed the row keys.
+            stray |= touched;
+            if *claimed {
+                if touched {
+                    memo.keys[row] = None;
+                }
+            } else if touched || memo.keys[row] != Some(blank_key) {
+                self.buffer.reset_row(row, &blank);
+                memo.keys[row] = Some(blank_key);
+            }
+            self.buffer.clear_touched(row);
+        }
+        debug_assert!(!stray, "base-layer write outside Frame::paint_row");
+        if stray {
+            // Release builds: never let the bypass go stale for long.
+            memo.invalidate_all();
+        }
+    }
+
+    /// Close the frame: rows overlays drew on repaint next frame. Returns the
+    /// requested cursor position.
+    fn finish(mut self) -> Option<(u16, u16)> {
+        self.finish_base();
+        if let Some(memo) = self.memo.as_deref_mut() {
+            for row in 0..self.claimed.len() {
+                if self.buffer.row_touched(row) {
+                    memo.keys[row] = None;
+                    self.buffer.clear_touched(row);
+                }
+            }
+        }
+        self.cursor_position
     }
 
     pub fn render_widget<W: Widget>(&mut self, widget: W, area: Rect) {
@@ -1958,77 +2765,87 @@ impl<'a> Table<'a> {
     }
 
     fn get_column_widths(&self, max_width: u16) -> Vec<u16> {
-        if self.widths.is_empty() {
-            return vec![];
-        }
-
-        let spacing_total = self.column_spacing * (self.widths.len().saturating_sub(1)) as u16;
-        let available = max_width.saturating_sub(spacing_total) as i32;
-
-        let mut widths: Vec<i32> = vec![0; self.widths.len()];
-        let mut remaining = available;
-        let mut flex_count = 0;
-
-        // First pass: fixed sizes (Length, Percentage, Ratio, Max)
-        // Min and Fill are flexible - they start at minimum and can grow
-        for (i, constraint) in self.widths.iter().enumerate() {
-            match constraint {
-                Constraint::Length(len) => {
-                    widths[i] = (*len as i32).min(remaining);
-                    remaining -= widths[i];
-                }
-                Constraint::Percentage(pct) => {
-                    widths[i] = (available * (*pct as i32) / 100).min(remaining);
-                    remaining -= widths[i];
-                }
-                Constraint::Min(min) => {
-                    // Reserve minimum, track as flexible
-                    widths[i] = (*min as i32).min(remaining);
-                    remaining -= widths[i];
-                    flex_count += 1;
-                }
-                Constraint::Max(max) => {
-                    widths[i] = (*max as i32).min(remaining);
-                    remaining -= widths[i];
-                }
-                Constraint::Ratio(num, den) => {
-                    if *den > 0 {
-                        widths[i] = (available * (*num as i32) / (*den as i32)).min(remaining);
-                        remaining -= widths[i];
-                    }
-                }
-                Constraint::Fill(_) => {
-                    flex_count += 1;
-                }
-            }
-        }
-
-        // Second pass: distribute remaining to flexible columns (Min and Fill)
-        if flex_count > 0 && remaining > 0 {
-            let per_flex = remaining / flex_count;
-            let mut extra = remaining % flex_count;
-            for (i, constraint) in self.widths.iter().enumerate() {
-                match constraint {
-                    Constraint::Min(_) | Constraint::Fill(_) => {
-                        widths[i] += per_flex;
-                        if extra > 0 {
-                            widths[i] += 1;
-                            extra -= 1;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        } else if remaining > 0 {
-            // All columns fixed: hand floor-division loss to the last column so
-            // the table uses the full width.
-            if let Some(last) = widths.last_mut() {
-                *last += remaining;
-            }
-        }
-
-        widths.into_iter().map(|w| w.max(0) as u16).collect()
+        resolve_column_widths(&self.widths, self.column_spacing, max_width)
     }
+}
+
+/// Resolve column constraints to widths across `max_width`, less the
+/// spacing between columns (how `Table` lays out its columns).
+pub fn resolve_column_widths(
+    constraints: &[Constraint],
+    column_spacing: u16,
+    max_width: u16,
+) -> Vec<u16> {
+    if constraints.is_empty() {
+        return vec![];
+    }
+
+    let spacing_total = column_spacing * (constraints.len().saturating_sub(1)) as u16;
+    let available = max_width.saturating_sub(spacing_total) as i32;
+
+    let mut widths: Vec<i32> = vec![0; constraints.len()];
+    let mut remaining = available;
+    let mut flex_count = 0;
+
+    // First pass: fixed sizes (Length, Percentage, Ratio, Max)
+    // Min and Fill are flexible - they start at minimum and can grow
+    for (i, constraint) in constraints.iter().enumerate() {
+        match constraint {
+            Constraint::Length(len) => {
+                widths[i] = (*len as i32).min(remaining);
+                remaining -= widths[i];
+            }
+            Constraint::Percentage(pct) => {
+                widths[i] = (available * (*pct as i32) / 100).min(remaining);
+                remaining -= widths[i];
+            }
+            Constraint::Min(min) => {
+                // Reserve minimum, track as flexible
+                widths[i] = (*min as i32).min(remaining);
+                remaining -= widths[i];
+                flex_count += 1;
+            }
+            Constraint::Max(max) => {
+                widths[i] = (*max as i32).min(remaining);
+                remaining -= widths[i];
+            }
+            Constraint::Ratio(num, den) => {
+                if *den > 0 {
+                    widths[i] = (available * (*num as i32) / (*den as i32)).min(remaining);
+                    remaining -= widths[i];
+                }
+            }
+            Constraint::Fill(_) => {
+                flex_count += 1;
+            }
+        }
+    }
+
+    // Second pass: distribute remaining to flexible columns (Min and Fill)
+    if flex_count > 0 && remaining > 0 {
+        let per_flex = remaining / flex_count;
+        let mut extra = remaining % flex_count;
+        for (i, constraint) in constraints.iter().enumerate() {
+            match constraint {
+                Constraint::Min(_) | Constraint::Fill(_) => {
+                    widths[i] += per_flex;
+                    if extra > 0 {
+                        widths[i] += 1;
+                        extra -= 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else if remaining > 0 {
+        // All columns fixed: hand floor-division loss to the last column so
+        // the table uses the full width.
+        if let Some(last) = widths.last_mut() {
+            *last += remaining;
+        }
+    }
+
+    widths.into_iter().map(|w| w.max(0) as u16).collect()
 }
 
 impl Table<'_> {
@@ -2385,76 +3202,125 @@ impl StatefulWidget for Scrollbar<'_> {
 mod tests {
     use super::*;
 
-    struct PhysicalLine {
-        cells: Vec<String>,
-        continuations: Vec<bool>,
+    /// Console model for diff tests: printed symbols on a grid, where
+    /// overwriting either half of a wide glyph erases the whole glyph, as real
+    /// consoles do. Driven by the real `diff_frame` through `DiffSink`.
+    struct Screen {
+        width: usize,
+        rows: Vec<Vec<(String, bool)>>, // (symbol, is_continuation)
+        cursor: (usize, usize),
+        prints: usize,
     }
 
-    impl PhysicalLine {
-        fn new(width: usize) -> Self {
+    impl Screen {
+        fn new(area: Rect) -> Self {
             Self {
-                cells: vec![" ".to_string(); width],
-                continuations: vec![false; width],
+                width: usize::from(area.width),
+                rows: vec![
+                    vec![(" ".to_string(), false); usize::from(area.width)];
+                    usize::from(area.height)
+                ],
+                cursor: (0, 0),
+                prints: 0,
             }
         }
 
-        fn print_at(&mut self, x: usize, symbol: &str) -> usize {
-            if x >= self.cells.len() {
-                return x;
+        /// Blank the whole wide glyph covering `x` (no-op for a narrow cell).
+        fn erase_glyph_at(&mut self, x: usize, y: usize) {
+            let row = &mut self.rows[y];
+            let mut lead = x;
+            while lead > 0 && row[lead].1 {
+                lead -= 1;
             }
-
-            let width = usize::from(terminal_symbol_width(symbol).max(1));
-            self.cells[x] = symbol.to_string();
-            self.continuations[x] = false;
-            for offset in 1..width {
-                let idx = x + offset;
-                if idx >= self.cells.len() {
-                    break;
+            let mut end = lead + 1;
+            while end < row.len() && row[end].1 {
+                end += 1;
+            }
+            if end - lead > 1 {
+                for cell in &mut row[lead..end] {
+                    *cell = (" ".to_string(), false);
                 }
-                self.cells[idx].clear();
-                self.continuations[idx] = true;
             }
-            x + width
         }
 
-        fn line(&self) -> String {
-            self.cells
+        fn line(&self, y: usize) -> String {
+            self.rows[y]
                 .iter()
-                .zip(&self.continuations)
-                .filter_map(|(cell, continuation)| (!continuation).then_some(cell.as_str()))
+                .filter(|(_, continuation)| !continuation)
+                .map(|(symbol, _)| symbol.as_str())
                 .collect::<String>()
                 .trim_end()
                 .to_string()
         }
     }
 
-    fn replay_diff_for_test(previous: &Buffer, current: &Buffer, physical: &mut PhysicalLine) {
-        let mut skip = 0usize;
-        let mut cursor = current.area.x as usize;
-
-        for x in current.area.x..current.area.right() {
-            let Some(cell) = current.get(x, current.area.y) else {
-                skip += 1;
-                continue;
-            };
-            let prev = previous.get(x, current.area.y);
-
-            if cell.is_continuation {
-                skip += 1;
-                continue;
+    impl DiffSink for Screen {
+        fn move_to(&mut self, x: u16, y: u16) -> io::Result<()> {
+            self.cursor = (usize::from(x), usize::from(y));
+            Ok(())
+        }
+        fn set_fg(&mut self, _: Color) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_bg(&mut self, _: Color) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_attribute(&mut self, _: Attribute) -> io::Result<()> {
+            Ok(())
+        }
+        fn print(&mut self, symbol: &str) -> io::Result<()> {
+            self.prints += 1;
+            let (x, y) = self.cursor;
+            let width = usize::from(terminal_symbol_width(symbol).max(1));
+            if x >= self.width {
+                return Ok(());
             }
-            if let Some(prev_cell) = prev
-                && cell == prev_cell
-            {
-                skip += 1;
-                continue;
+            for column in x..(x + width).min(self.width) {
+                self.erase_glyph_at(column, y);
             }
+            self.rows[y][x] = (symbol.to_string(), false);
+            for column in x + 1..(x + width).min(self.width) {
+                self.rows[y][column] = (String::new(), true);
+            }
+            self.cursor.0 = x + width;
+            Ok(())
+        }
+    }
 
-            if skip > 0 || x == current.area.x {
-                cursor = x as usize;
-            }
-            skip = 0;
-            cursor = physical.print_at(cursor, &cell.symbol);
+    /// Visible text of a (normalized) buffer row: what a correct screen shows.
+    fn buffer_line(buffer: &Buffer, y: u16) -> String {
+        let mut normalized = buffer.clone();
+        normalize_wide_row(&mut normalized, usize::from(y - buffer.area.y));
+        (buffer.area.x..buffer.area.right())
+            .filter_map(|x| normalized.get(x, y))
+            .filter(|cell| !cell.is_continuation)
+            .map(|cell| cell.symbol.as_str().to_string())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    /// Diff `back` onto the screen model and assert every row reads back.
+    fn present(back: &mut Buffer, front: &mut Buffer, screen: &mut Screen) {
+        let expected: Vec<String> = (back.area.y..back.area.bottom())
+            .map(|y| buffer_line(back, y))
+            .collect();
+        diff_frame(back, front, screen).unwrap();
+        for (y, line) in expected.iter().enumerate() {
+            assert_eq!(&screen.line(y), line, "screen row {y} diverged");
+            // `front` must mirror what the screen actually shows, or later
+            // diffs skip cells that need repainting.
+            let front_line: String = (front.area.x..front.area.right())
+                .filter_map(|x| front.get(x, front.area.y + y as u16))
+                .filter(|cell| !cell.is_continuation)
+                .map(|cell| cell.symbol.as_str().to_string())
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            assert_eq!(
+                &front_line, line,
+                "front row {y} out of step with the screen"
+            );
         }
     }
 
@@ -2481,14 +3347,14 @@ mod tests {
 
     #[test]
     fn diff_replay_replaces_modifier_cluster_without_leaving_continuations() {
-        let mut previous = Buffer::empty(Rect::new(0, 0, 8, 1));
-        let mut physical = PhysicalLine::new(8);
-        for text in ["👍🏽A", "🇺🇸B", "éC", "🧑🏽‍💻D", "normal"] {
-            let mut current = Buffer::empty(previous.area);
-            current.set_string_truncated(0, 0, text, 8, Style::default());
-            replay_diff_for_test(&previous, &current, &mut physical);
-            assert_eq!(physical.line(), text);
-            previous = current;
+        let area = Rect::new(0, 0, 8, 1);
+        let mut front = Buffer::empty(area);
+        let mut screen = Screen::new(area);
+        for text in ["👍🏽A", "🇺🇸B", "éC", "🧑🏽‍💻D", "normal"] {
+            let mut back = Buffer::empty(area);
+            back.set_string_truncated(0, 0, text, 8, Style::default());
+            present(&mut back, &mut front, &mut screen);
+            assert_eq!(screen.line(0), text);
         }
     }
 
@@ -2510,19 +3376,18 @@ mod tests {
     #[test]
     fn diff_replay_keeps_system_s_after_wide_indicator() {
         let area = Rect::new(0, 0, 24, 1);
-        let empty = Buffer::empty(area);
+        let mut front = Buffer::empty(area);
+        let mut screen = Screen::new(area);
+
         let mut previous = Buffer::empty(area);
-        let mut current = Buffer::empty(area);
-        let mut physical = PhysicalLine::new(area.width as usize);
-
         previous.set_string(0, 0, "xxABsD", Style::default());
+        present(&mut previous, &mut front, &mut screen);
+        let mut current = Buffer::empty(area);
         current.set_line(0, 0, &Line::raw("🛡️ System"), area.width);
+        present(&mut current, &mut front, &mut screen);
 
-        replay_diff_for_test(&empty, &previous, &mut physical);
-        replay_diff_for_test(&previous, &current, &mut physical);
-
-        assert_eq!(physical.line(), "🛡️ System");
-        assert!(!physical.line().contains("Sytem"));
+        assert_eq!(screen.line(0), "🛡️ System");
+        assert!(!screen.line(0).contains("Sytem"));
     }
 
     #[test]
@@ -2784,5 +3649,434 @@ mod tests {
         }
         assert!(buf.content.iter().all(|c| c.symbol.is_inline()));
         assert!(buf.content.iter().all(|c| *c == BufferCell::default()));
+    }
+
+    #[test]
+    fn default_cell_constant_matches_default_and_reset() {
+        assert_eq!(DEFAULT_CELL, BufferCell::default());
+        let mut cell = BufferCell::default();
+        cell.set_symbol("界");
+        cell.reset();
+        assert_eq!(cell, DEFAULT_CELL);
+    }
+
+    #[test]
+    fn inline_clone_is_equal_and_heap_clone_still_deep_copies() {
+        let mut inline = BufferCell::default();
+        inline.set_symbol("é");
+        assert_eq!(inline.clone(), inline);
+        let mut heap = BufferCell::default();
+        heap.set_symbol("👨\u{200d}👩\u{200d}👧\u{200d}👦");
+        let copy = heap.clone();
+        drop(heap);
+        assert_eq!(copy.symbol.as_str(), "👨\u{200d}👩\u{200d}👧\u{200d}👦");
+    }
+
+    /// The ASCII fast path must produce exactly what the grapheme path did:
+    /// tab → space, other controls → U+FFFD, one width-1 cell per byte.
+    #[test]
+    fn ascii_fast_path_sanitizes_like_the_grapheme_path() {
+        let text = "a\tb\x01c\x7f\r\n";
+        let expected = [
+            "a", " ", "b", "\u{FFFD}", "c", "\u{FFFD}", "\u{FFFD}", "\u{FFFD}",
+        ];
+        let style = Style::default().fg(Color::Green);
+
+        let mut via_string = Buffer::empty(Rect::new(0, 0, 10, 1));
+        via_string.set_string(0, 0, text, style);
+        let mut via_line = Buffer::empty(Rect::new(0, 0, 10, 1));
+        via_line.set_line(0, 0, &Line::from(vec![Span::styled(text, style)]), 10);
+
+        for buf in [&via_string, &via_line] {
+            for (x, symbol) in expected.iter().enumerate() {
+                let cell = buf.get(x as u16, 0).unwrap();
+                assert_eq!(cell.symbol.as_str(), *symbol, "cell {x}");
+                assert_eq!(cell.fg, Color::Green);
+                assert!(!cell.is_continuation);
+            }
+        }
+        // Truncation stops at the width limit.
+        let mut short = Buffer::empty(Rect::new(0, 0, 10, 1));
+        short.set_string_truncated(0, 0, "abcdef", 3, Style::default());
+        assert_eq!(short.get(2, 0).unwrap().symbol.as_str(), "c");
+        assert_eq!(short.get(3, 0).unwrap().symbol.as_str(), " ");
+    }
+
+    #[test]
+    fn zero_width_mark_after_an_ascii_span_joins_its_last_cell() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 1));
+        let line = Line::from(vec![Span::raw("ab"), Span::raw("\u{301}c")]);
+        buf.set_line(0, 0, &line, 10);
+        assert_eq!(buf.get(1, 0).unwrap().symbol.as_str(), "b\u{301}");
+        assert_eq!(buf.get(2, 0).unwrap().symbol.as_str(), "c");
+    }
+
+    #[test]
+    fn ascii_write_over_a_heap_symbol_frees_and_replaces_it() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        buf.set_string(0, 0, "👨\u{200d}👩\u{200d}👧\u{200d}👦", Style::default());
+        buf.set_string(0, 0, "x", Style::default());
+        let cell = buf.get(0, 0).unwrap();
+        assert_eq!(cell.symbol.as_str(), "x");
+        assert!(cell.symbol.is_inline());
+    }
+
+    // ===== Retained compositor =====
+
+    const AREA: Rect = Rect {
+        x: 0,
+        y: 0,
+        width: 12,
+        height: 3,
+    };
+
+    /// Paint `rows[y]` on row y with `base`, leaving other rows unclaimed.
+    fn paint_rows(frame: &mut Frame, background: Color, base: Style, rows: &[&str]) {
+        frame.begin(background);
+        for (y, text) in rows.iter().enumerate() {
+            let line = Line::raw(*text);
+            frame.paint_line(Rect::new(0, y as u16, AREA.width, 1), &line, base);
+        }
+        frame.finish_base();
+    }
+
+    #[test]
+    fn unchanged_rows_are_not_repainted() {
+        let mut compositor = Compositor::new(AREA);
+        compositor.draw(AREA, |f| {
+            paint_rows(f, Color::Black, Style::default(), &["ab", "cd"])
+        });
+        assert_eq!(
+            compositor.buffer().dirty_rows(),
+            3,
+            "first frame paints everything"
+        );
+        compositor.acknowledge();
+
+        compositor.draw(AREA, |f| {
+            paint_rows(f, Color::Black, Style::default(), &["ab", "cd"])
+        });
+        assert_eq!(compositor.buffer().dirty_rows(), 0);
+
+        compositor.draw(AREA, |f| {
+            paint_rows(f, Color::Black, Style::default(), &["ab", "cX"])
+        });
+        assert_eq!(compositor.buffer().dirty_rows(), 1);
+        assert_eq!(compositor.buffer().get(1, 1).unwrap().symbol.as_str(), "X");
+    }
+
+    #[test]
+    fn a_repaint_resets_the_row_instead_of_layering_on_it() {
+        let mut compositor = Compositor::new(AREA);
+        let bold = Style::default().add_modifier(Modifier::BOLD).fg(Color::Red);
+        compositor.draw(AREA, |f| paint_rows(f, Color::Black, bold, &["long text"]));
+        compositor.draw(AREA, |f| {
+            paint_rows(f, Color::Black, Style::default(), &["ab"])
+        });
+
+        let mut reference = Buffer::empty(AREA);
+        paint_rows(
+            &mut Frame::new(&mut reference),
+            Color::Black,
+            Style::default(),
+            &["ab"],
+        );
+        assert_eq!(compositor.buffer().content, reference.content);
+        assert!(
+            compositor
+                .buffer()
+                .content
+                .iter()
+                .all(|c| c.modifier.is_empty())
+        );
+    }
+
+    #[test]
+    fn a_background_change_repaints_every_row() {
+        let mut compositor = Compositor::new(AREA);
+        compositor.draw(AREA, |f| {
+            paint_rows(f, Color::Black, Style::default(), &["ab"])
+        });
+        compositor.acknowledge();
+        compositor.draw(AREA, |f| {
+            paint_rows(f, Color::Blue, Style::default(), &["ab"])
+        });
+        assert_eq!(compositor.buffer().dirty_rows(), 3);
+        assert!(
+            compositor
+                .buffer()
+                .content
+                .iter()
+                .all(|c| c.bg == Color::Blue)
+        );
+    }
+
+    #[test]
+    fn rows_under_an_overlay_repaint_once_it_closes() {
+        let mut compositor = Compositor::new(AREA);
+        compositor.draw(AREA, |f| {
+            paint_rows(f, Color::Black, Style::default(), &["base0", "base1"]);
+            f.render_widget(Paragraph::new("DIALOG"), Rect::new(0, 1, 6, 1));
+        });
+        assert_eq!(compositor.buffer().get(0, 1).unwrap().symbol.as_str(), "D");
+        compositor.acknowledge();
+
+        compositor.draw(AREA, |f| {
+            paint_rows(f, Color::Black, Style::default(), &["base0", "base1"])
+        });
+        assert_eq!(compositor.buffer().dirty_rows(), 1, "only the overlay row");
+        assert_eq!(compositor.buffer().get(0, 1).unwrap().symbol.as_str(), "b");
+    }
+
+    #[test]
+    fn invalidate_marks_everything_for_repaint() {
+        let mut compositor = Compositor::new(AREA);
+        compositor.draw(AREA, |f| {
+            paint_rows(f, Color::Black, Style::default(), &["ab"])
+        });
+        compositor.acknowledge();
+        compositor.invalidate();
+        compositor.draw(AREA, |f| {
+            paint_rows(f, Color::Black, Style::default(), &["ab"])
+        });
+        assert_eq!(compositor.buffer().dirty_rows(), 3);
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "outside Frame::paint_row"))]
+    fn base_layer_writes_must_go_through_paint_row() {
+        let mut compositor = Compositor::new(AREA);
+        compositor.draw(AREA, |f| {
+            f.begin(Color::Black);
+            f.render_widget(Paragraph::new("stray"), Rect::new(0, 0, 5, 1));
+            f.finish_base();
+        });
+    }
+
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "painted twice"))]
+    fn a_row_is_painted_once_per_frame() {
+        let mut frame_buffer = Buffer::empty(AREA);
+        let mut frame = Frame::new(&mut frame_buffer);
+        frame.begin(Color::Black);
+        let line = Line::raw("x");
+        frame.paint_line(Rect::new(0, 0, 4, 1), &line, Style::default());
+        frame.paint_line(Rect::new(4, 0, 4, 1), &line, Style::default());
+    }
+
+    #[test]
+    fn diff_visits_only_dirty_rows_and_keeps_front_in_step() {
+        let area = Rect::new(0, 0, 6, 3);
+        let mut back = Buffer::empty(area);
+        back.set_string(0, 0, "abc", Style::default());
+        back.set_string(0, 2, "xyz", Style::default());
+        let mut front = Buffer::empty(area);
+        let mut screen = Screen::new(area);
+        present(&mut back, &mut front, &mut screen);
+        assert_eq!(front.content, back.content);
+        assert_eq!(back.dirty_rows(), 0);
+
+        let before = screen.prints;
+        back.set_string(1, 2, "Y", Style::default());
+        present(&mut back, &mut front, &mut screen);
+        assert_eq!(screen.prints - before, 1, "one changed cell, one print");
+        assert!(!diff_frame(&mut back, &mut front, &mut screen).unwrap());
+    }
+
+    /// A dialog edge landing on the right half of a wide glyph used to leave
+    /// its border character on screen after the dialog closed.
+    #[test]
+    fn fresh_row_paint_matches_reset_style_and_line_writes() {
+        // paint_fresh_row must leave exactly the cells and flags of the
+        // sequence it replaces (the retained-render gate cannot tell: both
+        // of its sides paint fresh rows the same way).
+        let mut state = 0x853C_49E6_748F_EA9Bu64;
+        let mut next = |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let texts = [
+            "abc",
+            "PID",
+            "\t",
+            "\u{7}",
+            "🛡️",
+            "進程.exe",
+            "e\u{301}x",
+            "",
+            "│ ",
+            "🌿",
+            "C:\\Windows\\System32\\svchost.exe -k netsvcs",
+            " ",
+            "\u{301}",
+        ];
+        let colors = [
+            None,
+            Some(Color::Red),
+            Some(Color::Rgb(1, 2, 3)),
+            Some(Color::Indexed(99)),
+            Some(Color::Reset),
+        ];
+        let style = |next: &mut dyn FnMut(u64) -> u64| {
+            let mut style = Style {
+                fg: colors[next(5) as usize],
+                bg: colors[next(5) as usize],
+                ..Style::default()
+            };
+            if next(3) == 0 {
+                style = style.add_modifier(Modifier::BOLD);
+            }
+            if next(4) == 0 {
+                style = style.remove_modifier(Modifier::BOLD | Modifier::DIM);
+            }
+            style
+        };
+        let area = Rect::new(3, 1, 40, 3);
+        for case in 0..3000 {
+            let lines: Vec<Line<'static>> = (0..1 + next(4))
+                .map(|_| {
+                    let spans: Vec<Span<'static>> = (0..next(4))
+                        .map(|_| {
+                            Span::styled(texts[next(texts.len() as u64) as usize], style(&mut next))
+                        })
+                        .collect();
+                    Line::from(spans).style(style(&mut next))
+                })
+                .collect();
+            let segs: Vec<RowSeg<'_>> = lines
+                .iter()
+                .map(|line| RowSeg::line(next(50) as u16, next(30) as u16, style(&mut next), line))
+                .collect();
+            let spec = RowSpec {
+                x: next(48) as u16,
+                width: next(48) as u16,
+                base: style(&mut next),
+                segs: &segs,
+            };
+            let background = colors[next(5) as usize].unwrap_or(Color::Blue);
+            let y = area.y + next(3) as u16;
+            let row = usize::from(y - area.y);
+
+            // Both start from the same garbage: heap symbols, wide glyphs,
+            // stray continuations, styles.
+            let mut garbage = Buffer::empty(area);
+            for x in area.x..area.right() {
+                let text = texts[next(texts.len() as u64) as usize];
+                garbage.set_string(x, y, text, style(&mut next));
+            }
+            garbage.row_flags.fill(0);
+            let mut expected = garbage.clone();
+            let mut actual = garbage;
+
+            expected.reset_row(row, &blank_cell(background));
+            expected.set_style(Rect::new(spec.x, y, spec.width, 1), spec.base);
+            for seg in spec.segs {
+                if seg.style != Style::default() {
+                    expected.set_style(
+                        Rect::new(seg.x, y, seg.width, 1),
+                        spec.base.patch(seg.style),
+                    );
+                }
+                expected.set_spans(seg.x, y, seg.spans, seg.line_style, seg.width);
+            }
+            actual.paint_fresh_row(row, background, &spec);
+
+            assert_eq!(actual.content, expected.content, "case {case}");
+            assert_eq!(
+                actual.row_flags[row] & ROW_DIRTY,
+                expected.row_flags[row] & ROW_DIRTY,
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlay_over_half_a_wide_glyph_leaves_no_remnant() {
+        let area = Rect::new(0, 0, 12, 1);
+        let mut compositor = Compositor::new(area);
+        let mut front = Buffer::empty(area);
+        let mut screen = Screen::new(area);
+        let base = |f: &mut Frame| {
+            f.begin(Color::Reset);
+            let line = Line::raw("🛡️ System");
+            f.paint_line(area, &line, Style::default());
+            f.finish_base();
+        };
+
+        compositor.draw(area, base);
+        present(&mut compositor.back, &mut front, &mut screen);
+        assert_eq!(screen.line(0), "🛡️ System");
+
+        // Border at x=1: the shield's continuation cell.
+        compositor.draw(area, |f| {
+            base(f);
+            if let Some(cell) = f.buffer_mut().get_mut(1, 0) {
+                cell.set_symbol("│");
+                cell.is_continuation = false;
+            }
+        });
+        present(&mut compositor.back, &mut front, &mut screen);
+        assert_eq!(screen.line(0), " │ System");
+
+        compositor.draw(area, base);
+        present(&mut compositor.back, &mut front, &mut screen);
+        assert_eq!(screen.line(0), "🛡️ System");
+    }
+
+    #[test]
+    fn clear_then_redraw_resends_retained_rows() {
+        let area = Rect::new(0, 0, 8, 2);
+        let mut compositor = Compositor::new(area);
+        let mut front = Buffer::empty(area);
+        let mut screen = Screen::new(area);
+        let draw = |c: &mut Compositor| {
+            c.draw(area, |f| {
+                paint_rows(f, Color::Reset, Style::default(), &["keep", "me"])
+            });
+        };
+        draw(&mut compositor);
+        present(&mut compositor.back, &mut front, &mut screen);
+
+        // What Terminal::clear does: the console is wiped underneath us.
+        screen = Screen::new(area);
+        front.resize(area);
+        compositor.invalidate();
+        draw(&mut compositor);
+        present(&mut compositor.back, &mut front, &mut screen);
+        assert_eq!(screen.line(0), "keep");
+        assert_eq!(screen.line(1), "me");
+    }
+
+    #[test]
+    fn packed_colors_are_distinct_and_never_the_no_color_marker() {
+        let mut colors = vec![
+            Color::Reset,
+            Color::Black,
+            Color::Red,
+            Color::Green,
+            Color::Yellow,
+            Color::Blue,
+            Color::Magenta,
+            Color::Cyan,
+            Color::Gray,
+            Color::DarkGray,
+            Color::LightRed,
+            Color::LightGreen,
+            Color::LightYellow,
+            Color::LightBlue,
+            Color::LightMagenta,
+            Color::LightCyan,
+            Color::White,
+        ];
+        colors.extend([0u8, 1, 16, 255].map(Color::Indexed));
+        colors.extend(
+            [(0, 0, 0), (0, 0, 16), (255, 255, 255), (1, 2, 3)]
+                .map(|(r, g, b)| Color::Rgb(r, g, b)),
+        );
+        let packed: std::collections::HashSet<u32> = colors.iter().map(|c| c.packed()).collect();
+        assert_eq!(packed.len(), colors.len());
+        assert!(!packed.contains(&u32::MAX));
     }
 }

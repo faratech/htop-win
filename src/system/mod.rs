@@ -76,14 +76,15 @@ pub use d3dkmt::{
     GpuInfo, NpuInfo, debug_dump as gpu_debug_dump, gpu_names, has_tracked_adapters,
     set_gpu_process_stats_enabled, set_gpu_selection, set_npu_process_stats_enabled,
 };
-pub use memory::{MemoryInfo, format_bytes};
+pub use memory::{MemoryInfo, format_bytes, push_bytes};
 // Part of the library API (used by tests/visual_test.rs); the binary target
 // compiles this module tree too but never references the re-export, so the
 // unused-import lint must be silenced for that target.
 #[allow(unused_imports)]
 pub use process::ProcessArch;
 pub use process::{
-    ProcessEnrichmentRequirements, ProcessIdentity, ProcessInfo, enable_debug_privilege,
+    ProcessEnrichmentRequirements, ProcessIdentity, ProcessInfo, apply_cached_metadata,
+    enable_debug_privilege, enrich_processes_at,
     enrich_processes, enrich_processes_for, get_process_affinity, get_process_exe_path,
     get_process_io_counters, hydrate_processes_from_cache, kill_process, set_efficiency_mode,
     set_priority_class, set_process_affinity,
@@ -399,9 +400,8 @@ fn get_network_stats() -> bool {
 
 // Scratch PID→slot index reused across refresh ticks. Thread-local storage
 // needs no synchronization, keeps `SystemMetrics` cheap to clone for every
-// snapshot sent to the UI thread, and stays correct when the UI-thread
-// fallback refresh (`App::refresh_system`) runs this on another thread (each
-// thread simply reuses its own instance).
+// snapshot sent to the UI thread, and stays correct if another thread ever
+// runs this (each thread simply reuses its own instance).
 #[cfg(windows)]
 thread_local! {
     static PID_INDEX_SCRATCH: std::cell::RefCell<HashMap<u32, usize>> =
@@ -557,10 +557,6 @@ impl SystemMetrics {
         use self::cache::CACHE;
         use self::native::{calculate_process_rates, with_process_list, with_process_rates};
 
-        // Open the tick's exe-stat budget so due re-stats spread across ticks
-        // instead of stat-bombing the filesystem in one synchronized burst.
-        CACHE.begin_exe_tick(cache::config::EXE_STATS_PER_TICK);
-
         // On query failure (None), keep the previous process list and baselines
         // untouched rather than blanking the table for a frame.
         let _ = with_process_list(|proc_list| {
@@ -591,6 +587,11 @@ impl SystemMetrics {
                 total_disk_read = total_disk_read.saturating_add(proc.read_bytes());
                 total_disk_write = total_disk_write.saturating_add(proc.write_bytes());
             }
+
+            // Open the tick's exe-stat budget so due re-stats spread across
+            // ticks instead of stat-bombing the filesystem in one synchronized
+            // burst, and size the exe-status cache to this process count.
+            CACHE.begin_exe_tick(cache::config::EXE_STATS_PER_TICK, tasks_total);
 
             // Get CPU percentages and I/O rates based on cache deltas
             // (fills thread-local rate tables; read back via with_process_rates)

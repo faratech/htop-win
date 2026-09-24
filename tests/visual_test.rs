@@ -29,10 +29,6 @@ fn fixture_process(pid: u32, user: &str, name: &str, cpu: f32, mem: f32) -> Proc
         shared_mem: 16 * 1024 * 1024,
         priority: 20,
         cpu_time: 75 * 10_000_000,
-        tree_depth: 0,
-        tree_prefix: String::new(),
-        has_children: false,
-        is_collapsed: false,
         thread_count: 8,
         start_time: 1_700_000_000,
         create_time_100ns: 133_444_736_000_000_000 + pid as u64,
@@ -48,7 +44,6 @@ fn fixture_process(pid: u32, user: &str, name: &str, cpu: f32, mem: f32) -> Proc
         name_lower: name.to_lowercase().into(),
         command_lower: name.to_lowercase().into(),
         user_lower: user.to_lowercase().into(),
-        matches_search: false,
         efficiency_mode: false,
         is_elevated: false,
         arch: ProcessArch::Native,
@@ -400,7 +395,7 @@ fn paused_resize_and_header_toggle_keep_selection_visible() {
             assert!(app.selected_index >= app.scroll_offset);
             assert!(app.selected_index < app.scroll_offset + app.visible_height);
         }
-        assert!(app.scroll_offset < app.displayed_processes.len());
+        assert!(app.scroll_offset < app.displayed_len());
     }
     let target = app.selected_process().unwrap().identity();
     app.enter_kill_mode();
@@ -447,4 +442,79 @@ fn unsupported_views_describe_the_available_data() {
     let text = render_at(&mut app, 100, 30);
     assert!(text.contains("Environment inspection is not implemented."));
     assert!(!text.contains("elevated privileges"));
+}
+
+/// App showing PID/VIRT/S/Command with multi-color number highlighting on
+/// (the default) and the given processes, sorted by PID.
+fn large_numbers_app(processes: Vec<ProcessInfo>) -> App {
+    let columns: Vec<String> = ["PID", "VIRT", "S", "Command"]
+        .iter()
+        .map(|c| c.to_string())
+        .collect();
+    let config = Config {
+        visible_columns: columns.clone(),
+        highlight_large_numbers: true,
+        ..Config::default()
+    };
+    let mut app = App::new(config);
+    app.show_header = false;
+    app.screen_tabs = vec![ScreenTab {
+        name: "Main".to_string(),
+        columns,
+        sort_column: SortColumn::Pid,
+        sort_ascending: true,
+    }];
+    app.sort_column = SortColumn::Pid;
+    app.sort_ascending = true;
+    app.update_visible_columns_cache();
+    app.processes = processes;
+    app.update_displayed_processes();
+    app
+}
+
+#[test]
+fn large_memory_values_and_status_render_intact() {
+    // Issue #95: a second table render after span recycling painted the
+    // borrowed "G" unit over the leading digit (15G -> "G5G").
+    // Issue #96: the status byte printed as its ASCII code ("63" for '?').
+    let mut processes = vec![
+        fixture_process(100, "alice", "Fifteen", 1.0, 1.0),
+        fixture_process(200, "alice", "TwoFifty", 1.0, 1.0),
+        fixture_process(300, "alice", "Selected", 1.0, 1.0),
+    ];
+    processes[0].virtual_mem = 15 << 30;
+    processes[1].virtual_mem = 250 << 30;
+    for process in &mut processes {
+        process.status = b'?';
+    }
+    let mut app = large_numbers_app(processes);
+    // Keep the checked rows unselected so they take the multi-color path.
+    app.selected_index = 2;
+
+    let text = render_at(&mut app, 60, 6);
+    let row = |pid: &str| {
+        text.lines()
+            .map(normalize_cells)
+            .find(|line| line.starts_with(pid))
+            .unwrap_or_else(|| panic!("no row for pid {pid} in:\n{text}"))
+    };
+    assert_eq!(row("100"), "100 15G ? Fifteen", "\n{text}");
+    assert_eq!(row("200"), "200 250G ? TwoFifty", "\n{text}");
+    assert!(!text.contains("63"), "status rendered as a number:\n{text}");
+}
+
+#[test]
+fn process_info_dialog_shows_status_letter() {
+    let mut process = fixture_process(100, "alice", "Shell", 1.0, 1.0);
+    process.status = b'?';
+    let mut app = large_numbers_app(vec![process]);
+    app.enter_process_info_mode();
+
+    let text = render_at(&mut app, 100, 40);
+    let status = text
+        .lines()
+        .find(|line| line.contains("Status"))
+        .map(normalize_cells)
+        .unwrap_or_else(|| panic!("no Status line in:\n{text}"));
+    assert!(status.contains("Status ? (Unknown"), "{status}");
 }

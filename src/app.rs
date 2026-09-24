@@ -649,6 +649,33 @@ impl TerminationRequest {
     }
 }
 
+/// One row of the process list: an index into `App::processes` plus what the
+/// list view adds to that process (tree layout, search highlight).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DisplayRow {
+    /// Index into `App::processes`.
+    pub index: usize,
+    pub tree_depth: u16,
+    /// Tree display prefix (├─, └─, │, etc.).
+    pub tree_prefix: String,
+    /// Has child processes (tree view).
+    pub has_children: bool,
+    /// Collapsed in tree view.
+    pub is_collapsed: bool,
+    /// Matches the active search (highlighted).
+    pub matches_search: bool,
+}
+
+impl DisplayRow {
+    /// A flat (non-tree) row for `processes[index]`.
+    fn flat(index: usize) -> Self {
+        Self {
+            index,
+            ..Self::default()
+        }
+    }
+}
+
 /// Resolve ancestry from this snapshot, rejecting reused or unknown parents.
 /// Index-space equivalents of the old pid-keyed HashMaps in `build_tree`:
 /// pid→index, validated parent links, and children as CSR arrays. Buffers are
@@ -662,7 +689,6 @@ struct TreeScratch {
     child_list: Vec<u32>,
     visited: Vec<bool>,
     suppressed: Vec<bool>,
-    slots: Vec<Option<ProcessInfo>>,
     stack: Vec<PendingNode>,
 }
 
@@ -694,6 +720,17 @@ fn validated_parents(processes: &[ProcessInfo]) -> std::collections::HashMap<u32
                 .then_some((child.pid, child.parent_pid))
         })
         .collect()
+}
+
+/// Order-preserving integer image of an `f32` for sorting: equal floats get
+/// equal keys (`-0.0` sorts with `0.0`), larger floats larger keys.
+fn f32_sort_key(value: f32) -> u64 {
+    let bits = (value + 0.0).to_bits();
+    u64::from(if bits & 0x8000_0000 != 0 {
+        !bits
+    } else {
+        bits | 0x8000_0000
+    })
 }
 
 /// Dialog/view state - encapsulates per-dialog state into enum variants
@@ -800,8 +837,10 @@ pub struct App {
     pub processes: Vec<ProcessInfo>,
     /// Metadata dependencies fulfilled by the collector for `processes`.
     canonical_enrichment: crate::system::ProcessEnrichmentRequirements,
-    /// Filtered/displayed processes
-    pub displayed_processes: Vec<ProcessInfo>,
+    /// The process list as displayed: filtered, sorted (or tree-ordered) rows
+    /// indexing into `processes`. `processes` only changes together with a
+    /// rebuild of these rows (see `apply_snapshot`).
+    display: Vec<DisplayRow>,
     /// Currently selected process index
     pub selected_index: usize,
     /// Scroll offset for process list
@@ -860,9 +899,10 @@ pub struct App {
     pub collapsed_pids: HashSet<ProcessIdentity>,
     /// Reusable index-space buffers for `build_tree` (cleared, not reallocated).
     tree_scratch: TreeScratch,
-    /// Spare buffer for `displayed_processes` (same recycle pattern as the
-    /// collector's snapshot vec).
-    displayed_scratch: Vec<ProcessInfo>,
+    /// Spare buffers for the display rows and their sort entries (same
+    /// recycle pattern as the collector's snapshot vec).
+    display_scratch: Vec<DisplayRow>,
+    order_scratch: Vec<(u64, usize)>,
     /// Follow mode: stable identity to follow across refreshes.
     pub follow_pid: Option<ProcessIdentity>,
     /// Pause updates
@@ -888,6 +928,18 @@ pub struct App {
     pub cached_visible_columns: Vec<SortColumn>,
     /// Deferred process list update flag (flushed once before each render)
     pub needs_process_update: bool,
+    /// Display rows enriched by the last enrichment pass
+    /// (see `enrich_viewport`).
+    enriched_rows: std::ops::Range<usize>,
+    /// Some row in `enriched_rows` still needs a Windows metadata query; it
+    /// runs after the frame is drawn (see `run_deferred_enrichment`).
+    enrichment_pending: bool,
+    /// Set by Ctrl+L: the event loop clears the terminal and repaints every
+    /// cell on the next draw instead of diffing against the last frame.
+    pub full_redraw_requested: bool,
+    /// Fixed wall clock (Unix seconds) for rendering, so time-derived cells
+    /// (START, new-process highlight) are deterministic in tests.
+    pub clock_override: Option<u64>,
     /// UI layout bounds (populated during render for accurate mouse/keyboard navigation)
     pub ui_bounds: UIBounds,
 
@@ -995,7 +1047,7 @@ impl App {
             system_metrics: SystemMetrics::default(),
             processes: Vec::new(),
             canonical_enrichment: Default::default(),
-            displayed_processes: Vec::new(),
+            display: Vec::new(),
             selected_index: 0,
             scroll_offset: 0,
             sort_column,
@@ -1022,7 +1074,8 @@ impl App {
             config_save_failed: false,
             collapsed_pids: HashSet::new(),
             tree_scratch: TreeScratch::default(),
-            displayed_scratch: Vec::new(),
+            display_scratch: Vec::new(),
+            order_scratch: Vec::new(),
             follow_pid: None,
             paused: false,
             pid_search_buffer: String::new(),
@@ -1037,6 +1090,10 @@ impl App {
             npu_history: VecDeque::new(),
             cached_visible_columns,
             needs_process_update: false,
+            enriched_rows: 0..0,
+            enrichment_pending: false,
+            full_redraw_requested: false,
+            clock_override: None,
             ui_bounds: UIBounds::default(),
             dialog_area: None,
             dialog_inner: None,
@@ -1601,39 +1658,54 @@ impl App {
         **target = updated;
     }
 
-    /// Refresh system data (synchronous, used for initial refresh fallback)
-    pub fn refresh_system(&mut self) {
-        // Use native Windows APIs for all system metrics
-        self.system_metrics.refresh();
-        // Update processes in-place to avoid re-allocating strings
-        self.system_metrics
-            .update_processes_native(&mut self.processes);
-        crate::system::hydrate_processes_from_cache(&mut self.processes);
-        // This UI-thread refresh only collected raw data. Any required bulk
-        // metadata pass remains delegated to the collector.
-        self.canonical_enrichment = Default::default();
-        self.update_displayed_processes();
-        self.refresh_process_info_stats();
-
-        // Update history for graph mode
-        self.update_meter_history();
+    /// Wall-clock Unix seconds used for rendering (see `clock_override`).
+    pub fn now_unix_secs(&self) -> u64 {
+        self.clock_override.unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        })
     }
 
-    /// Apply a snapshot from the background data collector
-    pub fn apply_snapshot(&mut self, snapshot: crate::data::SystemSnapshot) {
+    /// Whether the collector has already populated `requirements` for the
+    /// current process set (the event loop keeps waiting for a snapshot while
+    /// paused until it has).
+    pub fn has_enrichment_for(
+        &self,
+        requirements: crate::system::ProcessEnrichmentRequirements,
+    ) -> bool {
+        self.canonical_enrichment.contains(requirements)
+    }
+
+    /// Apply a snapshot from the background data collector. Returns the
+    /// process list it replaced, for the collector to recycle.
+    pub fn apply_snapshot(&mut self, snapshot: crate::data::SystemSnapshot) -> Vec<ProcessInfo> {
         self.system_metrics = snapshot.metrics;
-        self.processes = snapshot.processes;
-        self.canonical_enrichment = snapshot.enrichment;
-        self.update_displayed_processes();
-        self.refresh_process_info_stats();
-        if self.pending_user_select && self.canonical_enrichment.user {
-            self.open_user_select_dialog();
-        } else if self.canonical_enrichment.user
-            && matches!(self.dialog, DialogState::UserSelect { .. })
+        let replaced = if snapshot
+            .enrichment
+            .contains(self.canonical_enrichment_requirements())
         {
-            self.refresh_user_select_dialog();
-        }
+            self.canonical_enrichment = snapshot.enrichment;
+            let replaced = std::mem::replace(&mut self.processes, snapshot.processes);
+            self.update_displayed_processes();
+            self.refresh_process_info_stats();
+            if self.pending_user_select && self.canonical_enrichment.user {
+                self.open_user_select_dialog();
+            } else if self.canonical_enrichment.user
+                && matches!(self.dialog, DialogState::UserSelect { .. })
+            {
+                self.refresh_user_select_dialog();
+            }
+            replaced
+        } else {
+            // The filter/sort/dialog needs metadata this snapshot lacks: keep
+            // the last authoritative process list (the displayed rows index
+            // into it) until the collector returns one with it populated.
+            snapshot.processes
+        };
         self.update_meter_history();
+        replaced
     }
 
     /// Update CPU and memory history for graph mode rendering
@@ -1736,7 +1808,12 @@ impl App {
         }
 
         let mut bits = 0u8;
-        if self.config.show_cpu_meters && self.config.cpu_meter_mode != MeterMode::Hidden {
+        // The Uptime row also renders the average CPU% from the per-core data,
+        // so it keeps CPU collection alive even with the CPU meters hidden
+        // (issue #97).
+        if (self.config.show_cpu_meters && self.config.cpu_meter_mode != MeterMode::Hidden)
+            || self.config.show_uptime_meter
+        {
             bits |= collect_gates::CPU;
         }
 
@@ -1801,8 +1878,6 @@ impl App {
             None
         };
 
-        // Filter-then-clone: only clone processes that pass all filters
-        // Also set matches_search flag during this pass to avoid recomputing in render
         let show_kernel = self.config.show_kernel_threads;
         let show_user = self.config.show_user_threads;
         let process_count = self.processes.len();
@@ -1844,15 +1919,17 @@ impl App {
                 .retain(|identity| live.contains(identity));
         }
 
-        // Reuse the previous displayed list's buffer (capacity included) for
-        // this pass; the old list moves to the spare slot at the end.
-        let mut processes = std::mem::take(&mut self.displayed_scratch);
-        processes.clear();
-        processes.reserve(process_count);
-        processes.extend(
+        // Sort entries for the processes that pass every filter, in a reused
+        // buffer.
+        let sort_entry = self.sort_entry();
+        let mut order = std::mem::take(&mut self.order_scratch);
+        order.clear();
+        order.reserve(process_count);
+        order.extend(
             self.processes
                 .iter()
-                .filter(|p| {
+                .enumerate()
+                .filter(|(_, p)| {
                     // Kernel/System threads filter
                     // On Windows, "kernel threads" are SYSTEM user processes.
                     // The string checks are dead when both flags are on (the
@@ -1897,30 +1974,29 @@ impl App {
                     }
                     true
                 })
-                .map(|p| {
-                    // Tag the render-time search flag during the single
-                    // filter/clone pass instead of a second sweep. Fresh
-                    // clones start with matches_search=false (from_raw), so
-                    // assigning unconditionally is exactly equivalent.
-                    let mut cloned = p.clone();
-                    cloned.matches_search = has_search
-                        && (cloned.name_lower.contains(&self.search_string_lower)
-                            || cloned.command_lower.contains(&self.search_string_lower));
-                    cloned
-                }),
+                .map(|(index, p)| sort_entry(index, p)),
         );
 
-        // Sort processes
-        self.sort_processes(&mut processes);
+        self.sort_order(&mut order);
 
-        // Build tree if needed
+        // Rows are built in the previous display's buffer (capacity included);
+        // the old rows move to the spare slot below.
+        let mut rows = std::mem::take(&mut self.display_scratch);
+        rows.clear();
         if self.tree_view {
-            processes = self.build_tree(processes);
+            self.build_tree(&order, &mut rows);
+        } else {
+            rows.extend(order.iter().map(|&(_, index)| DisplayRow::flat(index)));
         }
-
-        // Swap buffers: the old displayed vec becomes the next pass's scratch.
-        let old = std::mem::replace(&mut self.displayed_processes, processes);
-        self.displayed_scratch = old;
+        if has_search {
+            for row in &mut rows {
+                let p = &self.processes[row.index];
+                row.matches_search = p.name_lower.contains(&self.search_string_lower)
+                    || p.command_lower.contains(&self.search_string_lower);
+            }
+        }
+        self.order_scratch = order;
+        self.display_scratch = std::mem::replace(&mut self.display, rows);
 
         // Normal viewing is anchored to the row, not the process: dynamic
         // sorting must not drag the viewport around. Action handlers capture
@@ -1929,164 +2005,177 @@ impl App {
 
         // Clamp selection and scroll immediately after replacing the list, before
         // enrichment uses scroll_offset to choose the visible slice.
-        if self.selected_index >= self.displayed_processes.len() {
-            self.selected_index = self.displayed_processes.len().saturating_sub(1);
+        if self.selected_index >= self.display.len() {
+            self.selected_index = self.display.len().saturating_sub(1);
         }
-        if self.displayed_processes.is_empty() {
+        if self.display.is_empty() {
             self.scroll_offset = 0;
         } else {
             let max_scroll = self
-                .displayed_processes
+                .display
                 .len()
                 .saturating_sub(self.visible_height.max(1));
             self.scroll_offset = self.scroll_offset.min(max_scroll);
             self.ensure_visible();
         }
 
-        // Enrich visible processes with additional data from Windows APIs
-        // Use a buffer zone to handle scrolling smoothly
-        const BUFFER_SIZE: usize = 10;
-        let visible_start = self.scroll_offset.saturating_sub(BUFFER_SIZE);
-        let visible_end = (self.scroll_offset + self.visible_height + BUFFER_SIZE)
-            .min(self.displayed_processes.len());
-
-        if visible_start < visible_end {
-            // Only query exe paths when show_program_path is enabled (expensive API call)
-            crate::system::enrich_processes(
-                &mut self.displayed_processes[visible_start..visible_end],
-                self.config.show_program_path,
-            );
-        }
-
         // Handle follow mode - find and select the followed PID
         if let Some(follow_identity) = self.follow_pid
-            && let Some(idx) = self
-                .displayed_processes
-                .iter()
-                .position(|p| p.identity() == follow_identity)
+            && let Some(idx) = self.display_position(|p| p.identity() == follow_identity)
         {
             self.selected_index = idx;
             self.ensure_visible();
         }
 
         // Ensure selection is valid
-        if self.selected_index >= self.displayed_processes.len() {
-            self.selected_index = self.displayed_processes.len().saturating_sub(1);
+        if self.selected_index >= self.display.len() {
+            self.selected_index = self.display.len().saturating_sub(1);
+        }
+
+        // The rows changed, so enrich the final viewport (after follow mode
+        // may have scrolled it) unconditionally.
+        self.enrich_rows_around_viewport();
+    }
+
+    /// Enrich the rows in and around the viewport with per-row Windows
+    /// metadata (user, elevation, architecture, efficiency, exe path), and
+    /// remember which rows were covered.
+    fn enrich_rows_around_viewport(&mut self) {
+        // Buffer zone so short scrolls stay inside the enriched window.
+        const BUFFER_SIZE: usize = 10;
+        let start = self.scroll_offset.saturating_sub(BUFFER_SIZE);
+        let end = self
+            .scroll_offset
+            .saturating_add(self.visible_height)
+            .saturating_add(BUFFER_SIZE)
+            .min(self.display.len());
+        self.enriched_rows = start..end.max(start);
+
+        // Cached facts now; any Windows query waits until the frame is out,
+        // so a snapshot or scroll is drawn without per-process syscalls in
+        // the way (see `run_deferred_enrichment`).
+        let requirements = self.visible_enrichment();
+        let rows = self.enriched_process_indices();
+        self.enrichment_pending = !rows.is_empty()
+            && crate::system::apply_cached_metadata(&mut self.processes, &rows, requirements);
+    }
+
+    /// `processes` indices of the display rows in `enriched_rows`.
+    fn enriched_process_indices(&self) -> Vec<usize> {
+        let end = self.enriched_rows.end.min(self.display.len());
+        let start = self.enriched_rows.start.min(end);
+        self.display[start..end]
+            .iter()
+            .map(|row| row.index)
+            .collect()
+    }
+
+    /// Metadata the rows in view need (exe paths only when shown, since
+    /// that query is expensive).
+    fn visible_enrichment(&self) -> crate::system::ProcessEnrichmentRequirements {
+        crate::system::ProcessEnrichmentRequirements::visible(self.config.show_program_path)
+    }
+
+    /// Run the metadata queries deferred by the last enrichment pass (rows
+    /// new to the view whose facts are not cached yet). Returns true when it
+    /// ran, so the caller redraws with the results right away.
+    pub fn run_deferred_enrichment(&mut self) -> bool {
+        if !std::mem::take(&mut self.enrichment_pending) {
+            return false;
+        }
+        let requirements = self.visible_enrichment();
+        let rows = self.enriched_process_indices();
+        crate::system::enrich_processes_at(&mut self.processes, &rows, requirements);
+        true
+    }
+
+    /// Enrich newly visible rows when navigation (End, PgDn, mouse wheel, …)
+    /// moved the viewport outside the window enriched by the last list update,
+    /// so they don't show placeholder metadata until the next snapshot
+    /// (issue #99). A no-op while the viewport stays inside that window.
+    pub fn enrich_viewport(&mut self) {
+        let view_end = self
+            .scroll_offset
+            .saturating_add(self.visible_height)
+            .min(self.display.len());
+        let covered =
+            self.enriched_rows.start <= self.scroll_offset && view_end <= self.enriched_rows.end;
+        if !covered {
+            self.enrich_rows_around_viewport();
         }
     }
 
-    fn sort_processes(&self, processes: &mut [ProcessInfo]) {
-        use std::cmp::Ordering;
+    /// Sort key of the active column (`None` for the text columns, which
+    /// compare in place; see `sort_order`).
+    fn sort_key(&self) -> Option<fn(&ProcessInfo) -> u64> {
+        Some(match self.sort_column {
+            SortColumn::Cpu => |p| f32_sort_key(p.cpu_percent),
+            SortColumn::Mem => |p| f32_sort_key(p.mem_percent),
+            SortColumn::Pid => |p| u64::from(p.pid),
+            SortColumn::Res => |p| p.resident_mem,
+            SortColumn::Time => |p| p.cpu_time,
+            SortColumn::PPid => |p| u64::from(p.parent_pid),
+            SortColumn::Priority | SortColumn::PriorityClass => {
+                |p| u64::from(p.priority.cast_unsigned() ^ 0x8000_0000)
+            }
+            SortColumn::Threads => |p| u64::from(p.thread_count),
+            SortColumn::Virt => |p| p.virtual_mem,
+            SortColumn::Shr => |p| p.shared_mem,
+            SortColumn::Status => |p| u64::from(p.status),
+            SortColumn::StartTime => |p| u64::from(p.start_time),
+            SortColumn::Elevated => |p| u64::from(p.is_elevated),
+            SortColumn::Arch => |p| u64::from(p.arch.sort_rank()),
+            SortColumn::Efficiency => |p| u64::from(p.efficiency_mode),
+            SortColumn::HandleCount => |p| u64::from(p.handle_count),
+            SortColumn::IoRate => |p| p.io_read_rate.wrapping_add(p.io_write_rate),
+            SortColumn::IoReadRate => |p| p.io_read_rate,
+            SortColumn::IoWriteRate => |p| p.io_write_rate,
+            SortColumn::IoRead => |p| p.io_read_bytes,
+            SortColumn::IoWrite => |p| p.io_write_bytes,
+            SortColumn::Gpu => |p| f32_sort_key(p.gpu_percent),
+            SortColumn::GpuMem => |p| p.gpu_memory,
+            SortColumn::Npu => |p| f32_sort_key(p.npu_percent),
+            SortColumn::NpuMem => |p| p.npu_memory,
+            SortColumn::User | SortColumn::Command => return None,
+        })
+    }
 
-        // Use sort_unstable_by for better performance (no stability guarantee needed)
-        // The closure still has the match, but sort_unstable is faster overall
-        let ascending = self.sort_ascending;
+    /// Builds the `(key, index)` entry `sort_order` sorts for
+    /// `processes[index]`: the column's key, inverted for a descending sort.
+    fn sort_entry(&self) -> impl Fn(usize, &ProcessInfo) -> (u64, usize) + use<> {
+        let key = self.sort_key();
+        let flip = if self.sort_ascending { 0 } else { u64::MAX };
+        move |index, process| (key.map_or(0, |key| key(process)) ^ flip, index)
+    }
 
-        match self.sort_column {
-            // Specialize common sort columns for best performance (avoid match in hot loop)
-            SortColumn::Cpu => {
-                if ascending {
-                    processes.sort_unstable_by(|a, b| {
-                        a.cpu_percent
-                            .partial_cmp(&b.cpu_percent)
-                            .unwrap_or(Ordering::Equal)
-                    });
-                } else {
-                    processes.sort_unstable_by(|a, b| {
-                        b.cpu_percent
-                            .partial_cmp(&a.cpu_percent)
-                            .unwrap_or(Ordering::Equal)
-                    });
-                }
-            }
-            SortColumn::Mem => {
-                if ascending {
-                    processes.sort_unstable_by(|a, b| {
-                        a.mem_percent
-                            .partial_cmp(&b.mem_percent)
-                            .unwrap_or(Ordering::Equal)
-                    });
-                } else {
-                    processes.sort_unstable_by(|a, b| {
-                        b.mem_percent
-                            .partial_cmp(&a.mem_percent)
-                            .unwrap_or(Ordering::Equal)
-                    });
-                }
-            }
-            SortColumn::Pid => {
-                if ascending {
-                    processes.sort_unstable_by_key(|p| p.pid);
-                } else {
-                    processes.sort_unstable_by_key(|p| std::cmp::Reverse(p.pid));
-                }
-            }
-            SortColumn::Res => {
-                if ascending {
-                    processes.sort_unstable_by_key(|p| p.resident_mem);
-                } else {
-                    processes.sort_unstable_by_key(|p| std::cmp::Reverse(p.resident_mem));
-                }
-            }
-            SortColumn::Time => {
-                if ascending {
-                    processes.sort_unstable_by_key(|p| p.cpu_time);
-                } else {
-                    processes.sort_unstable_by_key(|p| std::cmp::Reverse(p.cpu_time));
-                }
-            }
-            // Less common columns - use generic approach
+    /// Sort `sort_entry` entries by the active sort column. Ties keep
+    /// collector order, so equal rows don't trade places between snapshots.
+    /// Numeric columns sort the entries' keys in place (built during the
+    /// filter pass, so this reads no process); text columns compare in place.
+    fn sort_order(&self, order: &mut [(u64, usize)]) {
+        let text: fn(&ProcessInfo) -> &str = match self.sort_column {
+            SortColumn::User => |p| &p.user,
+            SortColumn::Command => |p| &p.command,
             _ => {
-                let cmp_fn = |a: &ProcessInfo, b: &ProcessInfo| -> Ordering {
-                    let ord = match self.sort_column {
-                        SortColumn::PPid => a.parent_pid.cmp(&b.parent_pid),
-                        SortColumn::User => a.user.cmp(&b.user),
-                        SortColumn::Priority => a.priority.cmp(&b.priority),
-                        SortColumn::PriorityClass => a.priority.cmp(&b.priority),
-                        SortColumn::Threads => a.thread_count.cmp(&b.thread_count),
-                        SortColumn::Virt => a.virtual_mem.cmp(&b.virtual_mem),
-                        SortColumn::Shr => a.shared_mem.cmp(&b.shared_mem),
-                        SortColumn::Status => a.status.cmp(&b.status),
-                        SortColumn::StartTime => a.start_time.cmp(&b.start_time),
-                        SortColumn::Command => a.command.cmp(&b.command),
-                        SortColumn::Elevated => a.is_elevated.cmp(&b.is_elevated),
-                        SortColumn::Arch => a.arch.sort_rank().cmp(&b.arch.sort_rank()),
-                        SortColumn::Efficiency => a.efficiency_mode.cmp(&b.efficiency_mode),
-                        SortColumn::HandleCount => a.handle_count.cmp(&b.handle_count),
-                        SortColumn::IoRate => (a.io_read_rate + a.io_write_rate)
-                            .cmp(&(b.io_read_rate + b.io_write_rate)),
-                        SortColumn::IoReadRate => a.io_read_rate.cmp(&b.io_read_rate),
-                        SortColumn::IoWriteRate => a.io_write_rate.cmp(&b.io_write_rate),
-                        SortColumn::IoRead => a.io_read_bytes.cmp(&b.io_read_bytes),
-                        SortColumn::IoWrite => a.io_write_bytes.cmp(&b.io_write_bytes),
-                        SortColumn::Gpu => a
-                            .gpu_percent
-                            .partial_cmp(&b.gpu_percent)
-                            .unwrap_or(Ordering::Equal),
-                        SortColumn::GpuMem => a.gpu_memory.cmp(&b.gpu_memory),
-                        SortColumn::Npu => a
-                            .npu_percent
-                            .partial_cmp(&b.npu_percent)
-                            .unwrap_or(Ordering::Equal),
-                        SortColumn::NpuMem => a.npu_memory.cmp(&b.npu_memory),
-                        // Already handled above
-                        SortColumn::Cpu
-                        | SortColumn::Mem
-                        | SortColumn::Pid
-                        | SortColumn::Res
-                        | SortColumn::Time => Ordering::Equal,
-                    };
-                    if ascending { ord } else { ord.reverse() }
-                };
-                processes.sort_unstable_by(cmp_fn);
+                order.sort_unstable();
+                return;
             }
-        }
+        };
+        let processes = &self.processes[..];
+        let ascending = self.sort_ascending;
+        order.sort_unstable_by(|&(_, a), &(_, b)| {
+            let ord = text(&processes[a]).cmp(text(&processes[b]));
+            if ascending { ord } else { ord.reverse() }.then(a.cmp(&b))
+        });
     }
 
-    fn build_tree(&mut self, processes: Vec<ProcessInfo>) -> Vec<ProcessInfo> {
+    /// Append the tree-ordered rows for `order` (sorted `sort_entry`
+    /// entries) to `rows`. Position `i` below means `processes[order[i].1]`.
+    fn build_tree(&mut self, order: &[(u64, usize)], rows: &mut Vec<DisplayRow>) {
         use std::sync::Arc;
 
         const NONE: u32 = u32::MAX;
+        let all_processes = &self.processes;
         let scratch = &mut self.tree_scratch;
         let TreeScratch {
             idx_of,
@@ -2096,16 +2185,16 @@ impl App {
             child_list,
             visited,
             suppressed,
-            slots,
             stack,
         } = scratch;
 
-        let process_count = processes.len();
+        let process_count = order.len();
+        let processes = || order.iter().map(|&(_, index)| &all_processes[index]);
 
-        // pid → index (last occurrence wins, matching the old HashMap insert).
+        // pid → position (last occurrence wins, matching the old HashMap insert).
         idx_of.clear();
         idx_of.reserve(process_count);
-        for (idx, process) in processes.iter().enumerate() {
+        for (idx, process) in processes().enumerate() {
             idx_of.insert(process.pid, idx as u32);
         }
 
@@ -2116,12 +2205,12 @@ impl App {
         parent_idx.reserve(process_count);
         child_cnt.clear();
         child_cnt.resize(process_count, 0);
-        for process in processes.iter() {
+        for process in processes() {
             let validated = (process.parent_pid != 0 && process.parent_pid != process.pid)
                 .then(|| idx_of.get(&process.parent_pid).copied())
                 .flatten()
                 .filter(|&parent| {
-                    let parent_time = processes[parent as usize].create_time_100ns;
+                    let parent_time = all_processes[order[parent as usize].1].create_time_100ns;
                     parent_time != 0
                         && process.create_time_100ns != 0
                         && parent_time <= process.create_time_100ns
@@ -2157,10 +2246,7 @@ impl App {
         visited.resize(process_count, false);
         suppressed.clear();
         suppressed.resize(process_count, false);
-        slots.clear();
-        slots.extend(processes.into_iter().map(Some));
-
-        let mut result = Vec::with_capacity(process_count);
+        rows.reserve(process_count);
 
         // Traverse rooted components first, then cycle-only components in the
         // original sort order (the old `roots ++ order` iteration). Iteration
@@ -2188,19 +2274,14 @@ impl App {
                         continue;
                     }
                     visited[pending_idx] = true;
-                    let Some(mut process) = slots[pending_idx].take() else {
-                        continue;
-                    };
-                    let identity = process.identity();
+                    let index = order[pending_idx].1;
+                    let identity = all_processes[index].identity();
                     let child_range =
                         child_off[pending_idx] as usize..child_off[pending_idx + 1] as usize;
                     let child_slice = &child_list[child_range];
                     let is_collapsed = self.collapsed_pids.contains(&identity);
 
-                    process.tree_depth = pending.depth.min(u16::MAX as usize) as u16;
-                    process.has_children = !child_slice.is_empty();
-                    process.is_collapsed = is_collapsed;
-                    process.tree_prefix = if pending.depth == 0 {
+                    let tree_prefix = if pending.depth == 0 {
                         String::new()
                     } else {
                         let branch = if pending.is_last { "└─ " } else { "├─ " };
@@ -2212,7 +2293,14 @@ impl App {
                         prefix.push_str(branch);
                         prefix
                     };
-                    result.push(process);
+                    rows.push(DisplayRow {
+                        index,
+                        tree_depth: pending.depth.min(u16::MAX as usize) as u16,
+                        tree_prefix,
+                        has_children: !child_slice.is_empty(),
+                        is_collapsed,
+                        matches_search: false,
+                    });
 
                     if is_collapsed {
                         // Descendants of a collapsed node are intentionally
@@ -2255,8 +2343,6 @@ impl App {
                 }
             }
         }
-
-        result
     }
 
     /// Collapse tree branch at selected process
@@ -2302,7 +2388,7 @@ impl App {
 
     /// Move selection down
     pub fn select_down(&mut self) {
-        if self.selected_index < self.displayed_processes.len().saturating_sub(1) {
+        if self.selected_index < self.display.len().saturating_sub(1) {
             self.selected_index += 1;
             self.ensure_visible();
         }
@@ -2319,7 +2405,7 @@ impl App {
     pub fn page_down(&mut self) {
         let page_size = self.visible_height.saturating_sub(1);
         self.selected_index =
-            (self.selected_index + page_size).min(self.displayed_processes.len().saturating_sub(1));
+            (self.selected_index + page_size).min(self.display.len().saturating_sub(1));
         self.ensure_visible();
     }
 
@@ -2331,14 +2417,14 @@ impl App {
 
     /// Go to last process
     pub fn select_last(&mut self) {
-        self.selected_index = self.displayed_processes.len().saturating_sub(1);
+        self.selected_index = self.display.len().saturating_sub(1);
         self.ensure_visible();
     }
 
     /// Apply geometry before rendering, including while collection is paused.
     pub fn set_visible_height(&mut self, height: usize) {
         self.visible_height = height;
-        let len = self.displayed_processes.len();
+        let len = self.display.len();
         self.selected_index = self.selected_index.min(len.saturating_sub(1));
         self.scroll_offset = self.scroll_offset.min(len.saturating_sub(height.max(1)));
         self.ensure_visible();
@@ -2351,7 +2437,7 @@ impl App {
             // would set scroll_offset = selected_index + 1, one row past the
             // last valid index. There is no viewport to satisfy, so just keep
             // the offset anchored inside the list.
-            let last = self.displayed_processes.len().saturating_sub(1);
+            let last = self.display.len().saturating_sub(1);
             self.scroll_offset = self.scroll_offset.min(last);
             return;
         }
@@ -2364,7 +2450,7 @@ impl App {
 
     /// Toggle tag on selected process
     pub fn toggle_tag(&mut self) {
-        if let Some(proc) = self.displayed_processes.get(self.selected_index) {
+        if let Some(proc) = self.selected_process() {
             let identity = proc.identity();
             if self.tagged_pids.contains(&identity) {
                 self.tagged_pids.remove(&identity);
@@ -2385,8 +2471,7 @@ impl App {
             let name = proc.name.clone();
             // Find all visible processes with the same name and tag them
             let identities_to_tag: Vec<ProcessIdentity> = self
-                .displayed_processes
-                .iter()
+                .displayed_processes()
                 .filter(|p| p.name == name)
                 .map(ProcessInfo::identity)
                 .collect();
@@ -2400,32 +2485,73 @@ impl App {
     pub fn tag_all_visible(&mut self) {
         // If all visible are already tagged, untag them
         let all_tagged = self
-            .displayed_processes
-            .iter()
+            .displayed_processes()
             .all(|p| self.tagged_pids.contains(&p.identity()));
+        let visible: Vec<ProcessIdentity> = self
+            .displayed_processes()
+            .map(ProcessInfo::identity)
+            .collect();
 
         if all_tagged {
             // Untag all visible
-            for proc in &self.displayed_processes {
-                self.tagged_pids.remove(&proc.identity());
+            for identity in visible {
+                self.tagged_pids.remove(&identity);
             }
         } else {
             // Tag all visible
-            for proc in &self.displayed_processes {
-                self.tagged_pids.insert(proc.identity());
-            }
+            self.tagged_pids.extend(visible);
         }
     }
 
     /// Get selected process
     pub fn selected_process(&self) -> Option<&ProcessInfo> {
-        self.displayed_processes.get(self.selected_index)
+        self.displayed(self.selected_index)
     }
 
     pub fn process_by_identity(&self, identity: ProcessIdentity) -> Option<&ProcessInfo> {
-        self.displayed_processes
-            .iter()
+        self.displayed_processes()
             .find(|process| process.identity() == identity)
+    }
+
+    /// Number of rows in the process list.
+    pub fn displayed_len(&self) -> usize {
+        self.display.len()
+    }
+
+    /// The process shown at `row` of the process list.
+    pub fn displayed(&self, row: usize) -> Option<&ProcessInfo> {
+        self.display
+            .get(row)
+            .and_then(|row| self.processes.get(row.index))
+    }
+
+    /// The process list's rows from `start` on, with their processes.
+    pub fn display_rows_from(
+        &self,
+        start: usize,
+    ) -> impl Iterator<Item = (&DisplayRow, &ProcessInfo)> + Clone {
+        self.display
+            .get(start..)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|row| Some((row, self.processes.get(row.index)?)))
+    }
+
+    /// The processes of the process list, in display order.
+    pub fn displayed_processes(&self) -> impl Iterator<Item = &ProcessInfo> + Clone {
+        self.display_rows_from(0).map(|(_, process)| process)
+    }
+
+    /// Row of the first displayed process matching `predicate`.
+    fn display_position(&self, predicate: impl FnMut(&ProcessInfo) -> bool) -> Option<usize> {
+        self.displayed_processes().position(predicate)
+    }
+
+    /// Show `processes` in exactly this order, bypassing filter and sort.
+    #[cfg(test)]
+    fn set_display_for_test(&mut self, processes: Vec<ProcessInfo>) {
+        self.display = (0..processes.len()).map(DisplayRow::flat).collect();
+        self.processes = processes;
     }
 
     /// Toggle tree view
@@ -2471,7 +2597,7 @@ impl App {
         // Find first matching process using pre-computed lowercase strings
         if select_first
             && !self.search_string_lower.is_empty()
-            && let Some(idx) = self.displayed_processes.iter().position(|p| {
+            && let Some(idx) = self.display_position(|p| {
                 p.name_lower.contains(&self.search_string_lower)
                     || p.command_lower.contains(&self.search_string_lower)
             })
@@ -2485,13 +2611,15 @@ impl App {
 
     /// Find next search match
     pub fn find_next(&mut self) {
-        if self.search_string_lower.is_empty() || self.displayed_processes.is_empty() {
+        if self.search_string_lower.is_empty() || self.display.is_empty() {
             return;
         }
         let start = self.selected_index + 1;
-        for i in 0..self.displayed_processes.len() {
-            let idx = (start + i) % self.displayed_processes.len();
-            let p = &self.displayed_processes[idx];
+        for i in 0..self.display.len() {
+            let idx = (start + i) % self.display.len();
+            let Some(p) = self.displayed(idx) else {
+                continue;
+            };
             // Use pre-computed lowercase strings
             if p.name_lower.contains(&self.search_string_lower)
                 || p.command_lower.contains(&self.search_string_lower)
@@ -2596,12 +2724,6 @@ impl App {
                     format!("Efficiency mode {} for {}", state_str, name),
                     Instant::now(),
                 ));
-                for proc in &mut self.displayed_processes {
-                    if proc.identity() == identity {
-                        proc.efficiency_mode = new_state;
-                        break;
-                    }
-                }
                 for proc in &mut self.processes {
                     if proc.identity() == identity {
                         proc.efficiency_mode = new_state;
@@ -2741,10 +2863,7 @@ impl App {
             _ => {}
         }
         if let Some(identity) = restore_selection
-            && let Some(index) = self
-                .displayed_processes
-                .iter()
-                .position(|process| process.identity() == identity)
+            && let Some(index) = self.display_position(|process| process.identity() == identity)
         {
             self.selected_index = index;
             self.ensure_visible();
@@ -3000,12 +3119,10 @@ impl App {
         // order never influences which process wins.
         if let Ok(search_pid) = self.pid_search_buffer.parse::<u32>() {
             let match_identity = self
-                .displayed_processes
-                .iter()
+                .displayed_processes()
                 .find(|process| process.pid == search_pid)
                 .or_else(|| {
-                    self.displayed_processes
-                        .iter()
+                    self.displayed_processes()
                         .filter(|process| {
                             process.pid.to_string().starts_with(&self.pid_search_buffer)
                         })
@@ -3013,10 +3130,7 @@ impl App {
                 })
                 .map(ProcessInfo::identity);
             if let Some(identity) = match_identity
-                && let Some(index) = self
-                    .displayed_processes
-                    .iter()
-                    .position(|process| process.identity() == identity)
+                && let Some(index) = self.display_position(|process| process.identity() == identity)
             {
                 self.selected_index = index;
                 self.ensure_visible();
@@ -3032,13 +3146,12 @@ impl App {
                 return;
             };
             // Find parent in displayed processes and select it
-            if let Some((index, identity)) = self
-                .displayed_processes
-                .iter()
+            let parent = self
+                .displayed_processes()
                 .enumerate()
                 .find(|(_, process)| process.pid == parent_pid)
-                .map(|(index, process)| (index, process.identity()))
-            {
+                .map(|(index, process)| (index, process.identity()));
+            if let Some((index, identity)) = parent {
                 self.selected_index = index;
                 self.ensure_visible();
                 self.collapsed_pids.insert(identity);
@@ -3122,10 +3235,6 @@ mod tests {
             shared_mem: 0,
             priority: 8,
             cpu_time: 0,
-            tree_depth: 0,
-            tree_prefix: String::new(),
-            has_children: false,
-            is_collapsed: false,
             thread_count: 1,
             start_time: 0,
             create_time_100ns: 10_000 + pid as u64,
@@ -3141,7 +3250,6 @@ mod tests {
             name_lower: Arc::from(name),
             command_lower: Arc::from(""),
             user_lower: Arc::from("user"),
-            matches_search: false,
             efficiency_mode: false,
             is_elevated: false,
             arch: ProcessArch::Native,
@@ -3265,7 +3373,7 @@ mod tests {
             app.sort_column = SortColumn::Pid;
             app.sort_ascending = true;
             app.update_displayed_processes();
-            assert_eq!(usize::from(app.displayed_processes[1].tree_depth), usize::from(linked));
+            assert_eq!(usize::from(app.display[1].tree_depth), usize::from(linked));
             app.tag_with_children();
             assert_eq!(app.tagged_pids.len(), if linked { 3 } else { 1 });
             app.selected_index = 1;
@@ -3280,7 +3388,7 @@ mod tests {
         app.processes = cycle;
         app.tree_view = true;
         app.update_displayed_processes();
-        assert_eq!(app.displayed_processes.len(), 3);
+        assert_eq!(app.displayed_len(), 3);
         assert_eq!(app.branch_identities(app.processes[0].identity()).len(), 2);
     }
 
@@ -3292,10 +3400,10 @@ mod tests {
         app.processes[0].virtual_mem = 1 << 30;
         app.processes[1].virtual_mem = 1 << 20;
         app.update_displayed_processes();
-        assert_eq!(app.displayed_processes[0].pid, 1);
+        assert_eq!(app.displayed(0).unwrap().pid, 1);
         app.sort_ascending = true;
         app.update_displayed_processes();
-        assert_eq!(app.displayed_processes[0].pid, 2);
+        assert_eq!(app.displayed(0).unwrap().pid, 2);
     }
 
     #[test]
@@ -3382,7 +3490,7 @@ mod tests {
     #[test]
     fn pid_prefix_search_ignores_display_sort_order() {
         let mut app = App::new(Config::default());
-        app.displayed_processes = vec![process(5000, 0), process(1299, 0), process(1234, 0)];
+        app.set_display_for_test(vec![process(5000, 0), process(1299, 0), process(1234, 0)]);
 
         for digit in "1234".chars() {
             app.handle_pid_digit(digit);
@@ -3397,7 +3505,7 @@ mod tests {
     #[test]
     fn repeated_search_next_visits_all_matches() {
         let mut app = App::new(Config::default());
-        app.displayed_processes = vec![process(1, 0), process(2, 0), process(3, 0)];
+        app.set_display_for_test(vec![process(1, 0), process(2, 0), process(3, 0)]);
         app.search_string = "p".to_string();
         app.search_string_lower = "p".to_string();
         app.start_search();
@@ -3415,20 +3523,34 @@ mod tests {
 
     #[test]
     fn dependent_sort_waits_for_collector_enrichment() {
-        let mut app = App::new(Config::default());
-        app.processes = vec![process(1, 0)];
-        app.displayed_processes = vec![process(99, 0)];
-        app.sort_column = SortColumn::User;
-
-        app.update_displayed_processes();
-        assert_eq!(app.displayed_processes[0].pid, 99);
-
-        app.canonical_enrichment = crate::system::ProcessEnrichmentRequirements {
+        let snapshot = |pid, enrichment| crate::data::SystemSnapshot {
+            metrics: SystemMetrics::default(),
+            processes: vec![process(pid, 0)],
+            refresh_duration: Duration::ZERO,
+            enrichment,
+            published_at: Instant::now(),
+        };
+        let with_user = crate::system::ProcessEnrichmentRequirements {
             user: true,
             ..Default::default()
         };
+        let mut app = App::new(Config::default());
+        app.apply_snapshot(snapshot(99, Default::default()));
+        app.sort_column = SortColumn::User;
+
+        // The sort needs owners: the view (and the list it indexes) stays put.
         app.update_displayed_processes();
-        assert_eq!(app.displayed_processes[0].pid, 1);
+        assert_eq!(app.displayed(0).unwrap().pid, 99);
+        let returned = app.apply_snapshot(snapshot(1, Default::default()));
+        assert_eq!(
+            returned[0].pid, 1,
+            "the unusable snapshot goes back to be recycled"
+        );
+        assert_eq!(app.displayed(0).unwrap().pid, 99);
+
+        let returned = app.apply_snapshot(snapshot(2, with_user));
+        assert_eq!(returned[0].pid, 99);
+        assert_eq!(app.displayed(0).unwrap().pid, 2);
     }
 
     #[test]
@@ -3473,12 +3595,119 @@ mod tests {
                         (0..12).rev().collect()
                     };
                     let actual: Vec<_> = app
-                        .displayed_processes
-                        .iter()
+                        .displayed_processes()
                         .map(|p| (p.pid + tick) % 12)
                         .collect();
                     assert_eq!(actual, expected, "{column:?}, tick {tick}");
                 }
+            }
+        }
+    }
+
+    /// The comparator each column sorted by before the key sort.
+    fn reference_cmp(column: SortColumn, a: &ProcessInfo, b: &ProcessInfo) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        let f = |x: f32, y: f32| x.partial_cmp(&y).unwrap_or(Ordering::Equal);
+        match column {
+            SortColumn::Cpu => f(a.cpu_percent, b.cpu_percent),
+            SortColumn::Mem => f(a.mem_percent, b.mem_percent),
+            SortColumn::Pid => a.pid.cmp(&b.pid),
+            SortColumn::Res => a.resident_mem.cmp(&b.resident_mem),
+            SortColumn::Time => a.cpu_time.cmp(&b.cpu_time),
+            SortColumn::PPid => a.parent_pid.cmp(&b.parent_pid),
+            SortColumn::User => a.user.cmp(&b.user),
+            SortColumn::Priority | SortColumn::PriorityClass => a.priority.cmp(&b.priority),
+            SortColumn::Threads => a.thread_count.cmp(&b.thread_count),
+            SortColumn::Virt => a.virtual_mem.cmp(&b.virtual_mem),
+            SortColumn::Shr => a.shared_mem.cmp(&b.shared_mem),
+            SortColumn::Status => a.status.cmp(&b.status),
+            SortColumn::StartTime => a.start_time.cmp(&b.start_time),
+            SortColumn::Command => a.command.cmp(&b.command),
+            SortColumn::Elevated => a.is_elevated.cmp(&b.is_elevated),
+            SortColumn::Arch => a.arch.sort_rank().cmp(&b.arch.sort_rank()),
+            SortColumn::Efficiency => a.efficiency_mode.cmp(&b.efficiency_mode),
+            SortColumn::HandleCount => a.handle_count.cmp(&b.handle_count),
+            SortColumn::IoRate => {
+                (a.io_read_rate + a.io_write_rate).cmp(&(b.io_read_rate + b.io_write_rate))
+            }
+            SortColumn::IoReadRate => a.io_read_rate.cmp(&b.io_read_rate),
+            SortColumn::IoWriteRate => a.io_write_rate.cmp(&b.io_write_rate),
+            SortColumn::IoRead => a.io_read_bytes.cmp(&b.io_read_bytes),
+            SortColumn::IoWrite => a.io_write_bytes.cmp(&b.io_write_bytes),
+            SortColumn::Gpu => f(a.gpu_percent, b.gpu_percent),
+            SortColumn::GpuMem => a.gpu_memory.cmp(&b.gpu_memory),
+            SortColumn::Npu => f(a.npu_percent, b.npu_percent),
+            SortColumn::NpuMem => a.npu_memory.cmp(&b.npu_memory),
+        }
+    }
+
+    #[test]
+    fn key_sort_matches_the_column_comparators_with_ties_in_collector_order() {
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move |modulus: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % modulus
+        };
+        let arches = [
+            ProcessArch::Native,
+            ProcessArch::X86,
+            ProcessArch::X64,
+            ProcessArch::ARM64,
+        ];
+        // Few distinct values per field, so every column has many ties.
+        let processes: Vec<ProcessInfo> = (0..300)
+            .map(|i| {
+                let mut p = process(1000 + (next(50) as u32) * 7 + i, next(20) as u32);
+                p.cpu_percent = [0.0, -0.0, 0.5, 3.25, 99.9, 100.0][next(6) as usize];
+                p.mem_percent = next(4) as f32 / 3.0;
+                p.gpu_percent = [0.0, 12.5, 0.1][next(3) as usize];
+                p.npu_percent = [0.0, 7.0][next(2) as usize];
+                p.resident_mem = next(5) << 20;
+                p.virtual_mem = next(5) << 30;
+                p.shared_mem = next(3) << 12;
+                p.cpu_time = next(6) * 10_000_000;
+                p.priority = [-15, -1, 0, 4, 8, 13, 24][next(7) as usize];
+                p.thread_count = next(4) as u32;
+                p.status = b"RSD"[next(3) as usize];
+                p.start_time = next(4) as u32 * 60;
+                p.is_elevated = next(2) == 1;
+                p.efficiency_mode = next(2) == 1;
+                p.arch = arches[next(4) as usize];
+                p.handle_count = next(5) as u32;
+                p.io_read_rate = next(4) * 512;
+                p.io_write_rate = next(4) * 512;
+                p.io_read_bytes = next(4) << 10;
+                p.io_write_bytes = next(4) << 10;
+                p.gpu_memory = next(3) << 20;
+                p.npu_memory = next(3) << 20;
+                p.user = Arc::from(["alice", "bob", "SYSTEM"][next(3) as usize]);
+                p.command = Arc::from(["C:\\a.exe", "C:\\b.exe", "b"][next(3) as usize]);
+                p
+            })
+            .collect();
+
+        let mut app = App::new(Config::default());
+        app.processes = processes;
+        for &column in SortColumn::all() {
+            for ascending in [false, true] {
+                app.sort_column = column;
+                app.sort_ascending = ascending;
+                let sort_entry = app.sort_entry();
+                let mut entries: Vec<_> = (app.processes.iter().enumerate())
+                    .map(|(index, p)| sort_entry(index, p))
+                    .collect();
+                app.sort_order(&mut entries);
+                let order: Vec<usize> = entries.iter().map(|&(_, index)| index).collect();
+
+                // A stable sort keeps ties in collector order.
+                let mut expected: Vec<usize> = (0..app.processes.len()).collect();
+                expected.sort_by(|&a, &b| {
+                    let ord = reference_cmp(column, &app.processes[a], &app.processes[b]);
+                    if ascending { ord } else { ord.reverse() }
+                });
+                assert_eq!(order, expected, "{column:?}, ascending {ascending}");
             }
         }
     }
@@ -3591,6 +3820,7 @@ mod tests {
                 user: true,
                 ..Default::default()
             },
+            published_at: Instant::now(),
         });
 
         let DialogState::UserSelect { index, users } = &app.dialog else {
@@ -3598,6 +3828,68 @@ mod tests {
         };
         assert!(users.iter().any(|user| user == "carol"));
         assert_eq!(users.get(*index - 1).map(String::as_str), Some("bob"));
+    }
+
+    #[test]
+    fn uptime_meter_keeps_cpu_collection_alive() {
+        // Issue #97: the Uptime row renders the average CPU%, so hiding only
+        // the CPU meters must not freeze it.
+        use crate::config::MeterMode;
+        use crate::system::collect_gates;
+
+        let mut app = App::new(Config::default());
+        app.config.cpu_meter_mode = MeterMode::Hidden;
+        assert!(app.config.show_uptime_meter);
+        assert_ne!(app.canonical_collect_requirements() & collect_gates::CPU, 0);
+
+        app.config.show_uptime_meter = false;
+        assert_eq!(app.canonical_collect_requirements() & collect_gates::CPU, 0);
+
+        app.config.show_uptime_meter = true;
+        app.show_header = false;
+        assert_eq!(app.canonical_collect_requirements(), 0);
+    }
+
+    #[test]
+    fn navigation_enriches_rows_scrolled_into_view() {
+        // Issue #99: jumping past the enriched window must enrich the new
+        // viewport before it is drawn, not at the next snapshot.
+        let mut app = App::new(Config::default());
+        app.visible_height = 10;
+        app.sort_column = SortColumn::Pid;
+        app.sort_ascending = true;
+        app.processes = (1..=200).map(|pid| process(pid, 0)).collect();
+        app.update_displayed_processes();
+        assert_eq!(app.enriched_rows, 0..20);
+
+        // Inside the window: no new pass.
+        app.select_down();
+        app.enrich_viewport();
+        assert_eq!(app.enriched_rows, 0..20);
+
+        app.select_last();
+        assert_eq!(app.scroll_offset, 190);
+        app.enrich_viewport();
+        assert_eq!(app.enriched_rows, 180..200);
+
+        app.select_first();
+        app.enrich_viewport();
+        assert_eq!(app.enriched_rows, 0..20);
+    }
+
+    #[test]
+    fn uncached_metadata_queries_wait_until_after_the_draw() {
+        // Rows new to the view are drawn with cached facts; their Windows
+        // queries run once, after the frame (fixture PIDs are never cached).
+        let mut app = App::new(Config::default());
+        app.visible_height = 5;
+        app.processes = (1..=20)
+            .map(|pid| process(0x7FF0_0000 + pid * 4, 0))
+            .collect();
+        app.update_displayed_processes();
+        assert!(app.enrichment_pending);
+        assert!(app.run_deferred_enrichment());
+        assert!(!app.run_deferred_enrichment(), "runs once per pass");
     }
 
     #[test]
@@ -3611,7 +3903,7 @@ mod tests {
         app.sort_ascending = true;
 
         app.update_displayed_processes();
-        let pids: Vec<u32> = app.displayed_processes.iter().map(|p| p.pid).collect();
+        let pids: Vec<u32> = app.displayed_processes().map(|p| p.pid).collect();
         assert_eq!(pids, [1, 4]);
     }
 
@@ -3626,8 +3918,8 @@ mod tests {
         app.sort_ascending = true;
 
         app.update_displayed_processes();
-        assert_eq!(app.displayed_processes.len(), 80);
-        assert_eq!(app.displayed_processes.last().unwrap().tree_depth, 79);
+        assert_eq!(app.displayed_len(), 80);
+        assert_eq!(app.display.last().unwrap().tree_depth, 79);
     }
 
     #[test]
@@ -3640,11 +3932,10 @@ mod tests {
 
         app.update_displayed_processes();
         let identities: HashSet<ProcessIdentity> = app
-            .displayed_processes
-            .iter()
+            .displayed_processes()
             .map(ProcessInfo::identity)
             .collect();
-        assert_eq!(app.displayed_processes.len(), 3);
+        assert_eq!(app.displayed_len(), 3);
         assert_eq!(identities.len(), 3);
     }
 
@@ -3720,7 +4011,7 @@ mod tests {
         // A viewport with no rows: collapsed window, or a layout pass that
         // gave the process table no space (issue #75).
         app.visible_height = 0;
-        app.displayed_processes = (1..=10).map(|pid| process(pid * 100, 0)).collect();
+        app.set_display_for_test((1..=10).map(|pid| process(pid * 100, 0)).collect());
         app
     }
 
@@ -3736,7 +4027,7 @@ mod tests {
                 "selection should stop at the last row"
             );
             assert!(
-                app.scroll_offset < app.displayed_processes.len(),
+                app.scroll_offset < app.displayed_len(),
                 "scroll_offset {} escaped the list after {} select_down calls",
                 app.scroll_offset,
                 step
@@ -3744,9 +4035,9 @@ mod tests {
         }
 
         app.page_down();
-        assert!(app.scroll_offset < app.displayed_processes.len());
+        assert!(app.scroll_offset < app.displayed_len());
         app.select_last();
-        assert!(app.scroll_offset < app.displayed_processes.len());
+        assert!(app.scroll_offset < app.displayed_len());
     }
 
     #[test]
@@ -3756,17 +4047,17 @@ mod tests {
         app.visible_height = 0;
 
         app.update_displayed_processes();
-        assert!(!app.displayed_processes.is_empty());
+        assert_ne!(app.displayed_len(), 0);
 
         // Selection at the last row used to push scroll_offset one past it.
         app.select_last();
         app.update_displayed_processes();
-        assert!(app.scroll_offset < app.displayed_processes.len());
+        assert!(app.scroll_offset < app.displayed_len());
 
         // And a stale offset from a bigger list is clamped, not preserved.
         app.scroll_offset = 50;
         app.update_displayed_processes();
-        assert!(app.scroll_offset < app.displayed_processes.len());
+        assert!(app.scroll_offset < app.displayed_len());
     }
 
     #[test]
@@ -3794,7 +4085,7 @@ mod tests {
     fn reference_build_tree(
         processes: Vec<ProcessInfo>,
         collapsed_pids: &HashSet<ProcessIdentity>,
-    ) -> Vec<ProcessInfo> {
+    ) -> Vec<(u32, u16, String, bool, bool)> {
         use std::collections::HashMap;
         use std::sync::Arc;
 
@@ -3843,17 +4134,14 @@ mod tests {
                 if !visited.insert(pending.pid) || suppressed.contains(&pending.pid) {
                     continue;
                 }
-                let Some(mut process) = nodes.remove(&pending.pid) else {
+                let Some(process) = nodes.remove(&pending.pid) else {
                     continue;
                 };
                 let identity = process.identity();
                 let child_pids = children.remove(&pending.pid).unwrap_or_default();
                 let is_collapsed = collapsed_pids.contains(&identity);
 
-                process.tree_depth = pending.depth.min(u16::MAX as usize) as u16;
-                process.has_children = !child_pids.is_empty();
-                process.is_collapsed = is_collapsed;
-                process.tree_prefix = if pending.depth == 0 {
+                let tree_prefix = if pending.depth == 0 {
                     String::new()
                 } else {
                     let branch = if pending.is_last { "\u{2514}\u{2500} " } else { "\u{251c}\u{2500} " };
@@ -3863,7 +4151,13 @@ mod tests {
                     prefix.push_str(branch);
                     prefix
                 };
-                result.push(process);
+                result.push((
+                    process.pid,
+                    pending.depth.min(u16::MAX as usize) as u16,
+                    tree_prefix,
+                    !child_pids.is_empty(),
+                    is_collapsed,
+                ));
 
                 if is_collapsed {
                     let mut descendants = child_pids;
@@ -3954,23 +4248,27 @@ mod tests {
             }
 
             let expected = reference_build_tree(processes.clone(), &app.collapsed_pids);
-            let actual = app.build_tree(processes.clone());
-            let summary = |list: &[ProcessInfo]| -> Vec<(u32, u16, String, bool, bool)> {
-                list.iter()
-                    .map(|p| {
-                        (
-                            p.pid,
-                            p.tree_depth,
-                            p.tree_prefix.clone(),
-                            p.has_children,
-                            p.is_collapsed,
-                        )
-                    })
-                    .collect()
-            };
+            // Sorted position i holds processes[order[i]]: a shuffled order
+            // checks the tree is built over positions, not raw indices.
+            let order: Vec<(u64, usize)> = (0..processes.len()).rev().map(|i| (0, i)).collect();
+            app.processes = order.iter().map(|&(_, i)| processes[i].clone()).collect();
+            let mut rows = Vec::new();
+            app.build_tree(&order, &mut rows);
+            let actual: Vec<_> = rows
+                .into_iter()
+                .map(|row| {
+                    (
+                        app.processes[row.index].pid,
+                        row.tree_depth,
+                        row.tree_prefix,
+                        row.has_children,
+                        row.is_collapsed,
+                    )
+                })
+                .collect();
             assert_eq!(
-                summary(&actual),
-                summary(&expected),
+                actual,
+                expected,
                 "scenario {scenario} diverged ({} processes)",
                 processes.len()
             );

@@ -3,13 +3,12 @@ pub mod dialogs;
 mod footer;
 mod header;
 mod process_list;
+mod text_pool;
 
 // Cross-module use (App computes collector gates from header visibility).
 pub(crate) use header::filler_plan;
 
-use crate::terminal::{
-    Constraint, Direction, Frame, Layout, Line, Modifier, Paragraph, Rect, Span, Style,
-};
+use crate::terminal::{Constraint, Direction, Frame, Layout, Line, Modifier, Rect, Span, Style};
 
 use crate::app::{App, ColumnBounds, DialogState, SortColumn};
 
@@ -31,8 +30,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.dialog_header_rows = 0;
     app.dialog_scroll_rows = 0;
 
-    // Fill entire screen with theme background color
-    frame.buffer_mut().fill_bg(size, theme.background);
+    // Base layer on the theme background: header, tabs, table and footer
+    // paint whole rows through `Frame::paint_row`, so a retained frame only
+    // repaints rows whose content changed.
+    frame.begin(theme.background);
 
     // Main layout: header, tab bar, process list, footer
     // Header is hidden if app.show_header is false
@@ -79,11 +80,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.ui_bounds.footer_y_start = chunks[3].y;
 
     // Resolve column widths once per frame and share them between the
-    // click-region bookkeeping here and the Table widget in process_list::draw,
+    // click-region bookkeeping here and the table process_list::draw paints,
     // so the adaptive sizing math runs once with identical inputs.
     let column_widths =
         process_list::adaptive_column_widths(&app.cached_visible_columns, chunks[2].width);
-    // Calculate column bounds using the same constraint resolution as the Table widget
+    // Column bounds; process_list::draw paints its columns at these widths
     app.ui_bounds.columns =
         calculate_column_bounds(&app.cached_visible_columns, chunks[2], &column_widths);
 
@@ -105,6 +106,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
     // Draw footer (function keys)
     footer::draw(frame, app, chunks[3]);
+
+    // Everything below is an overlay drawn over the base layer.
+    frame.finish_base();
 
     // Draw dialog overlays if needed
     match &app.dialog {
@@ -182,8 +186,7 @@ fn draw_tab_bar(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 
     let line = Line::from(spans);
-    let paragraph = Paragraph::new(line).style(Style::default().bg(theme.background));
-    frame.render_widget(paragraph, area);
+    frame.paint_line(area, &line, Style::default().bg(theme.background));
 }
 
 /// Center a rectangle within another
@@ -215,7 +218,7 @@ pub fn centered_rect_fixed(width: u16, height: u16, r: Rect) -> Rect {
 }
 
 /// Calculate column bounds based on visible columns and available area
-/// Uses ratatui's Layout to resolve constraints exactly as the Table widget does
+/// (Layout resolves the constraints; the process table paints at these widths)
 fn calculate_column_bounds(
     visible_columns: &[SortColumn],
     area: Rect,
@@ -232,7 +235,7 @@ fn calculate_column_bounds(
     let column_areas = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(constraints)
-        .spacing(1) // Match Table's column_spacing(1)
+        .spacing(1) // The process table's column spacing
         .split(area);
 
     // Build column bounds from the resolved layout

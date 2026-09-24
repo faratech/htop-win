@@ -7,7 +7,7 @@
 //! - Centralized configuration
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -23,7 +23,9 @@ pub mod config {
     pub const QUERY_FAILURE_TTL_MS: u128 = 15_000;
     /// Exe status check interval in seconds
     pub const EXE_STATUS_TTL_SECS: u64 = 10;
-    /// Maximum exe status cache entries before eviction
+    /// Minimum exe status cache capacity before eviction. The effective cap
+    /// scales with the live process count (entries are one per process), see
+    /// `ProcessCache::begin_exe_tick`.
     pub const EXE_CACHE_MAX_SIZE: usize = 1000;
     /// Per-tick cap on exe-status filesystem stats. Entries past their
     /// (jittered) deadline are restated across following ticks in whatever
@@ -120,6 +122,15 @@ pub struct ExeStatusEntry {
 /// hashes and compares through `str`) instead of allocating a `String` per call.
 type ExeStatusMap = HashMap<Box<str>, HashMap<u64, ExeStatusEntry>>;
 
+/// [`ExeStatusMap`] plus its total entry count, kept in step with every
+/// insert/eviction so the per-insert cap check is O(1) instead of a walk over
+/// every path.
+#[derive(Default)]
+struct ExeStatusCache {
+    map: ExeStatusMap,
+    len: usize,
+}
+
 /// An entry is fresh while `now` is before its (jittered) deadline.
 fn exe_entry_is_fresh(entry: &ExeStatusEntry, now: Instant) -> bool {
     now < entry.next_check
@@ -148,7 +159,9 @@ fn exe_status_jitter(exe_path: &str, start_time_100ns: u64) -> Duration {
     Duration::from_nanos(nanos)
 }
 
-/// Total number of cached entries across every path.
+/// Total number of cached entries across every path (test cross-check for
+/// the running count).
+#[cfg(test)]
 fn exe_status_len(map: &ExeStatusMap) -> usize {
     map.values().map(HashMap::len).sum()
 }
@@ -172,14 +185,15 @@ fn evict_expired_entries(map: &mut ExeStatusMap, now: Instant) -> usize {
 
 /// Enforce the size cap once it is exceeded: shed expired entries first and
 /// wipe the cache wholesale only when everything left is still fresh, i.e.
-/// when eviction cannot free enough room.
-fn enforce_exe_cache_limit(map: &mut ExeStatusMap, now: Instant) {
-    if exe_status_len(map) <= config::EXE_CACHE_MAX_SIZE {
+/// when eviction cannot free enough room. `len` is the running entry count.
+fn enforce_exe_cache_limit(map: &mut ExeStatusMap, len: &mut usize, now: Instant, cap: usize) {
+    if *len <= cap {
         return;
     }
-    evict_expired_entries(map, now);
-    if exe_status_len(map) > config::EXE_CACHE_MAX_SIZE {
+    *len = len.saturating_sub(evict_expired_entries(map, now));
+    if *len > cap {
         map.clear();
+        *len = 0;
     }
 }
 
@@ -191,11 +205,14 @@ pub struct ProcessCache {
     /// Per-PID cache entries
     entries: RwLock<HashMap<u32, ProcessCacheEntry>>,
     /// Exe status cache (keyed by path+process create FILETIME)
-    exe_status: RwLock<ExeStatusMap>,
+    exe_status: RwLock<ExeStatusCache>,
     /// Cleanup counter for periodic maintenance
     cleanup_counter: AtomicU32,
     /// Remaining exe-status stats allowed this tick (see `begin_exe_tick`)
     exe_budget: AtomicU32,
+    /// Exe-status entry cap for the current process population (see
+    /// `begin_exe_tick`); never below `config::EXE_CACHE_MAX_SIZE`.
+    exe_cap: AtomicUsize,
 }
 
 impl ProcessCache {
@@ -203,17 +220,29 @@ impl ProcessCache {
     pub fn new() -> Self {
         Self {
             entries: RwLock::new(HashMap::new()),
-            exe_status: RwLock::new(HashMap::new()),
+            exe_status: RwLock::new(ExeStatusCache::default()),
             cleanup_counter: AtomicU32::new(0),
             exe_budget: AtomicU32::new(0),
+            exe_cap: AtomicUsize::new(config::EXE_CACHE_MAX_SIZE),
         }
     }
 
     /// Open a new collection tick with a fresh exe-stat budget. Entries past
     /// their jittered deadline are restated across ticks under this cap so a
     /// large process set never stats in a single tick.
-    pub fn begin_exe_tick(&self, budget: u32) {
+    ///
+    /// `live_processes` sizes the cache: entries are one per process, so a
+    /// fixed cap below the process count would wipe fresh verdicts every few
+    /// ticks and keep the stat budget saturated (issue #102). Twice the live
+    /// count leaves room for exited processes awaiting eviction.
+    pub fn begin_exe_tick(&self, budget: u32, live_processes: usize) {
         self.exe_budget.store(budget, Ordering::Relaxed);
+        self.exe_cap.store(
+            live_processes
+                .saturating_mul(2)
+                .max(config::EXE_CACHE_MAX_SIZE),
+            Ordering::Relaxed,
+        );
     }
 
     /// Take one stat from the budget, if any remain.
@@ -376,6 +405,7 @@ impl ProcessCache {
         // can drop before any filesystem work.
         let existing: Option<(bool, bool, bool)> = if let Ok(cache) = self.exe_status.read() {
             cache
+                .map
                 .get(exe_path)
                 .and_then(|by_start| by_start.get(&start_time_100ns))
                 .map(|e| (e.updated, e.deleted, exe_entry_is_fresh(e, now)))
@@ -419,14 +449,17 @@ impl ProcessCache {
         };
 
         // Update cache (size-capped; shed expired entries before clearing)
-        if let Ok(mut cache) = self.exe_status.write() {
-            enforce_exe_cache_limit(&mut cache, now);
+        if let Ok(mut guard) = self.exe_status.write() {
+            let cache = &mut *guard;
+            let cap = self.exe_cap.load(Ordering::Relaxed);
+            enforce_exe_cache_limit(&mut cache.map, &mut cache.len, now, cap);
             let jitter = if jitter {
                 exe_status_jitter(exe_path, start_time_100ns)
             } else {
                 Duration::ZERO
             };
-            cache
+            let replaced = cache
+                .map
                 .entry(Box::from(exe_path))
                 .or_default()
                 .insert(
@@ -438,6 +471,9 @@ impl ProcessCache {
                         next_check: now + EXE_STATUS_TTL + jitter,
                     },
                 );
+            if replaced.is_none() {
+                cache.len += 1;
+            }
         }
 
         result
@@ -510,8 +546,20 @@ mod tests {
 
     impl ProcessCache {
         fn with_exe_status<R>(&self, f: impl FnOnce(&ExeStatusMap) -> R) -> R {
-            f(&self.exe_status.read().expect("exe_status lock"))
+            let cache = self.exe_status.read().expect("exe_status lock");
+            // The running count must always match the map it summarizes.
+            assert_eq!(cache.len, exe_status_len(&cache.map));
+            f(&cache.map)
         }
+    }
+
+    /// `enforce_exe_cache_limit` at the base cap with a freshly counted `len`,
+    /// returning the updated running count.
+    fn enforce_base_cap(map: &mut ExeStatusMap, now: Instant) -> usize {
+        let mut len = exe_status_len(map);
+        enforce_exe_cache_limit(map, &mut len, now, config::EXE_CACHE_MAX_SIZE);
+        assert_eq!(len, exe_status_len(map), "running count drifted");
+        len
     }
 
     #[test]
@@ -778,7 +826,7 @@ mod tests {
         );
         assert!(exe_status_len(&map) > config::EXE_CACHE_MAX_SIZE);
 
-        enforce_exe_cache_limit(&mut map, later);
+        enforce_base_cap(&mut map, later);
 
         // Expired entries shed, every fresh entry intact: no wholesale clear.
         assert!(exe_status_len(&map) <= config::EXE_CACHE_MAX_SIZE);
@@ -810,7 +858,7 @@ mod tests {
         add_synthetic_entries(&mut map, 0..config::EXE_CACHE_MAX_SIZE + 200, t0);
         assert!(exe_status_len(&map) > config::EXE_CACHE_MAX_SIZE);
 
-        enforce_exe_cache_limit(&mut map, t0 + Duration::from_secs(1));
+        assert_eq!(enforce_base_cap(&mut map, t0 + Duration::from_secs(1)), 0);
 
         assert!(map.is_empty());
     }
@@ -821,7 +869,7 @@ mod tests {
         let mut map = ExeStatusMap::new();
         add_synthetic_entries(&mut map, 0..64, t0);
 
-        enforce_exe_cache_limit(&mut map, t0 + Duration::from_secs(1));
+        assert_eq!(enforce_base_cap(&mut map, t0 + Duration::from_secs(1)), 64);
 
         assert_eq!(exe_status_len(&map), 64);
         assert_eq!(map.len(), 64);
@@ -856,7 +904,7 @@ mod tests {
 
         // Open a 1-stat budget: the first due entry stats and caches, the
         // second defers with the neutral verdict and stays uncached.
-        cache.begin_exe_tick(1);
+        cache.begin_exe_tick(1, 0);
         assert_eq!(
             cache.check_exe_status_impl(path, 1, t0, true, true),
             (false, true) // nonexistent path -> deleted
@@ -873,7 +921,7 @@ mod tests {
     fn staggered_checks_keep_last_verdict_while_deferred() {
         let cache = ProcessCache::new();
         let t0 = Instant::now();
-        cache.begin_exe_tick(1);
+        cache.begin_exe_tick(1, 0);
         // A deleted exe is stat'd once and cached as deleted.
         let path = "C:\\gone\\app.exe";
         assert_eq!(
@@ -882,7 +930,7 @@ mod tests {
         );
         // Past its deadline with the budget drained: the cached (deleted)
         // verdict holds until a later tick restats - no flicker to (f,t).
-        cache.begin_exe_tick(0);
+        cache.begin_exe_tick(0, 0);
         let later = t0 + EXE_STATUS_TTL + Duration::from_secs(60);
         assert_eq!(
             cache.check_exe_status_impl(path, 1, later, true, true),
@@ -920,12 +968,65 @@ mod tests {
         // 50 entries come due in the same instant (as a real tick produces);
         // the budget paces their initial caching, and everything is cached
         // after enough ticks.
-        cache.begin_exe_tick(config::EXE_STATS_PER_TICK);
+        cache.begin_exe_tick(config::EXE_STATS_PER_TICK, 0);
         for i in 0..50u64 {
             let path = format!("C:\\conv\\app{}.exe", i);
             cache.check_exe_status_impl(&path, 1_000 + i, t0, true, true);
         }
         let cached = cache.with_exe_status(|m| m.values().map(|b| b.len()).sum::<usize>());
         assert_eq!(cached, 50, "budget of {} covers 50 entries", config::EXE_STATS_PER_TICK);
+    }
+
+    #[test]
+    fn cap_scales_with_live_processes_so_fresh_entries_survive() {
+        // Issue #102: with more live processes than the base cap, every entry
+        // is fresh, so a fixed 1000-entry cap wiped the whole cache repeatedly.
+        let t0 = Instant::now();
+        let mut map = ExeStatusMap::new();
+        let entries = config::EXE_CACHE_MAX_SIZE + 200;
+        add_synthetic_entries(&mut map, 0..entries, t0);
+        let mut len = exe_status_len(&map);
+
+        let cache = ProcessCache::new();
+        cache.begin_exe_tick(0, entries);
+        let cap = cache.exe_cap.load(Ordering::Relaxed);
+        assert_eq!(cap, entries * 2);
+
+        enforce_exe_cache_limit(&mut map, &mut len, t0 + Duration::from_secs(1), cap);
+        assert_eq!(len, entries);
+        assert_eq!(exe_status_len(&map), entries);
+
+        // A small population never lowers the cap below the base size.
+        cache.begin_exe_tick(0, 10);
+        assert_eq!(
+            cache.exe_cap.load(Ordering::Relaxed),
+            config::EXE_CACHE_MAX_SIZE
+        );
+    }
+
+    #[test]
+    fn running_count_tracks_inserts_restats_and_evictions() {
+        let cache = ProcessCache::new();
+        let t0 = Instant::now();
+        cache.begin_exe_tick(u32::MAX, 0);
+        for i in 0..20u64 {
+            let path = format!("C:\\count\\app{}.exe", i % 5);
+            cache.check_exe_status_impl(&path, i, t0, false, true);
+        }
+        // Re-stat the same keys after the TTL: replaced, not double-counted.
+        let later = t0 + EXE_STATUS_TTL + Duration::from_secs(1);
+        for i in 0..20u64 {
+            let path = format!("C:\\count\\app{}.exe", i % 5);
+            cache.check_exe_status_impl(&path, i, later, false, true);
+        }
+        assert_eq!(cache.with_exe_status(exe_status_len), 20);
+
+        // Evictions keep the count in step (checked inside with_exe_status).
+        let mut guard = cache.exe_status.write().unwrap();
+        let state = &mut *guard;
+        let past_grace = later + EXE_STATUS_TTL + EXE_STATUS_TTL + Duration::from_secs(1);
+        enforce_exe_cache_limit(&mut state.map, &mut state.len, past_grace, 0);
+        assert_eq!(state.len, 0);
+        assert!(state.map.is_empty());
     }
 }

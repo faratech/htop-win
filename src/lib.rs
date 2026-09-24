@@ -1,6 +1,7 @@
 pub mod app;
 pub mod config;
 pub mod data;
+pub mod event_wait;
 pub mod input;
 pub mod json;
 pub(crate) mod numfmt;

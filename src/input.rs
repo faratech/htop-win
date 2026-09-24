@@ -205,9 +205,10 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
             app.prev_screen_tab();
         }
 
-        // Redraw screen (Ctrl+L)
+        // Redraw screen (Ctrl+L): repaint every cell on the next frame. Data
+        // collection stays on the collector thread (issue #100).
         KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.refresh_system();
+            app.full_redraw_requested = true;
         }
 
         // Arrow key navigation - depends on focus region
@@ -1386,12 +1387,11 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
     let element = match element {
         Some(UIElement::ProcessRow { index, .. }) => {
             let actual_index = app.scroll_offset + index;
-            if actual_index < app.displayed_processes.len() {
-                let pid = app.displayed_processes[actual_index].pid;
-                Some(UIElement::ProcessRow { index, pid })
-            } else {
-                None
-            }
+            app.displayed(actual_index)
+                .map(|process| UIElement::ProcessRow {
+                    index,
+                    pid: process.pid,
+                })
         }
         other => other,
     };
@@ -1445,7 +1445,7 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
             // Process row single click - select
             (UIElement::ProcessRow { index, .. }, UIAction::Click) => {
                 let actual_index = app.scroll_offset + index;
-                if actual_index < app.displayed_processes.len() {
+                if actual_index < app.displayed_len() {
                     app.selected_index = actual_index;
                 }
             }
@@ -1453,12 +1453,13 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
             // Process row double click - open process info, or toggle tag branch in tree mode
             (UIElement::ProcessRow { index, pid: _ }, UIAction::DoubleClick) => {
                 let actual_index = app.scroll_offset + index;
-                if actual_index < app.displayed_processes.len() {
+                if actual_index < app.displayed_len() {
                     app.selected_index = actual_index;
                     if app.tree_view {
                         // In tree mode, double-click toggles tag for entire branch
-                        let identity = app.displayed_processes[actual_index].identity();
-                        app.toggle_tag_branch(identity);
+                        if let Some(identity) = app.selected_process().map(|p| p.identity()) {
+                            app.toggle_tag_branch(identity);
+                        }
                     } else {
                         // In normal mode, open process info dialog
                         app.enter_process_info_mode();
@@ -1469,22 +1470,17 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
             // Process row right click - tag process
             (UIElement::ProcessRow { index, pid: _ }, UIAction::RightClick) => {
                 let actual_index = app.scroll_offset + index;
-                if actual_index < app.displayed_processes.len() {
+                if actual_index < app.displayed_len() {
                     app.selected_index = actual_index;
                     // Toggle tag on the process
-                    let identity = app.displayed_processes[actual_index].identity();
-                    if app.tagged_pids.contains(&identity) {
-                        app.tagged_pids.remove(&identity);
-                    } else {
-                        app.tagged_pids.insert(identity);
-                    }
+                    app.toggle_tag();
                 }
             }
 
             // Process row middle click - kill process
             (UIElement::ProcessRow { index, pid: _ }, UIAction::MiddleClick) => {
                 let actual_index = app.scroll_offset + index;
-                if actual_index < app.displayed_processes.len() {
+                if actual_index < app.displayed_len() {
                     app.selected_index = actual_index;
                     // Open kill dialog
                     app.enter_kill_mode();
@@ -1647,6 +1643,19 @@ mod tests {
         handle_mouse_event(&mut app, blank);
         assert!(app.show_header);
         assert_eq!(app.config.cpu_meter_mode, MeterMode::Graph);
+    }
+
+    #[test]
+    fn ctrl_l_requests_full_redraw_without_collecting() {
+        // Issue #100: Ctrl+L repaints the terminal; it must not run a
+        // collection on the UI thread (which skewed the collector's CPU%).
+        let mut app = test_app();
+        assert!(!app.full_redraw_requested);
+        let ctrl_l = KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL);
+        assert!(!handle_key_event(&mut app, ctrl_l));
+        assert!(app.full_redraw_requested);
+        assert!(app.processes.is_empty());
+        assert!(!app.needs_process_update);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 // The binary is a thin wrapper over the htop_win library crate — modules are
 // declared once in lib.rs so each source file compiles a single time.
-use htop_win::{app, config, data, input, installer, system, terminal, ui};
+use htop_win::{app, config, data, event_wait, input, installer, system, terminal, ui};
 
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,6 +48,15 @@ struct Args {
 struct BenchmarkStats {
     refresh_times: Vec<Duration>,
     draw_times: Vec<Duration>,
+    /// Per-frame split of each draw (compose vs. diff + console output) and
+    /// how many rows the retained frame actually repainted.
+    frames: Vec<terminal::FrameStats>,
+    /// Publish-to-apply delay of each snapshot (UI pickup latency).
+    snapshot_lags: Vec<Duration>,
+    /// Publish-to-drawn delay of each snapshot (pickup + apply + draw).
+    frame_latencies: Vec<Duration>,
+    /// Snapshots the collector replaced before the UI took them.
+    superseded_snapshots: u64,
     total_start: Option<Instant>,
     process_cpu_start: Duration,
 }
@@ -161,6 +170,7 @@ fn print_help() {
     println!("  -n, --max-iterations <N>     Exit after N updates (alias: --iterations)");
     println!("      --no-meters              Hide header meters");
     println!("      --benchmark[=<N>]        Run N iterations (default 20) and print timing stats");
+    println!("                               (refresh 10 ms unless -d is given)");
     println!("      --benchmark-iterations <N>  Alias with a separate iteration value");
     println!("      --readonly               Disable process mutation operations");
     println!("      --inefficient            Disable Efficiency Mode (run at normal priority)");
@@ -249,6 +259,10 @@ impl BenchmarkStats {
         Self {
             refresh_times: Vec::new(),
             draw_times: Vec::new(),
+            frames: Vec::new(),
+            snapshot_lags: Vec::new(),
+            frame_latencies: Vec::new(),
+            superseded_snapshots: 0,
             total_start: Some(Instant::now()),
             process_cpu_start: get_process_cpu_time(),
         }
@@ -258,8 +272,17 @@ impl BenchmarkStats {
         self.refresh_times.push(duration);
     }
 
-    fn record_draw(&mut self, duration: Duration) {
+    fn record_draw(&mut self, duration: Duration, frame: terminal::FrameStats) {
         self.draw_times.push(duration);
+        self.frames.push(frame);
+    }
+
+    fn record_snapshot_lag(&mut self, lag: Duration) {
+        self.snapshot_lags.push(lag);
+    }
+
+    fn record_frame_latency(&mut self, latency: Duration) {
+        self.frame_latencies.push(latency);
     }
 
     fn print_report(&self, process_count: usize) {
@@ -321,6 +344,48 @@ impl BenchmarkStats {
                 bench_ms(min),
                 bench_ms(max)
             );
+            let frames = self.frames.len().max(1);
+            let compose: Vec<Duration> = self.frames.iter().map(|f| f.compose).collect();
+            let output: Vec<Duration> = self.frames.iter().map(|f| f.output).collect();
+            let rows: usize = self.frames.iter().map(|f| usize::from(f.dirty_rows)).sum();
+            let bytes: usize = self.frames.iter().map(|f| f.bytes).sum();
+            println!(
+                "║   Compose avg: {:>10}  Diff+output avg: {:>10}      ║",
+                bench_ms(avg_max(&compose).0),
+                bench_ms(avg_max(&output).0)
+            );
+            println!(
+                "║   Rows repainted/frame: {:>5}  Bytes/frame: {:>7}          ║",
+                format!("{}.{}", rows / frames, rows * 10 / frames % 10),
+                bytes / frames
+            );
+        }
+
+        // Snapshot latency: publish → UI pickup, and publish → frame drawn
+        if !self.snapshot_lags.is_empty() {
+            let (pickup_avg, pickup_max) = avg_max(&self.snapshot_lags);
+            let (frame_avg, frame_max) = avg_max(&self.frame_latencies);
+            println!("╠══════════════════════════════════════════════════════════════╣");
+            println!("║ SNAPSHOT LATENCY (from collector publish)                    ║");
+            println!(
+                "║   Pickup Avg: {:>10}  Max: {:>10}                  ║",
+                bench_ms(pickup_avg),
+                bench_ms(pickup_max)
+            );
+            println!(
+                "║   Frame  Avg: {:>10}  Max: {:>10}                  ║",
+                bench_ms(frame_avg),
+                bench_ms(frame_max)
+            );
+            println!(
+                "║   Frame  p50: {:>10}  p99: {:>10}                  ║",
+                bench_ms(percentile(&self.frame_latencies, 50)),
+                bench_ms(percentile(&self.frame_latencies, 99))
+            );
+            println!(
+                "║   Dropped (superseded) snapshots: {:>6}                     ║",
+                self.superseded_snapshots
+            );
         }
 
         // Overall stats
@@ -344,12 +409,31 @@ impl BenchmarkStats {
     }
 }
 
-/// Format a Duration as whole milliseconds with two decimals ("7.08ms"),
+/// Format a Duration as milliseconds with three decimals ("7.081ms"),
 /// computed with integer math so the benchmark report does not link
 /// Duration's precision-aware Debug formatting.
 fn bench_ms(duration: Duration) -> String {
     let micros = duration.as_micros();
-    format!("{}.{:02}ms", micros / 1000, (micros % 1000) / 10)
+    format!("{}.{:03}ms", micros / 1000, micros % 1000)
+}
+
+/// Average and maximum of a sample set (zero for an empty set).
+/// Nearest-rank percentile (`pct` in 0..=100) of the samples.
+fn percentile(samples: &[Duration], pct: usize) -> Duration {
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let rank = (sorted.len() * pct).div_ceil(100).max(1);
+    sorted.get(rank - 1).copied().unwrap_or_default()
+}
+
+fn avg_max(samples: &[Duration]) -> (Duration, Duration) {
+    let max = samples.iter().max().copied().unwrap_or_default();
+    let avg = samples
+        .iter()
+        .sum::<Duration>()
+        .checked_div(samples.len() as u32)
+        .unwrap_or_default();
+    (avg, max)
 }
 
 /// True once mouse capture has been enabled, so restore only disables what was set.
@@ -639,8 +723,11 @@ fn run_tui_inner(
     let benchmark_mode = args.benchmark;
     if let Some(n) = benchmark_mode {
         app.max_iterations = Some(n);
-        // Use minimal delay in benchmark mode for faster iteration
-        app.config.refresh_rate_ms = 10;
+        // Minimal delay for faster iteration, unless -d asks for a realistic
+        // rate (e.g. to measure snapshot lag at a normal cadence).
+        if args.delay.is_none() {
+            app.config.refresh_rate_ms = 10;
+        }
     }
 
     // Spawn background data collector and wait for initial snapshot
@@ -675,9 +762,12 @@ fn run_tui_inner(
         &mut app,
         bench_stats.as_mut(),
         update_rx,
-        data_rx,
+        &data_rx,
         &collector,
     );
+    if let Some(stats) = bench_stats.as_mut() {
+        stats.superseded_snapshots = data_rx.superseded_count();
+    }
 
     // Persist any config change still pending from the debounced hot paths
     // (meter clicks / arrow-key meter cycling).
@@ -693,12 +783,27 @@ fn run_app(
     app: &mut App,
     mut bench_stats: Option<&mut BenchmarkStats>,
     update_rx: std::sync::mpsc::Receiver<installer::UpdateStatus>,
-    data_rx: data::SnapshotReceiver,
+    data_rx: &data::SnapshotReceiver,
     collector: &data::DataCollector,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Wait on console input and a "snapshot published" event together, so a
+    // snapshot is picked up with a thread wake instead of on the next timer
+    // tick. The loop has no clock of its own to drift against the collector's
+    // (issue #98).
+    let waiter = event_wait::EventWait::new()?;
+    data_rx.notify_on_publish({
+        let signal = waiter.signal_handle();
+        move || signal.raise()
+    });
+    // Consecutive input wakes that yielded no crossterm event (see below).
+    let mut empty_input_wakes = 0u32;
+
+    // Housekeeping cadence (process-info I/O refresh, config flush).
     let mut last_tick = Instant::now();
     let mut last_enrichment_bits = u8::MAX; // force the first store
     let mut last_collect_bits = u8::MAX; // force the first store
+    let mut last_paused = app.paused;
+    let mut last_rate_ms = app.config.refresh_rate_ms;
 
     // Paint the initial state before blocking on input: the loop below draws
     // only after handling events, so without this the first frame could wait
@@ -707,7 +812,7 @@ fn run_app(
         let draw_start = Instant::now();
         terminal.draw(|f| ui::draw(f, app))?;
         if let Some(stats) = bench_stats.as_mut() {
-            stats.record_draw(draw_start.elapsed());
+            stats.record_draw(draw_start.elapsed(), terminal.last_frame());
         }
         false
     };
@@ -717,6 +822,25 @@ fn run_app(
     // iteration); a keypress and a snapshot arriving in the same iteration
     // collapse into ONE deferred update pass and one draw instead of two.
     loop {
+        let now = Instant::now();
+
+        // Push collector-facing state only when it changed. A change the UI
+        // is now waiting on (metadata it lacks, resuming from pause) wakes the
+        // collector so it collects immediately instead of at its next tick.
+        let mut wake_collector = false;
+        if app.config.refresh_rate_ms != last_rate_ms {
+            last_rate_ms = app.config.refresh_rate_ms;
+            collector
+                .tick_rate_ms
+                .store(last_rate_ms, Ordering::Relaxed);
+            wake_collector = true; // re-derive its schedule from now
+        }
+        if app.paused != last_paused {
+            last_paused = app.paused;
+            collector.paused.store(app.paused, Ordering::Relaxed);
+            // A collector that skipped a tick while paused collects now.
+            wake_collector |= !app.paused;
+        }
         // Requirements only change with config/dialog state; skip the atomic
         // store when the bits are unchanged.
         let requirements = app.canonical_enrichment_requirements();
@@ -724,6 +848,10 @@ fn run_app(
         if enrichment_bits != last_enrichment_bits {
             last_enrichment_bits = enrichment_bits;
             collector.set_enrichment_requirements(requirements);
+            wake_collector |= !app.has_enrichment_for(requirements);
+        }
+        if wake_collector {
+            collector.wake();
         }
 
         // Same change-detection for the collection gates (which subsystems
@@ -737,11 +865,36 @@ fn run_app(
         // Read tick rate from app.config so it updates dynamically
         let tick_rate = Duration::from_millis(app.config.refresh_rate_ms);
 
+        // Input crossterm already buffered comes first: our wait watches only
+        // the console buffer, so an event sitting in crossterm's queue would
+        // otherwise wait behind it. Then block until input, a published
+        // snapshot, or the housekeeping tick.
+        let mut input_ready = event::poll(Duration::ZERO)?;
+        // A redraw already owed (deferred enrichment results) goes out now.
+        if !input_ready && !needs_redraw {
+            let housekeeping_left =
+                tick_rate.saturating_sub(now.saturating_duration_since(last_tick));
+            let woke_for_input = waiter.wait(housekeeping_left)? == event_wait::Wake::Input;
+            if woke_for_input {
+                input_ready = event::poll(Duration::ZERO)?;
+            }
+            // An input wake with no crossterm event means it consumed a record
+            // it doesn't surface (e.g. a menu event). Back off if that repeats,
+            // in case the console handle stays signaled with nothing to read.
+            empty_input_wakes = if woke_for_input && !input_ready {
+                empty_input_wakes + 1
+            } else {
+                0
+            };
+            if empty_input_wakes >= 3 {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+
         // Handle input against the displayed frame before applying another
         // collector snapshot below. Process action keys must capture the
         // identity the user sees at the selected row.
-        let timeout = tick_rate.saturating_sub(last_tick.elapsed());
-        if event::poll(timeout)? {
+        if input_ready {
             match event::read()? {
                 Event::Key(key) => {
                     // Provably inert events (releases/repeats of mapped keys,
@@ -752,11 +905,6 @@ fn run_app(
                         if input::handle_key_event(app, key) {
                             return Ok(());
                         }
-                        // Sync shared state with background collector
-                        collector.paused.store(app.paused, Ordering::Relaxed);
-                        collector
-                            .tick_rate_ms
-                            .store(app.config.refresh_rate_ms, Ordering::Relaxed);
                         needs_redraw = true;
                     }
                 }
@@ -768,16 +916,11 @@ fn run_app(
                         if input::handle_mouse_event(app, mouse) {
                             return Ok(());
                         }
-                        // Sync shared state with background collector
-                        collector.paused.store(app.paused, Ordering::Relaxed);
-                        collector
-                            .tick_rate_ms
-                            .store(app.config.refresh_rate_ms, Ordering::Relaxed);
                         needs_redraw = true;
                     }
                 }
                 Event::Resize(_, _) => {
-                    // Terminal will handle resize automatically
+                    terminal.refresh_size()?;
                     needs_redraw = true;
                 }
                 _ => {}
@@ -813,15 +956,17 @@ fn run_app(
 
         // The collector's capacity-one slot has already discarded superseded
         // snapshots, so one non-blocking receive is always the newest state.
+        let mut applied_published_at = None;
         {
             if let Ok(snapshot) = data_rx.try_recv() {
                 if let Some(stats) = bench_stats.as_mut() {
                     stats.record_refresh(snapshot.refresh_duration);
+                    stats.record_snapshot_lag(snapshot.published_at.elapsed());
                 }
-                // Recycle old vec before replacing
-                let old = std::mem::take(&mut app.processes);
+                applied_published_at = Some(snapshot.published_at);
+                // The replaced process list goes back to the collector.
+                let old = app.apply_snapshot(snapshot);
                 let _ = collector.recycle_tx.send(old);
-                app.apply_snapshot(snapshot);
                 app.iteration_count += 1;
                 needs_redraw = true;
 
@@ -842,14 +987,41 @@ fn run_app(
             needs_redraw = true;
         }
 
+        // Ctrl+L: clear the terminal and repaint every cell, repairing a
+        // console garbled by other writers (issue #100).
+        if app.full_redraw_requested {
+            app.full_redraw_requested = false;
+            terminal.clear()?;
+            needs_redraw = true;
+        }
+
         // Draw UI only when needed (state changed)
         if needs_redraw {
+            // Rows scrolled into view since the last list update get their
+            // metadata before being painted (issue #99).
+            app.enrich_viewport();
             let draw_start = Instant::now();
             terminal.draw(|f| ui::draw(f, app))?;
             if let Some(stats) = bench_stats.as_mut() {
-                stats.record_draw(draw_start.elapsed());
+                stats.record_draw(draw_start.elapsed(), terminal.last_frame());
+                if let Some(published_at) = applied_published_at {
+                    stats.record_frame_latency(published_at.elapsed());
+                }
             }
             needs_redraw = false;
+
+            // Metadata queries for rows new to the view run after the frame
+            // is out, then the frame is redrawn with their results.
+            if app.run_deferred_enrichment() {
+                needs_redraw = true;
+            }
+            // The console size is re-read here, off the snapshot-to-frame
+            // path, instead of before each draw. Resize events need not
+            // arrive (no window input without mouse capture), so a change
+            // noticed here redraws right away.
+            if terminal.refresh_size()? {
+                needs_redraw = true;
+            }
         }
 
         // Refresh I/O counters when process info dialog is open (at tick rate, even when paused)
@@ -884,5 +1056,16 @@ mod tests {
         apply_config_overrides(&mut config, &args);
 
         assert!(!config.readonly);
+    }
+
+    #[test]
+    fn percentile_is_nearest_rank() {
+        let ms = |n| Duration::from_millis(n);
+        let samples: Vec<Duration> = (1..=100).rev().map(ms).collect();
+        assert_eq!(percentile(&samples, 50), ms(50));
+        assert_eq!(percentile(&samples, 99), ms(99));
+        assert_eq!(percentile(&samples, 100), ms(100));
+        assert_eq!(percentile(&[ms(7)], 99), ms(7));
+        assert_eq!(percentile(&[], 50), Duration::ZERO);
     }
 }

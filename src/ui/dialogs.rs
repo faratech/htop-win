@@ -122,7 +122,8 @@ fn render_scrollable_dialog(
     frame.render_widget(Clear, area);
     frame.render_widget(list, area);
 
-    if total_lines > visible_lines {
+    // A zero-width dialog (tiny terminal) has no column for a scrollbar.
+    if total_lines > visible_lines && area.width > 0 {
         let scrollbar_area = Rect::new(
             area.x + area.width - 1,
             area.y + 1,
@@ -210,7 +211,7 @@ fn render_list_dialog(
     frame.render_widget(list, area);
 
     // Scrollbar beside the middle region only when it overflows.
-    if scrollable_len > scroll_height && scroll_height > 0 {
+    if scrollable_len > scroll_height && scroll_height > 0 && area.width > 0 {
         let scrollbar_area = Rect::new(
             area.x + area.width - 1,
             inner.y + header_rows as u16,
@@ -877,7 +878,7 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
             proc.parent_pid,
             proc.name,
             proc.user,
-            proc.status,
+            proc.status_char(),
             status_desc,
             arch_str,
             proc.priority,

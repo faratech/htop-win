@@ -1,9 +1,12 @@
-use crate::terminal::{Block, Borders, Frame, Line, Modifier, Paragraph, Rect, Span, Style};
+use crate::terminal::{Frame, Modifier, Rect, RowSeg, RowSpec, Span, Style};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 
+use super::text_pool::{pooled_fmt, pooled_str, pooled_string, recycle_spans, recycle_vec};
 use crate::app::{App, UIElement, UIRegion};
 use crate::config::MeterMode;
-use crate::system::format_bytes;
+use crate::numfmt::{push_round0, push_tenths};
+use crate::system::push_bytes;
 
 /// Pre-computed bar strings to avoid repeated String::repeat() allocations.
 /// Maximum bar width is 128 characters which covers most terminal widths.
@@ -286,14 +289,39 @@ fn length_row_rect(area: Rect, row_idx: usize, n: usize) -> Rect {
     )
 }
 
-pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
-    let theme = &app.theme;
-    let block = Block::default()
-        .borders(Borders::NONE)
-        .style(Style::default().bg(theme.background));
+/// Meter lines laid out for this frame: line `(rect, range)` is what a
+/// one-line `Paragraph` of `spans[range]` renders in `rect`. Kept across
+/// frames (see `SLOTS`), so the header builds its lines without allocating:
+/// owned span text comes from the string pool and returns to it once painted.
+struct Slots {
+    spans: Vec<Span<'static>>,
+    lines: Vec<(Rect, std::ops::Range<usize>)>,
+    segs: Vec<RowSeg<'static>>,
+}
 
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+impl Slots {
+    /// Add one meter line in `area`.
+    fn line<const N: usize>(&mut self, area: Rect, spans: [Span<'static>; N]) {
+        let start = self.spans.len();
+        self.spans.extend(spans);
+        self.lines.push((area, start..self.spans.len()));
+    }
+}
+
+thread_local! {
+    static SLOTS: RefCell<Slots> = const {
+        RefCell::new(Slots {
+            spans: Vec::new(),
+            lines: Vec::new(),
+            segs: Vec::new(),
+        })
+    };
+}
+
+pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
+    // The header needs no background pass of its own: the frame's base layer
+    // is already the theme background.
+    let inner = area;
 
     let cpu_count = visible_cpu_count(app);
     let cols = calculate_meter_columns(inner.width, cpu_count);
@@ -303,18 +331,81 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     // left-to-right instead of all landing in the first filler-hosting column.
     let plan = filler_plan(app);
     let mut filler_cursor = 0usize;
-    for col_idx in 0..cols {
-        draw_meter_column(
-            frame,
-            app,
-            ratio_column_rect(inner, col_idx, cols),
-            col_idx,
-            cols,
-            meter_rows,
-            &plan,
-            &mut filler_cursor,
+    SLOTS.with(|slots| {
+        let slots = &mut *slots.borrow_mut();
+        for col_idx in 0..cols {
+            draw_meter_column(
+                slots,
+                app,
+                ratio_column_rect(inner, col_idx, cols),
+                col_idx,
+                cols,
+                meter_rows,
+                &plan,
+                &mut filler_cursor,
+            );
+        }
+        paint_slots(frame, inner, slots);
+    });
+}
+
+/// Paint the meter lines as one `paint_row` per screen row, so an unchanged
+/// header row is skipped as a whole, then empty the slots for the next frame.
+/// A one-line `Paragraph` renders nothing into an empty rect and only its
+/// first row otherwise; the extra rows of a taller slot stay blank.
+fn paint_slots(frame: &mut Frame, area: Rect, slots: &mut Slots) {
+    slots.lines.retain(|(rect, _)| !rect.is_empty());
+    // Positions are distinct, so an unstable sort gives the same order.
+    slots
+        .lines
+        .sort_unstable_by_key(|(rect, _)| (rect.y, rect.x));
+    let mut segs: Vec<RowSeg<'_>> = recycle_vec(std::mem::take(&mut slots.segs));
+    for row in slots.lines.chunk_by(|a, b| a.0.y == b.0.y) {
+        segs.clear();
+        segs.extend(row.iter().map(|(rect, range)| RowSeg {
+            x: rect.x,
+            width: rect.width,
+            style: Style::default(),
+            line_style: Style::default(),
+            spans: &slots.spans[range.clone()],
+        }));
+        frame.paint_row(
+            row[0].0.y,
+            &RowSpec {
+                x: area.x,
+                width: area.width,
+                base: Style::default(),
+                segs: &segs,
+            },
         );
     }
+    slots.segs = recycle_vec(segs);
+    slots.lines.clear();
+    recycle_spans(&mut slots.spans);
+}
+
+/// A pooled string holding `value` as `{:width$.1}` followed by `suffix`.
+fn tenths_text(value: f32, width: usize, suffix: &str) -> String {
+    let mut text = pooled_string();
+    push_tenths(&mut text, value, width);
+    text.push_str(suffix);
+    text
+}
+
+/// A pooled string holding `prefix`, `bytes` as `format_bytes` shows them,
+/// then `suffix`.
+fn bytes_text(prefix: &str, bytes: u64, suffix: &str) -> String {
+    let mut text = pooled_str(prefix);
+    push_bytes(&mut text, bytes);
+    text.push_str(suffix);
+    text
+}
+
+/// A pooled string holding `used/total` as `format_bytes` shows them.
+fn used_total_text(used: u64, total: u64) -> String {
+    let mut text = bytes_text("", used, "/");
+    push_bytes(&mut text, total);
+    text
 }
 
 /// Draw a single meter column of the header.
@@ -325,7 +416,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
 /// extras so its empty CPU slots are filled with Net / Dsk / Bat info.
 #[allow(clippy::too_many_arguments)] // layout params are all distinct concerns
 fn draw_meter_column(
-    frame: &mut Frame,
+    slots: &mut Slots,
     app: &mut App,
     area: Rect,
     col_idx: usize,
@@ -366,7 +457,7 @@ fn draw_meter_column(
                 height: row.height,
             });
             draw_cpu_bar(
-                frame,
+                slots,
                 app,
                 cpu_idx,
                 app.system_metrics.cpu.core_usage[cpu_idx],
@@ -377,9 +468,9 @@ fn draw_meter_column(
             //-off filler leaves the slot blank on purpose.
             if filler_plan[*filler_cursor] {
                 match *filler_cursor {
-                    0 => draw_network_info(frame, app, row),
-                    1 => draw_disk_info(frame, app, row),
-                    2 => draw_battery_info(frame, app, row),
+                    0 => draw_network_info(slots, app, row),
+                    1 => draw_disk_info(slots, app, row),
+                    2 => draw_battery_info(slots, app, row),
                     _ => {}
                 }
             }
@@ -437,7 +528,7 @@ fn draw_meter_column(
                     width: row.width,
                     height: row.height,
                 });
-                draw_memory_bar(frame, app, row);
+                draw_memory_bar(slots, app, row);
             }
             ExtraMeter::Swap => {
                 app.ui_bounds.add_region(UIRegion {
@@ -447,7 +538,7 @@ fn draw_meter_column(
                     width: row.width,
                     height: row.height,
                 });
-                draw_swap_bar(frame, app, row);
+                draw_swap_bar(slots, app, row);
             }
             ExtraMeter::Gpu => {
                 app.ui_bounds.add_region(UIRegion {
@@ -457,7 +548,7 @@ fn draw_meter_column(
                     width: row.width,
                     height: row.height,
                 });
-                draw_gpu_bar(frame, app, row);
+                draw_gpu_bar(slots, app, row);
             }
             ExtraMeter::Npu => {
                 app.ui_bounds.add_region(UIRegion {
@@ -467,10 +558,10 @@ fn draw_meter_column(
                     width: row.width,
                     height: row.height,
                 });
-                draw_npu_bar(frame, app, row);
+                draw_npu_bar(slots, app, row);
             }
-            ExtraMeter::Tasks => draw_tasks_info(frame, app, row),
-            ExtraMeter::Uptime => draw_uptime_info(frame, app, row),
+            ExtraMeter::Tasks => draw_tasks_info(slots, app, row),
+            ExtraMeter::Uptime => draw_uptime_info(slots, app, row),
         }
     }
 }
@@ -485,7 +576,7 @@ enum ExtraMeter {
     Uptime,
 }
 
-fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: Rect) {
+fn draw_cpu_bar(slots: &mut Slots, app: &App, cpu_idx: usize, usage: f32, area: Rect) {
     let mode = app.config.cpu_meter_mode;
 
     // Hidden mode: don't render anything
@@ -495,26 +586,26 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
 
     let usage_clamped = usage.clamp(0.0, 100.0);
     let theme = &app.theme;
-    let label = format!("{:>2}", cpu_idx);
+    let label_style = Style::default()
+        .fg(theme.meter_label)
+        .add_modifier(Modifier::BOLD);
 
-    let line = match mode {
+    match mode {
         MeterMode::Text => {
             // Text mode: just show "N: XX.X%"
-            Line::from(vec![
-                Span::styled(
-                    label,
-                    Style::default()
-                        .fg(theme.meter_label)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(": ", Style::default().fg(theme.text)),
-                Span::styled(
-                    format!("{}%", crate::numfmt::tenths_str(usage_clamped, 5)),
-                    Style::default()
-                        .fg(theme.cpu_color(usage_clamped))
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ])
+            slots.line(
+                area,
+                [
+                    Span::styled(pooled_fmt(format_args!("{:>2}", cpu_idx)), label_style),
+                    Span::styled(": ", Style::default().fg(theme.text)),
+                    Span::styled(
+                        tenths_text(usage_clamped, 5, "%"),
+                        Style::default()
+                            .fg(theme.cpu_color(usage_clamped))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ],
+            );
         }
         MeterMode::Graph => {
             // Graph mode: sparkline using history
@@ -522,37 +613,37 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
             let graph_width =
                 (area.width.saturating_sub(10) as usize).min(max_bar_width(area.width as usize)); // label + percent
 
-            let graph_str = if let Some(hist) = history {
-                render_sparkline(hist, graph_width)
-            } else {
-                bar_empty(graph_width).to_string()
+            let graph: Span<'static> = match history {
+                Some(hist) => Span::raw(sparkline_text(hist, graph_width)),
+                None => Span::raw(bar_empty(graph_width)),
             };
 
-            Line::from(vec![
-                Span::styled(
-                    format!("{}[", label),
-                    Style::default()
-                        .fg(theme.meter_label)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    graph_str,
-                    Style::default()
-                        .fg(theme.cpu_color(usage_clamped))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{}%]", crate::numfmt::tenths_str(usage_clamped, 5)),
-                    Style::default().fg(theme.text),
-                ),
-            ])
+            slots.line(
+                area,
+                [
+                    Span::styled(pooled_fmt(format_args!("{:>2}[", cpu_idx)), label_style),
+                    graph.style(
+                        Style::default()
+                            .fg(theme.cpu_color(usage_clamped))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        tenths_text(usage_clamped, 5, "%]"),
+                        Style::default().fg(theme.text),
+                    ),
+                ],
+            );
         }
         MeterMode::Bar | MeterMode::Hidden => {
             // Bar mode (default): multi-segment bar with user/system breakdown (htop style)
             // htop uses: nice(blue) + user(green) + system(red) + iowait(gray)
             let bar_width =
                 (area.width.saturating_sub(11) as usize).min(max_bar_width(area.width as usize));
-            let percent = format!("{}%]", crate::numfmt::tenths_str(usage_clamped, 5));
+            let label = Span::styled(pooled_fmt(format_args!("{:>2}[", cpu_idx)), label_style);
+            let percent = Span::styled(
+                tenths_text(usage_clamped, 5, "%]"),
+                Style::default().fg(theme.text),
+            );
 
             let breakdown = app.system_metrics.cpu.core_breakdown.get(cpu_idx).copied();
 
@@ -573,60 +664,55 @@ fn draw_cpu_bar(frame: &mut Frame, app: &App, cpu_idx: usize, usage: f32, area: 
                     .min(bar_width.saturating_sub(user_width + system_width));
                 let empty_width = bar_width.saturating_sub(user_width + system_width + other_width);
 
-                Line::from(vec![
-                    Span::styled(
-                        format!("{}[", label),
-                        Style::default()
-                            .fg(theme.meter_label)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    // User time - green (htop: CPU_NORMAL)
-                    Span::styled(bar_fill(user_width), Style::default().fg(theme.cpu_normal)),
-                    // System/kernel time - red (htop: CPU_SYSTEM)
-                    Span::styled(
-                        bar_fill(system_width),
-                        Style::default().fg(theme.cpu_system),
-                    ),
-                    // IO wait/other - gray (htop: CPU_IOWAIT)
-                    Span::styled(bar_fill(other_width), Style::default().fg(theme.cpu_iowait)),
-                    // Empty space
-                    Span::styled(
-                        bar_empty(empty_width),
-                        Style::default().fg(theme.meter_shadow),
-                    ),
-                    Span::styled(percent, Style::default().fg(theme.text)),
-                ])
+                slots.line(
+                    area,
+                    [
+                        label,
+                        // User time - green (htop: CPU_NORMAL)
+                        Span::styled(bar_fill(user_width), Style::default().fg(theme.cpu_normal)),
+                        // System/kernel time - red (htop: CPU_SYSTEM)
+                        Span::styled(
+                            bar_fill(system_width),
+                            Style::default().fg(theme.cpu_system),
+                        ),
+                        // IO wait/other - gray (htop: CPU_IOWAIT)
+                        Span::styled(bar_fill(other_width), Style::default().fg(theme.cpu_iowait)),
+                        // Empty space
+                        Span::styled(
+                            bar_empty(empty_width),
+                            Style::default().fg(theme.meter_shadow),
+                        ),
+                        percent,
+                    ],
+                );
             } else {
                 // Fallback: single color bar based on usage threshold
                 let bar_color = theme.cpu_color(usage_clamped);
                 let filled = ((usage_clamped as usize) * bar_width / 100).min(bar_width);
                 let empty = bar_width - filled;
 
-                Line::from(vec![
-                    Span::styled(
-                        format!("{}[", label),
-                        Style::default()
-                            .fg(theme.meter_label)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(bar_fill(filled), Style::default().fg(bar_color)),
-                    Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
-                    Span::styled(percent, Style::default().fg(theme.text)),
-                ])
+                slots.line(
+                    area,
+                    [
+                        label,
+                        Span::styled(bar_fill(filled), Style::default().fg(bar_color)),
+                        Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
+                        percent,
+                    ],
+                );
             }
         }
-    };
-
-    let paragraph = Paragraph::new(line);
-    frame.render_widget(paragraph, area);
+    }
 }
 
 /// Render a sparkline graph from history data - htop style
 /// Each character encodes TWO consecutive values (left and right halves)
 /// This doubles the effective horizontal resolution
-fn render_sparkline(history: &VecDeque<f32>, width: usize) -> String {
+fn sparkline_text(history: &VecDeque<f32>, width: usize) -> String {
+    let mut result = pooled_string();
     if history.is_empty() || width == 0 {
-        return bar_empty(width).to_string();
+        result.push_str(bar_empty(width));
+        return result;
     }
 
     // We need width*2 samples since each char shows 2 values
@@ -639,7 +725,7 @@ fn render_sparkline(history: &VecDeque<f32>, width: usize) -> String {
     let graph_chars = graph_chars.min(width);
     let padding_chars = width.saturating_sub(graph_chars);
 
-    let mut result = String::with_capacity(width * 3); // UTF-8 braille is 3 bytes
+    result.reserve(width * 3); // UTF-8 braille is 3 bytes
 
     // Pre-add padding spaces (O(n) instead of O(n²) from repeated insert(0))
     for _ in 0..padding_chars {
@@ -673,7 +759,7 @@ fn render_sparkline(history: &VecDeque<f32>, width: usize) -> String {
     result
 }
 
-fn draw_memory_bar(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_memory_bar(slots: &mut Slots, app: &App, area: Rect) {
     let mode = app.config.memory_meter_mode;
 
     if mode == MeterMode::Hidden {
@@ -683,56 +769,58 @@ fn draw_memory_bar(frame: &mut Frame, app: &App, area: Rect) {
     let mem = &app.system_metrics.memory;
     let usage = mem.used_percent.clamp(0.0, 100.0);
     let theme = &app.theme;
+    let label_style = Style::default()
+        .fg(theme.meter_label)
+        .add_modifier(Modifier::BOLD);
     // htop shows "used + shared + compressed" in the info text (line 53-57 of MemoryMeter.c)
     let total_used = mem.used + mem.shared + mem.buffers;
-    let mem_info = format!("{}/{}", format_bytes(total_used), format_bytes(mem.total));
+    let mut mem_info = used_total_text(total_used, mem.total);
+    let mem_info_len = mem_info.len();
 
-    let line = match mode {
+    match mode {
         MeterMode::Text => {
             // Text mode: just show "Mem: XX.X% (used/total)"
-            Line::from(vec![
-                Span::styled(
-                    "Mem: ",
-                    Style::default()
-                        .fg(theme.meter_label)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{}%", crate::numfmt::tenths_str(usage, 5)),
-                    Style::default()
-                        .fg(theme.memory_used)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!(" ({})", mem_info), Style::default().fg(theme.text)),
-            ])
+            mem_info.insert_str(0, " (");
+            mem_info.push(')');
+            slots.line(
+                area,
+                [
+                    Span::styled("Mem: ", label_style),
+                    Span::styled(
+                        tenths_text(usage, 5, "%"),
+                        Style::default()
+                            .fg(theme.memory_used)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(mem_info, Style::default().fg(theme.text)),
+                ],
+            );
         }
         MeterMode::Graph => {
             // Graph mode: sparkline using history
-            let graph_width = (area.width.saturating_sub(mem_info.len() as u16 + 6) as usize)
+            let graph_width = (area.width.saturating_sub(mem_info_len as u16 + 6) as usize)
                 .min(max_bar_width(area.width as usize));
-            let graph_str = render_sparkline(&app.mem_history, graph_width);
+            mem_info.push(']');
 
-            Line::from(vec![
-                Span::styled(
-                    "Mem[",
-                    Style::default()
-                        .fg(theme.meter_label)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    graph_str,
-                    Style::default()
-                        .fg(theme.memory_used)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("{}]", mem_info), Style::default().fg(theme.text)),
-            ])
+            slots.line(
+                area,
+                [
+                    Span::styled("Mem[", label_style),
+                    Span::styled(
+                        sparkline_text(&app.mem_history, graph_width),
+                        Style::default()
+                            .fg(theme.memory_used)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(mem_info, Style::default().fg(theme.text)),
+                ],
+            );
         }
         MeterMode::Bar | MeterMode::Hidden => {
             // Bar mode (default): multi-segment bar matching htop exactly
             // htop order: used (green) + shared (magenta) + buffers (blue) + cache (yellow)
             // See htop MemoryMeter.c: MemoryMeter_attributes[]
-            let info_len = mem_info.len() + 1;
+            let info_len = mem_info_len + 1;
             let bar_width = (area.width.saturating_sub(4 + info_len as u16) as usize)
                 .min(max_bar_width(area.width as usize));
 
@@ -769,48 +857,44 @@ fn draw_memory_bar(frame: &mut Frame, app: &App, area: Rect) {
                 .min(bar_width.saturating_sub(used_width + shared_width + buffers_width));
             let empty_width =
                 bar_width.saturating_sub(used_width + shared_width + buffers_width + cached_width);
+            mem_info.push(']');
 
-            Line::from(vec![
-                Span::styled(
-                    "Mem[",
-                    Style::default()
-                        .fg(theme.meter_label)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                // Used memory - green (htop: MEMORY_USED)
-                Span::styled(bar_fill(used_width), Style::default().fg(theme.memory_used)),
-                // Shared memory - magenta (htop: MEMORY_SHARED)
-                Span::styled(
-                    bar_fill(shared_width),
-                    Style::default().fg(theme.memory_shared),
-                ),
-                // Buffer cache - blue bold (htop: MEMORY_BUFFERS)
-                Span::styled(
-                    bar_fill(buffers_width),
-                    Style::default()
-                        .fg(theme.memory_buffers)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                // Page cache/standby - yellow (htop: MEMORY_CACHE)
-                Span::styled(
-                    bar_fill(cached_width),
-                    Style::default().fg(theme.memory_cache),
-                ),
-                // Empty/free space
-                Span::styled(
-                    bar_empty(empty_width),
-                    Style::default().fg(theme.meter_shadow),
-                ),
-                Span::styled(format!("{}]", mem_info), Style::default().fg(theme.text)),
-            ])
+            slots.line(
+                area,
+                [
+                    Span::styled("Mem[", label_style),
+                    // Used memory - green (htop: MEMORY_USED)
+                    Span::styled(bar_fill(used_width), Style::default().fg(theme.memory_used)),
+                    // Shared memory - magenta (htop: MEMORY_SHARED)
+                    Span::styled(
+                        bar_fill(shared_width),
+                        Style::default().fg(theme.memory_shared),
+                    ),
+                    // Buffer cache - blue bold (htop: MEMORY_BUFFERS)
+                    Span::styled(
+                        bar_fill(buffers_width),
+                        Style::default()
+                            .fg(theme.memory_buffers)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    // Page cache/standby - yellow (htop: MEMORY_CACHE)
+                    Span::styled(
+                        bar_fill(cached_width),
+                        Style::default().fg(theme.memory_cache),
+                    ),
+                    // Empty/free space
+                    Span::styled(
+                        bar_empty(empty_width),
+                        Style::default().fg(theme.meter_shadow),
+                    ),
+                    Span::styled(mem_info, Style::default().fg(theme.text)),
+                ],
+            );
         }
-    };
-
-    let paragraph = Paragraph::new(line);
-    frame.render_widget(paragraph, area);
+    }
 }
 
-fn draw_swap_bar(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_swap_bar(slots: &mut Slots, app: &App, area: Rect) {
     let mode = app.config.memory_meter_mode;
 
     if mode == MeterMode::Hidden {
@@ -820,54 +904,52 @@ fn draw_swap_bar(frame: &mut Frame, app: &App, area: Rect) {
     let mem = &app.system_metrics.memory;
     let usage = mem.swap_percent.clamp(0.0, 100.0);
     let theme = &app.theme;
+    let label_style = Style::default()
+        .fg(theme.meter_label)
+        .add_modifier(Modifier::BOLD);
 
     // htop format: "Swp[||||...    X.XXG/X.XXG]"
-    let swap_info = format!(
-        "{}/{}",
-        format_bytes(mem.swap_used),
-        format_bytes(mem.swap_total)
-    );
+    let mut swap_info = used_total_text(mem.swap_used, mem.swap_total);
+    let swap_info_len = swap_info.len();
 
-    let line = match mode {
+    match mode {
         MeterMode::Text => {
             // Text mode: just show "Swp: XX.X% (used/total)"
-            Line::from(vec![
-                Span::styled(
-                    "Swp: ",
-                    Style::default()
-                        .fg(theme.meter_label)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{}%", crate::numfmt::tenths_str(usage, 5)),
-                    Style::default().fg(theme.swap).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!(" ({})", swap_info), Style::default().fg(theme.text)),
-            ])
+            swap_info.insert_str(0, " (");
+            swap_info.push(')');
+            slots.line(
+                area,
+                [
+                    Span::styled("Swp: ", label_style),
+                    Span::styled(
+                        tenths_text(usage, 5, "%"),
+                        Style::default().fg(theme.swap).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(swap_info, Style::default().fg(theme.text)),
+                ],
+            );
         }
         MeterMode::Graph => {
             // Graph mode: sparkline using history
-            let graph_width = (area.width.saturating_sub(swap_info.len() as u16 + 6) as usize)
+            let graph_width = (area.width.saturating_sub(swap_info_len as u16 + 6) as usize)
                 .min(max_bar_width(area.width as usize));
-            let graph_str = render_sparkline(&app.swap_history, graph_width);
+            swap_info.push(']');
 
-            Line::from(vec![
-                Span::styled(
-                    "Swp[",
-                    Style::default()
-                        .fg(theme.meter_label)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    graph_str,
-                    Style::default().fg(theme.swap).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("{}]", swap_info), Style::default().fg(theme.text)),
-            ])
+            slots.line(
+                area,
+                [
+                    Span::styled("Swp[", label_style),
+                    Span::styled(
+                        sparkline_text(&app.swap_history, graph_width),
+                        Style::default().fg(theme.swap).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(swap_info, Style::default().fg(theme.text)),
+                ],
+            );
         }
         MeterMode::Bar | MeterMode::Hidden => {
             // Bar mode (default)
-            let info_len = swap_info.len() + 1; // +1 for the closing bracket
+            let info_len = swap_info_len + 1; // +1 for the closing bracket
             let bar_width = (area.width.saturating_sub(4 + info_len as u16) as usize)
                 .min(max_bar_width(area.width as usize)); // 4 for "Swp["
             let filled = ((usage as usize) * bar_width / 100).min(bar_width);
@@ -875,23 +957,118 @@ fn draw_swap_bar(frame: &mut Frame, app: &App, area: Rect) {
 
             // Use theme color for swap bar (htop uses red for swap)
             let bar_color = theme.swap;
+            swap_info.push(']');
 
-            Line::from(vec![
-                Span::styled(
-                    "Swp[",
-                    Style::default()
-                        .fg(theme.meter_label)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(bar_fill(filled), Style::default().fg(bar_color)),
-                Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
-                Span::styled(format!("{}]", swap_info), Style::default().fg(theme.text)),
-            ])
+            slots.line(
+                area,
+                [
+                    Span::styled("Swp[", label_style),
+                    Span::styled(bar_fill(filled), Style::default().fg(bar_color)),
+                    Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
+                    Span::styled(swap_info, Style::default().fg(theme.text)),
+                ],
+            );
         }
+    }
+}
+
+/// Info text of a GPU/NPU meter: memory first, then the utilization % at the
+/// right edge so it lines up with the CPU meters ("Y.YG/Z.ZG X.X%", or
+/// "Y.YG X.X%" without a total).
+fn adapter_info_text(mem_used: u64, mem_total: u64, usage: f32) -> String {
+    let mut info = if mem_total > 0 {
+        used_total_text(mem_used, mem_total)
+    } else {
+        bytes_text("", mem_used, "")
+    };
+    info.push(' ');
+    push_tenths(&mut info, usage, 0);
+    info.push('%');
+    info
+}
+
+/// GPU and NPU meters: `label` is "GPU" or "NPU".
+#[allow(clippy::too_many_arguments)] // one meter's label, readings and history
+fn draw_adapter_bar(
+    slots: &mut Slots,
+    app: &App,
+    area: Rect,
+    mode: MeterMode,
+    label: &'static str,
+    usage: f32,
+    (mem_used, mem_total): (u64, u64),
+    history: &VecDeque<f32>,
+) {
+    let theme = &app.theme;
+    let label_style = Style::default()
+        .fg(theme.meter_label)
+        .add_modifier(Modifier::BOLD);
+    // "GPU: " / "GPU[" without formatting: both labels are three ASCII letters.
+    let (text_label, bar_label) = match label {
+        "NPU" => ("NPU: ", "NPU["),
+        _ => ("GPU: ", "GPU["),
     };
 
-    let paragraph = Paragraph::new(line);
-    frame.render_widget(paragraph, area);
+    match mode {
+        MeterMode::Text => slots.line(
+            area,
+            [
+                Span::styled(text_label, label_style),
+                Span::styled(
+                    tenths_text(usage, 5, "%"),
+                    Style::default()
+                        .fg(theme.cpu_color(usage))
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    bytes_text(" (", mem_used, ")"),
+                    Style::default().fg(theme.text),
+                ),
+            ],
+        ),
+        MeterMode::Graph => {
+            let mut info = adapter_info_text(mem_used, mem_total, usage);
+            let graph_width = (area.width.saturating_sub(info.len() as u16 + 6) as usize)
+                .min(max_bar_width(area.width as usize));
+            info.push(']');
+
+            slots.line(
+                area,
+                [
+                    Span::styled(bar_label, label_style),
+                    Span::styled(
+                        sparkline_text(history, graph_width),
+                        Style::default()
+                            .fg(theme.cpu_color(usage))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(info, Style::default().fg(theme.text)),
+                ],
+            );
+        }
+        MeterMode::Bar | MeterMode::Hidden => {
+            let mut info = adapter_info_text(mem_used, mem_total, usage);
+            let info_len = info.len() + 1; // +1 for the closing bracket
+            let bar_width = (area.width.saturating_sub(4 + info_len as u16) as usize)
+                .min(max_bar_width(area.width as usize)); // 4 for "GPU["
+            let filled = ((usage as usize) * bar_width / 100).min(bar_width);
+            let empty = bar_width - filled;
+            info.push(']');
+
+            slots.line(
+                area,
+                [
+                    Span::styled(bar_label, label_style),
+                    Span::styled(
+                        bar_fill(filled),
+                        Style::default().fg(theme.cpu_color(usage)),
+                    ),
+                    Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
+                    Span::styled(info, Style::default().fg(theme.text)),
+                ],
+            );
+        }
+    }
 }
 
 /// GPU utilization meter (Task Manager parity). The bar fill is utilization;
@@ -899,7 +1076,7 @@ fn draw_swap_bar(frame: &mut Frame, app: &App, area: Rect) {
 /// an aperture commit limit (~half of system RAM) would dwarf the dedicated
 /// pool and mislead — falling back to dedicated+shared for iGPUs. Only drawn
 /// when a GPU exists (see `gpu_meter_visible`).
-fn draw_gpu_bar(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_gpu_bar(slots: &mut Slots, app: &App, area: Rect) {
     let mode = app.config.gpu_meter_mode;
 
     if mode == MeterMode::Hidden {
@@ -910,95 +1087,22 @@ fn draw_gpu_bar(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let usage = gpu.utilization.clamp(0.0, 100.0);
-    let theme = &app.theme;
-
-    let (mem_used, mem_total) = gpu.meter_memory();
-
-    // htop-style format: "GPU[|||||      Y.YG/Z.ZG X.X%]" — memory first, then the
-    // utilization % at the right edge so it lines up with the CPU meters.
-    let gpu_info = if mem_total > 0 {
-        format!(
-            "{}/{} {}%",
-            format_bytes(mem_used),
-            format_bytes(mem_total),
-            crate::numfmt::tenths_str(usage, 0)
-        )
-    } else {
-        format!("{} {}%", format_bytes(mem_used), crate::numfmt::tenths_str(usage, 0))
-    };
-
-    let line = match mode {
-        MeterMode::Text => Line::from(vec![
-            Span::styled(
-                "GPU: ",
-                Style::default()
-                    .fg(theme.meter_label)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{}%", crate::numfmt::tenths_str(usage, 5)),
-                Style::default()
-                    .fg(theme.cpu_color(usage))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" ({})", format_bytes(mem_used)),
-                Style::default().fg(theme.text),
-            ),
-        ]),
-        MeterMode::Graph => {
-            let graph_width = (area.width.saturating_sub(gpu_info.len() as u16 + 6) as usize)
-                .min(max_bar_width(area.width as usize));
-            let graph_str = render_sparkline(&app.gpu_history, graph_width);
-
-            Line::from(vec![
-                Span::styled(
-                    "GPU[",
-                    Style::default()
-                        .fg(theme.meter_label)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    graph_str,
-                    Style::default()
-                        .fg(theme.cpu_color(usage))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("{}]", gpu_info), Style::default().fg(theme.text)),
-            ])
-        }
-        MeterMode::Bar | MeterMode::Hidden => {
-            let info_len = gpu_info.len() + 1; // +1 for the closing bracket
-            let bar_width = (area.width.saturating_sub(4 + info_len as u16) as usize)
-                .min(max_bar_width(area.width as usize)); // 4 for "GPU["
-            let filled = ((usage as usize) * bar_width / 100).min(bar_width);
-            let empty = bar_width - filled;
-
-            Line::from(vec![
-                Span::styled(
-                    "GPU[",
-                    Style::default()
-                        .fg(theme.meter_label)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    bar_fill(filled),
-                    Style::default().fg(theme.cpu_color(usage)),
-                ),
-                Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
-                Span::styled(format!("{}]", gpu_info), Style::default().fg(theme.text)),
-            ])
-        }
-    };
-
-    let paragraph = Paragraph::new(line);
-    frame.render_widget(paragraph, area);
+    draw_adapter_bar(
+        slots,
+        app,
+        area,
+        mode,
+        "GPU",
+        usage,
+        gpu.meter_memory(),
+        &app.gpu_history,
+    );
 }
 
 /// NPU utilization meter (Task Manager parity). The bar fill is utilization;
 /// the info text shows NPU memory in use (and total when the driver reports
 /// a commit limit). Only drawn when an NPU exists (see `npu_meter_visible`).
-fn draw_npu_bar(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_npu_bar(slots: &mut Slots, app: &App, area: Rect) {
     let mode = app.config.npu_meter_mode;
 
     if mode == MeterMode::Hidden {
@@ -1009,143 +1113,72 @@ fn draw_npu_bar(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let usage = npu.utilization.clamp(0.0, 100.0);
-    let theme = &app.theme;
-
-    let (mem_used, mem_total) = npu.meter_memory();
-
-    // htop-style format: "NPU[|||||      Y.YG/Z.ZG X.X%]" — memory first, then the
-    // utilization % at the right edge so it lines up with the CPU meters.
-    let npu_info = if mem_total > 0 {
-        format!(
-            "{}/{} {}%",
-            format_bytes(mem_used),
-            format_bytes(mem_total),
-            crate::numfmt::tenths_str(usage, 0)
-        )
-    } else {
-        format!("{} {}%", format_bytes(mem_used), crate::numfmt::tenths_str(usage, 0))
-    };
-
-    let line = match mode {
-        MeterMode::Text => Line::from(vec![
-            Span::styled(
-                "NPU: ",
-                Style::default()
-                    .fg(theme.meter_label)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{}%", crate::numfmt::tenths_str(usage, 5)),
-                Style::default()
-                    .fg(theme.cpu_color(usage))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" ({})", format_bytes(mem_used)),
-                Style::default().fg(theme.text),
-            ),
-        ]),
-        MeterMode::Graph => {
-            let graph_width = (area.width.saturating_sub(npu_info.len() as u16 + 6) as usize)
-                .min(max_bar_width(area.width as usize));
-            let graph_str = render_sparkline(&app.npu_history, graph_width);
-
-            Line::from(vec![
-                Span::styled(
-                    "NPU[",
-                    Style::default()
-                        .fg(theme.meter_label)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    graph_str,
-                    Style::default()
-                        .fg(theme.cpu_color(usage))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("{}]", npu_info), Style::default().fg(theme.text)),
-            ])
-        }
-        MeterMode::Bar | MeterMode::Hidden => {
-            let info_len = npu_info.len() + 1; // +1 for the closing bracket
-            let bar_width = (area.width.saturating_sub(4 + info_len as u16) as usize)
-                .min(max_bar_width(area.width as usize)); // 4 for "NPU["
-            let filled = ((usage as usize) * bar_width / 100).min(bar_width);
-            let empty = bar_width - filled;
-
-            Line::from(vec![
-                Span::styled(
-                    "NPU[",
-                    Style::default()
-                        .fg(theme.meter_label)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    bar_fill(filled),
-                    Style::default().fg(theme.cpu_color(usage)),
-                ),
-                Span::styled(bar_empty(empty), Style::default().fg(theme.meter_shadow)),
-                Span::styled(format!("{}]", npu_info), Style::default().fg(theme.text)),
-            ])
-        }
-    };
-
-    let paragraph = Paragraph::new(line);
-    frame.render_widget(paragraph, area);
+    draw_adapter_bar(
+        slots,
+        app,
+        area,
+        mode,
+        "NPU",
+        usage,
+        npu.meter_memory(),
+        &app.npu_history,
+    );
 }
 
-fn draw_tasks_info(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_tasks_info(slots: &mut Slots, app: &App, area: Rect) {
     let metrics = &app.system_metrics;
     let theme = &app.theme;
+    let value_style = Style::default()
+        .fg(theme.meter_value)
+        .add_modifier(Modifier::BOLD);
 
     // Windows' native process list does not expose htop-style running/sleeping
     // process state, so do not fabricate a "K running" value.
     // Thread total is already summed once per refresh in SystemMetrics; reuse it
     // instead of re-summing every process on every frame.
-    let line = Line::from(vec![
-        Span::styled(
-            "Tasks: ",
-            Style::default()
-                .fg(theme.meter_label)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{}", metrics.tasks_total),
-            Style::default()
-                .fg(theme.meter_value)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(", ", Style::default().fg(theme.text)),
-        Span::styled(
-            format!("{}", metrics.threads_total),
-            Style::default()
-                .fg(theme.meter_value)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" thr", Style::default().fg(theme.text)),
-    ]);
-
-    let paragraph = Paragraph::new(line);
-    frame.render_widget(paragraph, area);
+    slots.line(
+        area,
+        [
+            Span::styled(
+                "Tasks: ",
+                Style::default()
+                    .fg(theme.meter_label)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                pooled_fmt(format_args!("{}", metrics.tasks_total)),
+                value_style,
+            ),
+            Span::styled(", ", Style::default().fg(theme.text)),
+            Span::styled(
+                pooled_fmt(format_args!("{}", metrics.threads_total)),
+                value_style,
+            ),
+            Span::styled(" thr", Style::default().fg(theme.text)),
+        ],
+    );
 }
 
-fn draw_uptime_info(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_uptime_info(slots: &mut Slots, app: &App, area: Rect) {
     let uptime = app.system_metrics.uptime;
     let theme = &app.theme;
     let days = uptime / 86400;
     let hours = (uptime % 86400) / 3600;
     let mins = (uptime % 3600) / 60;
     let secs = uptime % 60;
+    let label_style = Style::default()
+        .fg(theme.meter_label)
+        .add_modifier(Modifier::BOLD);
 
     // htop format: "Uptime: D day(s), HH:MM:SS"
     let uptime_str = if days > 0 {
         let day_word = if days == 1 { "day" } else { "days" };
-        format!(
+        pooled_fmt(format_args!(
             "{} {}, {:02}:{:02}:{:02}",
             days, day_word, hours, mins, secs
-        )
+        ))
     } else {
-        format!("{:02}:{:02}:{:02}", hours, mins, secs)
+        pooled_fmt(format_args!("{:02}:{:02}:{:02}", hours, mins, secs))
     };
 
     // Calculate overall CPU percentage
@@ -1156,125 +1189,96 @@ fn draw_uptime_info(frame: &mut Frame, app: &App, area: Rect) {
         core_usage.iter().sum::<f32>() / core_usage.len() as f32
     };
 
-    let line = Line::from(vec![
-        Span::styled(
-            "CPU: ",
-            Style::default()
-                .fg(theme.meter_label)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("{}%", crate::numfmt::tenths_str(cpu_percent, 5)),
-            Style::default()
-                .fg(theme.cpu_color(cpu_percent))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            "Uptime: ",
-            Style::default()
-                .fg(theme.meter_label)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            uptime_str,
-            Style::default()
-                .fg(theme.uptime)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-
-    let paragraph = Paragraph::new(line);
-    frame.render_widget(paragraph, area);
+    slots.line(
+        area,
+        [
+            Span::styled("CPU: ", label_style),
+            Span::styled(
+                tenths_text(cpu_percent, 5, "%"),
+                Style::default()
+                    .fg(theme.cpu_color(cpu_percent))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled("Uptime: ", label_style),
+            Span::styled(
+                uptime_str,
+                Style::default()
+                    .fg(theme.uptime)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ],
+    );
 }
 
-fn draw_network_info(frame: &mut Frame, app: &App, area: Rect) {
+/// "Net[" / "Dsk[" style rate meter: two labelled `bytes/s` readings.
+fn draw_rate_pair(
+    slots: &mut Slots,
+    app: &App,
+    area: Rect,
+    label: &'static str,
+    first: (&'static str, crate::terminal::Color, u64),
+    second: (&'static str, crate::terminal::Color, u64),
+) {
+    let theme = &app.theme;
+    let label_style = Style::default()
+        .fg(theme.meter_label)
+        .add_modifier(Modifier::BOLD);
+    let value_style = Style::default()
+        .fg(theme.meter_value)
+        .add_modifier(Modifier::BOLD);
+    slots.line(
+        area,
+        [
+            Span::styled(label, label_style),
+            Span::styled(first.0, Style::default().fg(first.1)),
+            Span::styled(bytes_text("", first.2, "/s "), value_style),
+            Span::styled(second.0, Style::default().fg(second.1)),
+            Span::styled(bytes_text("", second.2, "/s"), value_style),
+            Span::styled("]", label_style),
+        ],
+    );
+}
+
+fn draw_network_info(slots: &mut Slots, app: &App, area: Rect) {
     let metrics = &app.system_metrics;
     let theme = &app.theme;
 
-    let rx_rate = format_bytes(metrics.net_rx_rate);
-    let tx_rate = format_bytes(metrics.net_tx_rate);
-
-    // htop style: use meter colors for I/O
-    let line = Line::from(vec![
-        Span::styled(
-            "Net[",
-            Style::default()
-                .fg(theme.meter_label)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("↓", Style::default().fg(theme.meter_value_ok)), // Green for download
-        Span::styled(
-            format!("{}/s ", rx_rate),
-            Style::default()
-                .fg(theme.meter_value)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("↑", Style::default().fg(theme.meter_value_warn)), // Yellow for upload
-        Span::styled(
-            format!("{}/s", tx_rate),
-            Style::default()
-                .fg(theme.meter_value)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "]",
-            Style::default()
-                .fg(theme.meter_label)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-
-    let paragraph = Paragraph::new(line);
-    frame.render_widget(paragraph, area);
+    // htop style: use meter colors for I/O. Green for download, yellow for
+    // upload.
+    draw_rate_pair(
+        slots,
+        app,
+        area,
+        "Net[",
+        ("↓", theme.meter_value_ok, metrics.net_rx_rate),
+        ("↑", theme.meter_value_warn, metrics.net_tx_rate),
+    );
 }
 
-fn draw_disk_info(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_disk_info(slots: &mut Slots, app: &App, area: Rect) {
     let metrics = &app.system_metrics;
     let theme = &app.theme;
-
-    let read_rate = format_bytes(metrics.disk_read_rate);
-    let write_rate = format_bytes(metrics.disk_write_rate);
 
     // htop style: use meter I/O read (green) and write (blue) colors
-    let line = Line::from(vec![
-        Span::styled(
-            "Dsk[",
-            Style::default()
-                .fg(theme.meter_label)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("R:", Style::default().fg(theme.meter_value_ok)), // Green for read
-        Span::styled(
-            format!("{}/s ", read_rate),
-            Style::default()
-                .fg(theme.meter_value)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("W:", Style::default().fg(theme.memory_buffers)), // Blue for write
-        Span::styled(
-            format!("{}/s", write_rate),
-            Style::default()
-                .fg(theme.meter_value)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            "]",
-            Style::default()
-                .fg(theme.meter_label)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]);
-
-    let paragraph = Paragraph::new(line);
-    frame.render_widget(paragraph, area);
+    draw_rate_pair(
+        slots,
+        app,
+        area,
+        "Dsk[",
+        ("R:", theme.meter_value_ok, metrics.disk_read_rate),
+        ("W:", theme.memory_buffers, metrics.disk_write_rate),
+    );
 }
 
-fn draw_battery_info(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_battery_info(slots: &mut Slots, app: &App, area: Rect) {
     let metrics = &app.system_metrics;
     let theme = &app.theme;
+    let label_style = Style::default()
+        .fg(theme.meter_label)
+        .add_modifier(Modifier::BOLD);
 
-    let line = if let Some(percent) = metrics.battery_percent {
+    if let Some(percent) = metrics.battery_percent {
         let status = if metrics.battery_charging { "+" } else { "-" };
         let color = if percent > 50.0 {
             theme.meter_value_ok // Green
@@ -1283,49 +1287,40 @@ fn draw_battery_info(frame: &mut Frame, app: &App, area: Rect) {
         } else {
             theme.meter_value_error // Red
         };
+        let mut value = pooled_string();
+        push_round0(&mut value, percent);
+        value.push('%');
 
-        Line::from(vec![
-            Span::styled(
-                "Bat[",
-                Style::default()
-                    .fg(theme.meter_label)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                status,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!("{}%", crate::numfmt::round0_str(percent)),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "]",
-                Style::default()
-                    .fg(theme.meter_label)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])
+        slots.line(
+            area,
+            [
+                Span::styled("Bat[", label_style),
+                Span::styled(
+                    status,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    value,
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("]", label_style),
+            ],
+        );
     } else {
         // No battery detected, show hostname instead (htop style)
-        Line::from(vec![
-            Span::styled(
-                "Host: ",
-                Style::default()
-                    .fg(theme.meter_label)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                metrics.hostname.clone(),
-                Style::default()
-                    .fg(theme.hostname)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])
-    };
-
-    let paragraph = Paragraph::new(line);
-    frame.render_widget(paragraph, area);
+        slots.line(
+            area,
+            [
+                Span::styled("Host: ", label_style),
+                Span::styled(
+                    pooled_str(&metrics.hostname),
+                    Style::default()
+                        .fg(theme.hostname)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ],
+        );
+    }
 }
 
 #[cfg(test)]

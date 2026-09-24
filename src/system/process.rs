@@ -560,13 +560,165 @@ pub fn enrich_processes(processes: &mut [ProcessInfo], fetch_exe_path: bool) {
     );
 }
 
+/// Whether a cached efficiency-mode reading is still within its TTL.
+#[cfg(windows)]
+fn cached_efficiency_fresh(
+    entry: Option<&super::cache::ProcessCacheEntry>,
+    now: std::time::Instant,
+) -> bool {
+    entry
+        .and_then(|e| e.efficiency_updated)
+        .is_some_and(|updated| {
+            now.saturating_duration_since(updated).as_millis()
+                < super::cache::config::EFFICIENCY_TTL_MS
+        })
+}
+
+/// Whether a recent failed query still suppresses retries for this process.
+#[cfg(windows)]
+fn cached_query_suppressed(
+    entry: Option<&super::cache::ProcessCacheEntry>,
+    now: std::time::Instant,
+) -> bool {
+    entry.and_then(|e| e.query_failed_at).is_some_and(|at| {
+        now.saturating_duration_since(at).as_millis() < super::cache::config::QUERY_FAILURE_TTL_MS
+    })
+}
+
+/// Facts a metadata pass must query for one process: all false when the
+/// cache already answers what `requirements` ask for, or a recent failure
+/// suppresses retries.
+#[cfg(windows)]
+#[derive(Clone, Copy, Default)]
+struct QueryNeeds {
+    arch: bool,
+    elevation: bool,
+    user: bool,
+    efficiency: bool,
+    exe_path: bool,
+}
+
+#[cfg(windows)]
+impl QueryNeeds {
+    fn of(
+        entry: Option<&super::cache::ProcessCacheEntry>,
+        requirements: ProcessEnrichmentRequirements,
+        now: std::time::Instant,
+    ) -> Self {
+        if cached_query_suppressed(entry, now) {
+            return Self::default();
+        }
+        Self {
+            arch: requirements.arch && entry.and_then(|e| e.arch).is_none(),
+            elevation: requirements.elevation && entry.and_then(|e| e.is_elevated).is_none(),
+            user: requirements.user && entry.is_none_or(|e| e.user.is_none()),
+            efficiency: requirements.efficiency && !cached_efficiency_fresh(entry, now),
+            exe_path: requirements.exe_path
+                && entry
+                    .and_then(|e| e.exe_path.as_deref())
+                    .is_none_or(str::is_empty),
+        }
+    }
+
+    fn any(self) -> bool {
+        self.arch || self.elevation || self.user || self.efficiency || self.exe_path
+    }
+}
+
+/// Which of `rows` (indices into `processes`) a metadata pass still has to
+/// query. The System Idle and System pseudo-processes never do: hydration
+/// applies their fixed facts (see [`hydrate_one`]).
+#[cfg(windows)]
+fn rows_needing_query(
+    processes: &[ProcessInfo],
+    rows: impl Iterator<Item = usize>,
+    requirements: ProcessEnrichmentRequirements,
+) -> Vec<usize> {
+    let now = std::time::Instant::now();
+    super::cache::CACHE.with_read(|cache| {
+        rows.filter_map(|index| {
+            let process = processes.get(index)?;
+            if process.pid == 0 || process.pid == 4 {
+                return None;
+            }
+            let entry = cache
+                .get(&process.pid)
+                .filter(|entry| entry.create_time == process.create_time_100ns);
+            QueryNeeds::of(entry, requirements, now)
+                .any()
+                .then_some(index)
+        })
+        .collect()
+    })
+}
+
+/// The cheap half of [`enrich_processes_at`]: apply cached facts to `rows`
+/// (indices into `processes`) and report whether any of them still needs a
+/// Windows query. Lets the UI draw with what the cache knows and run the
+/// queries after the frame is out.
+#[cfg(windows)]
+pub fn apply_cached_metadata(
+    processes: &mut [ProcessInfo],
+    rows: &[usize],
+    requirements: ProcessEnrichmentRequirements,
+) -> bool {
+    let now = std::time::Instant::now();
+    super::cache::CACHE.with_read(|cache| {
+        for &index in rows {
+            if let Some(process) = processes.get_mut(index) {
+                hydrate_one(cache, process, now);
+            }
+        }
+    });
+    !rows_needing_query(processes, rows.iter().copied(), requirements).is_empty()
+}
+
+/// [`enrich_processes_for`] over `rows` (indices into `processes`): apply
+/// cached facts and query what the cache lacks.
+#[cfg(windows)]
+pub fn enrich_processes_at(
+    processes: &mut [ProcessInfo],
+    rows: &[usize],
+    requirements: ProcessEnrichmentRequirements,
+) {
+    apply_cached_metadata(processes, rows, requirements);
+    for index in rows_needing_query(processes, rows.iter().copied(), requirements) {
+        query_process_metadata(&mut processes[index..=index], requirements);
+    }
+}
+
 /// Enrich only metadata explicitly required by a canonical filter or sort.
+///
+/// Almost every call finds every needed fact cached already: the collector
+/// hydrates each snapshot, and earlier passes cached what they queried. So
+/// the cache is applied to all rows (a read-locked lookup each) and the
+/// query pass, with its per-row state, handle opens and cache write lock,
+/// runs only for rows that still need a Windows query.
 #[cfg(windows)]
 pub fn enrich_processes_for(
     processes: &mut [ProcessInfo],
     requirements: ProcessEnrichmentRequirements,
 ) {
-    use super::cache::{CACHE, config};
+    hydrate_processes_from_cache(processes);
+    let needing = rows_needing_query(processes, 0..processes.len(), requirements);
+    if needing.len() * 2 >= processes.len() && !needing.is_empty() {
+        // Mostly uncached (first display, first filter): one batched pass.
+        query_process_metadata(processes, requirements);
+    } else {
+        for index in needing {
+            query_process_metadata(&mut processes[index..=index], requirements);
+        }
+    }
+}
+
+/// The query pass behind [`enrich_processes_for`]: opens each process that
+/// needs a fact the cache lacks, queries it, and caches the results.
+#[cfg(windows)]
+fn query_process_metadata(
+    processes: &mut [ProcessInfo],
+    requirements: ProcessEnrichmentRequirements,
+) {
+    use super::cache::CACHE;
     use windows::Win32::System::SystemInformation::IMAGE_FILE_MACHINE;
 
     // Extract only the cached facts the pass reads, under a short read lock,
@@ -581,7 +733,7 @@ pub fn enrich_processes_for(
         user: Option<Arc<str>>,
         efficiency_mode: Option<bool>,
         efficiency_valid: bool,
-        query_suppressed: bool,
+        needs: QueryNeeds,
     }
     let now = std::time::Instant::now();
     let cache_facts: Vec<CachedFacts> = CACHE.with_read(|cache| {
@@ -591,13 +743,7 @@ pub fn enrich_processes_for(
                 let entry = cache
                     .get(&process.pid)
                     .filter(|entry| entry.create_time == process.create_time_100ns);
-                let efficiency_valid = entry
-                    .and_then(|e| e.efficiency_updated)
-                    .map(|updated| {
-                        now.saturating_duration_since(updated).as_millis()
-                            < config::EFFICIENCY_TTL_MS
-                    })
-                    .unwrap_or(false);
+                let efficiency_valid = cached_efficiency_fresh(entry, now);
                 CachedFacts {
                     elevation: entry.and_then(|e| e.is_elevated),
                     arch: entry.and_then(|e| e.arch),
@@ -609,13 +755,7 @@ pub fn enrich_processes_for(
                         None
                     },
                     efficiency_valid,
-                    query_suppressed: entry
-                        .and_then(|e| e.query_failed_at)
-                        .map(|at| {
-                            now.saturating_duration_since(at).as_millis()
-                                < config::QUERY_FAILURE_TTL_MS
-                        })
-                        .unwrap_or(false),
+                    needs: QueryNeeds::of(entry, requirements, now),
                 }
             })
             .collect()
@@ -661,24 +801,17 @@ pub fn enrich_processes_for(
             } else {
                 None
             };
-            let query_suppressed = facts.query_suppressed;
-
-            // Determine what we need to query
-            let need_arch = requirements.arch && cached_arch.is_none() && !query_suppressed;
-            let need_elevation =
-                requirements.elevation && cached_elevation.is_none() && !query_suppressed;
-            let need_user = requirements.user && cached_user.is_none() && !query_suppressed;
-            let need_efficiency = requirements.efficiency && !efficiency_valid && !query_suppressed;
-            let need_exe_path = requirements.exe_path
-                && cached_exe_path
-                    .as_ref()
-                    .map(|p| p.is_empty())
-                    .unwrap_or(true)
-                && !query_suppressed;
+            // Determine what we need to query (shared with rows_needing_query)
+            let QueryNeeds {
+                arch: need_arch,
+                elevation: need_elevation,
+                user: need_user,
+                efficiency: need_efficiency,
+                exe_path: need_exe_path,
+            } = facts.needs;
 
             // Skip OpenProcess entirely if we have all cached data and don't need times
-            let need_handle =
-                need_arch || need_elevation || need_user || need_efficiency || need_exe_path;
+            let need_handle = facts.needs.any();
 
             let handle = if need_handle {
                 open_verified_process(identity, PROCESS_QUERY_LIMITED_INFORMATION).ok()
@@ -1004,49 +1137,88 @@ pub fn enrich_processes_for(
 /// that warrants active enrichment.
 #[cfg(windows)]
 pub fn hydrate_processes_from_cache(processes: &mut [ProcessInfo]) {
-    use super::cache::{CACHE, config};
-
     let now = std::time::Instant::now();
-    CACHE.with_read(|cache| {
+    super::cache::CACHE.with_read(|cache| {
         for process in processes {
-            let Some(entry) = cache.get(&process.pid) else {
-                continue;
-            };
-            if entry.create_time == 0 || entry.create_time != process.create_time_100ns {
-                continue;
-            }
-
-            if let Some(user) = entry.user.as_ref()
-                && *user != process.user
-            {
-                process.user = user.clone();
-                process.user_lower = user.to_lowercase().into();
-            }
-            if let Some(is_elevated) = entry.is_elevated {
-                process.is_elevated = is_elevated;
-            }
-            if let Some(arch) = entry.arch {
-                process.arch = arch;
-            }
-            if let (Some(mode), Some(updated)) = (entry.efficiency_mode, entry.efficiency_updated)
-                && now.saturating_duration_since(updated).as_millis() < config::EFFICIENCY_TTL_MS
-            {
-                process.efficiency_mode = mode;
-            }
-            if let Some(path) = entry.exe_path.as_deref().filter(|path| !path.is_empty())
-                && path != &*process.exe_path
-            {
-                let path: Arc<str> = Arc::from(path);
-                process.command_lower = path.to_lowercase().into();
-                process.exe_path = path.clone();
-                process.command = path;
-            }
+            hydrate_one(cache, process, now);
         }
     });
 }
 
+/// Apply one process's cached facts (see [`hydrate_processes_from_cache`]).
+/// The System Idle (0) and System (4) pseudo-processes get the fixed facts a
+/// query pass would report; they are never cached (the scan keeps no entry
+/// for PID 0, so a cached copy could never match its create time).
+#[cfg(windows)]
+fn hydrate_one(
+    cache: &HashMap<u32, super::cache::ProcessCacheEntry>,
+    process: &mut ProcessInfo,
+    now: std::time::Instant,
+) {
+    if process.pid == 0 || process.pid == 4 {
+        if &*process.user != SYSTEM_STR {
+            process.user = Arc::from(SYSTEM_STR);
+            process.user_lower = SYSTEM_STR.to_lowercase().into();
+        }
+        process.is_elevated = process.pid == 4;
+        process.arch = ProcessArch::Native;
+        process.efficiency_mode = false;
+        return;
+    }
+    let Some(entry) = cache.get(&process.pid) else {
+        return;
+    };
+    if entry.create_time == 0 || entry.create_time != process.create_time_100ns {
+        return;
+    }
+
+    if let Some(user) = entry.user.as_ref()
+        && *user != process.user
+    {
+        process.user = user.clone();
+        process.user_lower = user.to_lowercase().into();
+    }
+    if let Some(is_elevated) = entry.is_elevated {
+        process.is_elevated = is_elevated;
+    }
+    if let Some(arch) = entry.arch {
+        process.arch = arch;
+    }
+    if let (Some(mode), Some(updated)) = (entry.efficiency_mode, entry.efficiency_updated)
+        && now.saturating_duration_since(updated).as_millis()
+            < super::cache::config::EFFICIENCY_TTL_MS
+    {
+        process.efficiency_mode = mode;
+    }
+    if let Some(path) = entry.exe_path.as_deref().filter(|path| !path.is_empty())
+        && path != &*process.exe_path
+    {
+        let path: Arc<str> = Arc::from(path);
+        process.command_lower = path.to_lowercase().into();
+        process.exe_path = path.clone();
+        process.command = path;
+    }
+}
+
 #[cfg(not(windows))]
 pub fn hydrate_processes_from_cache(_processes: &mut [ProcessInfo]) {}
+
+#[cfg(not(windows))]
+pub fn apply_cached_metadata(
+    _processes: &mut [ProcessInfo],
+    _rows: &[usize],
+    _requirements: ProcessEnrichmentRequirements,
+) -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub fn enrich_processes_at(
+    _processes: &mut [ProcessInfo],
+    _rows: &[usize],
+    _requirements: ProcessEnrichmentRequirements,
+) {
+}
 
 #[cfg(not(windows))]
 pub fn enrich_processes(_processes: &mut [ProcessInfo], _fetch_exe_path: bool) {
@@ -1111,11 +1283,7 @@ pub struct ProcessInfo {
     /// Cumulative CPU time in 100 ns ticks (was a 16 B `Duration`; the ticks
     /// are the native unit the collector already hands us).
     pub cpu_time: u64,
-    pub tree_depth: u16,
-    pub tree_prefix: String, // Tree display prefix (├─, └─, │, etc.)
     // New fields for extended features
-    pub has_children: bool,     // Has child processes (for tree view)
-    pub is_collapsed: bool,     // Is collapsed in tree view
     pub thread_count: u32,      // Number of threads
     pub start_time: u32,        // Process start time (Unix timestamp; good to 2106)
     pub create_time_100ns: u64, // Raw Windows FILETIME process creation timestamp
@@ -1132,8 +1300,6 @@ pub struct ProcessInfo {
     pub name_lower: Arc<str>,
     pub command_lower: Arc<str>,
     pub user_lower: Arc<str>,
-    // Pre-computed search match flag (set during filtering, used in rendering)
-    pub matches_search: bool,
     // Windows 11 Efficiency Mode (EcoQoS)
     pub efficiency_mode: bool,
     // Running as administrator
@@ -1154,6 +1320,13 @@ impl ProcessInfo {
             pid: self.pid,
             create_time_100ns: self.create_time_100ns,
         }
+    }
+
+    /// The status letter (`'R'`, `'S'`, `'?'`, …). `status` stores its ASCII
+    /// code; format this, not the raw byte, which prints as a number.
+    #[inline]
+    pub fn status_char(&self) -> char {
+        char::from(self.status)
     }
 
     /// Format CPU time as HH:MM:SS or MM:SS.ms
@@ -1306,10 +1479,6 @@ impl ProcessInfo {
                 .saturating_sub(proc.private_working_set()),
             priority: proc.base_priority(),
             cpu_time,
-            tree_depth: 0,
-            tree_prefix: String::new(),
-            has_children: false,
-            is_collapsed: false,
             thread_count: proc.thread_count(),
             start_time,
             create_time_100ns,
@@ -1325,7 +1494,6 @@ impl ProcessInfo {
             name_lower,
             command_lower,
             user_lower,
-            matches_search: false,
             efficiency_mode,
             is_elevated,
             arch,
@@ -1586,10 +1754,9 @@ mod size_tests {
     #[test]
     fn process_info_stays_at_shrunk_size() {
         // Round 3 shrank this from 296 B (Duration cpu_time, usize
-        // tree_depth, u64 start_time, char status → 280). Reaching 272 would
-        // additionally require packing the 7 bools + status + arch into one
-        // flag byte, which costs accessor churn across every consumer for 8
-        // bytes per slot (~22 KB total) — declined.
-        assert_eq!(std::mem::size_of::<ProcessInfo>(), 280);
+        // tree_depth, u64 start_time, char status → 280). Moving the list
+        // view's tree layout and search flag to `app::DisplayRow` took it
+        // to 248.
+        assert_eq!(std::mem::size_of::<ProcessInfo>(), 248);
     }
 }

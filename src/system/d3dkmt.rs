@@ -178,13 +178,17 @@ const FAILURE_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// Whether any adapter is currently tracked. The UI uses this to keep the
 /// GPU/NPU collection gates open while adapters exist even when their meters
 /// are hidden (so presence is already known when a meter is re-enabled).
+///
+/// Lock-free: the UI thread asks on every event-loop iteration, while
+/// `refresh` holds `ADAPTER_STATE` across all its statistics syscalls
+/// (issue #101).
 pub fn has_tracked_adapters() -> bool {
-    ADAPTER_STATE
-        .lock()
-        .unwrap()
-        .as_ref()
-        .is_some_and(|state| !state.adapters.is_empty())
+    ADAPTERS_PRESENT.load(Ordering::Relaxed)
 }
+
+/// Mirror of `!ADAPTER_STATE.adapters.is_empty()`, updated whenever
+/// (re-)detection replaces the tracked adapter set.
+static ADAPTERS_PRESENT: AtomicBool = AtomicBool::new(false);
 
 static ADAPTER_STATE: Mutex<Option<AdapterState>> = Mutex::new(None);
 
@@ -643,6 +647,7 @@ pub fn refresh() -> AdapterSnapshot {
             }
         }
         state.adapters = adapters;
+        ADAPTERS_PRESENT.store(!state.adapters.is_empty(), Ordering::Relaxed);
         state.enumerated_luids = luids;
         state.pending_luids = pending;
         state.detected = true;

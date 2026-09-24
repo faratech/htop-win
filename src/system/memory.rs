@@ -281,19 +281,29 @@ impl MemoryInfo {
 
 /// Format bytes into human-readable string
 pub fn format_bytes(bytes: u64) -> String {
-    use crate::numfmt::{scaled_bytes, scaled_bytes_round0};
+    let mut text = String::new();
+    push_bytes(&mut text, bytes);
+    text
+}
+
+/// [`format_bytes`] appended to `buf` (render paths write into pooled strings).
+pub fn push_bytes(buf: &mut String, bytes: u64) {
+    use crate::numfmt::{push_scaled_bytes, scaled_round0};
+    use std::fmt::Write as _;
 
     // Byte formatters use integer math (crate::numfmt) so the frame path
     // never touches core::fmt's float machinery. Exponent = log2 of the unit.
     if bytes >= (1u64 << 40) {
-        format!("{}T", scaled_bytes(bytes, 40))
+        push_scaled_bytes(buf, bytes, 40);
+        buf.push('T');
     } else if bytes >= (1u64 << 30) {
-        format!("{}G", scaled_bytes(bytes, 30))
+        push_scaled_bytes(buf, bytes, 30);
+        buf.push('G');
     } else if bytes >= (1u64 << 20) {
-        format!("{}M", scaled_bytes_round0(bytes, 20))
+        let _ = write!(buf, "{}M", scaled_round0(bytes, 20));
     } else if bytes >= (1u64 << 10) {
-        format!("{}K", scaled_bytes_round0(bytes, 10))
+        let _ = write!(buf, "{}K", scaled_round0(bytes, 10));
     } else {
-        format!("{bytes}B")
+        let _ = write!(buf, "{bytes}B");
     }
 }

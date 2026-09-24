@@ -1,4 +1,4 @@
-use crate::terminal::{Frame, Line, Modifier, Paragraph, Rect, Span, Style};
+use crate::terminal::{Frame, Line, Modifier, Rect, Span, Style};
 
 use crate::app::{App, DialogState, FocusRegion};
 
@@ -92,16 +92,14 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let line = Line::from(spans);
-    let paragraph = Paragraph::new(line).style(Style::default().bg(theme.background));
-    frame.render_widget(paragraph, area);
+    let background = Style::default().bg(theme.background);
+    frame.paint_line(area, &line, background);
 
     // Second line: filter/search status
     if area.height > 1 {
         let status_area = Rect::new(area.x, area.y + 1, area.width, 1);
-        let status_spans = build_status_line(app);
-        let status_line = Line::from(status_spans);
-        let status_para = Paragraph::new(status_line).style(Style::default().bg(theme.background));
-        frame.render_widget(status_para, status_area);
+        let status_line = Line::from(build_status_line(app));
+        frame.paint_line(status_area, &status_line, background);
     }
 }
 

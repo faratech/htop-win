@@ -62,11 +62,16 @@ pub(crate) fn tenths_str(value: impl Into<f64>, width: usize) -> String {
 
 /// [`tenths_str`] writing into a caller-owned (pooled) string.
 pub(crate) fn tenths_into(buf: &mut String, value: impl Into<f64>, width: usize) {
+    buf.clear();
+    push_tenths(buf, value, width);
+}
+
+/// [`tenths_str`] appended to `buf`.
+pub(crate) fn push_tenths(buf: &mut String, value: impl Into<f64>, width: usize) {
     let value = value.into();
-    debug_assert!(value >= 0.0 && value.is_finite(), "tenths_into: {value}");
+    debug_assert!(value >= 0.0 && value.is_finite(), "push_tenths: {value}");
     let tenths = exact_scaled(value, 10);
     let whole = tenths / 10;
-    buf.clear();
     let digits_len = usize::from(whole == 0) + if whole == 0 {
         0
     } else {
@@ -80,16 +85,26 @@ pub(crate) fn tenths_into(buf: &mut String, value: impl Into<f64>, width: usize)
     let _ = write!(buf, "{whole}.{}", tenths % 10);
 }
 
-/// `format!("{:.0}", value)` for finite `value >= 0`, via integer math.
+/// `format!("{:.0}", value)` for finite `value >= 0`, via integer math
+/// (the reference `push_round0` is tested against).
+#[cfg(test)]
 pub(crate) fn round0_str(value: impl Into<f64>) -> String {
     let value = value.into();
     debug_assert!(value >= 0.0 && value.is_finite(), "round0_str: {value}");
     format!("{}", exact_scaled(value, 1))
 }
 
+/// [`round0_str`] appended to `buf`.
+pub(crate) fn push_round0(buf: &mut String, value: impl Into<f64>) {
+    let value = value.into();
+    debug_assert!(value >= 0.0 && value.is_finite(), "push_round0: {value}");
+    use std::fmt::Write as _;
+    let _ = write!(buf, "{}", exact_scaled(value, 1));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{exact_scaled, round0_str, tenths_str};
+    use super::{exact_scaled, push_round0, push_tenths, round0_str, tenths_str};
 
     #[test]
     fn tenths_matches_format_at_boundaries() {
@@ -167,6 +182,20 @@ mod tests {
     }
 
     #[test]
+    fn push_variants_append_the_same_text() {
+        for value in [0.0f64, 0.05, 0.25, 12.5, 99.95, 100.0, 1234.5] {
+            for width in [0usize, 5, 8] {
+                let mut buf = String::from("x[");
+                push_tenths(&mut buf, value, width);
+                assert_eq!(buf, format!("x[{}", tenths_str(value, width)));
+            }
+            let mut buf = String::from("y");
+            push_round0(&mut buf, value);
+            assert_eq!(buf, format!("y{}", round0_str(value)));
+        }
+    }
+
+    #[test]
     fn exact_scaled_handles_dyadic_ties() {
         // 0.25 → tenths 2.5 → ties to even → 2 ("0.2")
         assert_eq!(exact_scaled(0.25, 10), 2);
@@ -184,8 +213,13 @@ pub(crate) fn scaled_bytes(bytes: u64, divisor_pow2: u32) -> String {
 
 /// [`scaled_bytes`] writing into a caller-owned (pooled) string.
 pub(crate) fn scaled_bytes_into(buf: &mut String, bytes: u64, divisor_pow2: u32) {
-    let tenths = round_half_even_div(u128::from(bytes) * 10, divisor_pow2);
     buf.clear();
+    push_scaled_bytes(buf, bytes, divisor_pow2);
+}
+
+/// [`scaled_bytes`] appended to `buf`.
+pub(crate) fn push_scaled_bytes(buf: &mut String, bytes: u64, divisor_pow2: u32) {
+    let tenths = round_half_even_div(u128::from(bytes) * 10, divisor_pow2);
     use std::fmt::Write as _;
     let _ = write!(buf, "{}.{}", tenths / 10, tenths % 10);
 }
@@ -193,7 +227,12 @@ pub(crate) fn scaled_bytes_into(buf: &mut String, bytes: u64, divisor_pow2: u32)
 /// `(bytes / 2^divisor_pow2)` rounded to an integer — matches
 /// `format!("{:.0}", bytes as f64 / 2^d)`.
 pub(crate) fn scaled_bytes_round0(bytes: u64, divisor_pow2: u32) -> String {
-    format!("{}", round_half_even_div(u128::from(bytes), divisor_pow2))
+    format!("{}", scaled_round0(bytes, divisor_pow2))
+}
+
+/// The integer [`scaled_bytes_round0`] formats.
+pub(crate) fn scaled_round0(bytes: u64, divisor_pow2: u32) -> u128 {
+    round_half_even_div(u128::from(bytes), divisor_pow2)
 }
 
 #[cfg(test)]
