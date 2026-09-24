@@ -626,8 +626,8 @@ impl QueryNeeds {
 }
 
 /// Which of `rows` (indices into `processes`) a metadata pass still has to
-/// query. The System Idle and System pseudo-processes never do: hydration
-/// applies their fixed facts (see [`hydrate_one`]).
+/// query. The System Idle and System pseudo-processes never do: the process
+/// scan gives them their fixed facts (see `ProcessInfo::from_raw`).
 #[cfg(windows)]
 fn rows_needing_query(
     processes: &[ProcessInfo],
@@ -1146,25 +1146,14 @@ pub fn hydrate_processes_from_cache(processes: &mut [ProcessInfo]) {
 }
 
 /// Apply one process's cached facts (see [`hydrate_processes_from_cache`]).
-/// The System Idle (0) and System (4) pseudo-processes get the fixed facts a
-/// query pass would report; they are never cached (the scan keeps no entry
-/// for PID 0, so a cached copy could never match its create time).
+/// Inlined: the collector runs it for every process on every tick.
 #[cfg(windows)]
+#[inline(always)]
 fn hydrate_one(
     cache: &HashMap<u32, super::cache::ProcessCacheEntry>,
     process: &mut ProcessInfo,
     now: std::time::Instant,
 ) {
-    if process.pid == 0 || process.pid == 4 {
-        if &*process.user != SYSTEM_STR {
-            process.user = Arc::from(SYSTEM_STR);
-            process.user_lower = SYSTEM_STR.to_lowercase().into();
-        }
-        process.is_elevated = process.pid == 4;
-        process.arch = ProcessArch::Native;
-        process.efficiency_mode = false;
-        return;
-    }
     let Some(entry) = cache.get(&process.pid) else {
         return;
     };
@@ -1398,7 +1387,11 @@ impl ProcessInfo {
                     .get(&pid)
                     .filter(|entry| entry.create_time == create_time_100ns);
 
-                let is_elevated = cached_entry.and_then(|e| e.is_elevated).unwrap_or(false);
+                // System Idle (0) and System (4) are pseudo-processes with
+                // fixed facts (SYSTEM, native, System elevated), set here once
+                // per process: the scan keeps no cache entry for PID 0, and
+                // metadata queries skip both (`rows_needing_query`).
+                let is_elevated = cached_entry.and_then(|e| e.is_elevated).unwrap_or(pid == 4);
                 let arch = cached_entry
                     .and_then(|e| e.arch)
                     .unwrap_or(ProcessArch::Native);
