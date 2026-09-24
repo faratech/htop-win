@@ -119,6 +119,9 @@ then `frame.finish_base()`. Everything drawn after that (dialogs, error banner) 
   (`SnapshotReceiver::notify_on_publish`), or at the housekeeping timeout. Snapshot pickup is ~15-25 µs.
 - The collector wakes early (`DataCollector::wake`) when the UI changes refresh rate, pause state or
   the metadata it needs.
+- Timed waits that pace work use `event_wait::DeadlineWait` (a high-resolution waitable timer).
+  Never use a `Condvar` or millisecond timeout for them: on Windows those round up to the
+  ~15.6 ms timer tick, so every collection would start late.
 - Visible-row metadata: `enrich_viewport()` applies cached facts before the draw.
   `run_deferred_enrichment()` runs the Windows queries after the frame is out and requests a redraw.
 

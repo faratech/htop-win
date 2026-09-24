@@ -39,7 +39,7 @@ mod imp {
     use super::{Wake, timeout_millis};
     use std::io;
     use std::sync::Arc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use windows::Win32::Foundation::{
         CloseHandle, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
@@ -47,8 +47,11 @@ mod imp {
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
-    use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
-    use windows::core::w;
+    use windows::Win32::System::Threading::{
+        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateEventW, CreateWaitableTimerExW, INFINITE,
+        SetEvent, SetWaitableTimer, TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject,
+    };
+    use windows::core::{PCWSTR, w};
 
     /// Kernel handle closed on drop.
     struct OwnedHandle(HANDLE);
@@ -139,6 +142,68 @@ mod imp {
             }
         }
     }
+
+    /// Blocks until a deadline or an earlier `raise`, whichever comes first.
+    /// The deadline is a high-resolution waitable timer: condition-variable
+    /// and millisecond timeouts round up to the ~15.6 ms system timer tick,
+    /// which would start each timed step up to a tick late.
+    pub struct DeadlineWait {
+        /// Auto-reset: one early wake per raise, consumed by the wait.
+        raised: OwnedHandle,
+        timer: OwnedHandle,
+    }
+
+    impl DeadlineWait {
+        pub fn new() -> io::Result<Self> {
+            let raised = unsafe { CreateEventW(None, false, false, None) }
+                .map_err(|error| io::Error::other(format!("CreateEventW failed: {error}")))?;
+            let raised = OwnedHandle(raised);
+            // High resolution needs Windows 10 1803+; before that the plain
+            // timer has tick granularity, like any sleep there.
+            let timer = unsafe {
+                CreateWaitableTimerExW(
+                    None,
+                    PCWSTR::null(),
+                    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                    TIMER_ALL_ACCESS.0,
+                )
+            }
+            .or_else(|_| unsafe {
+                CreateWaitableTimerExW(None, PCWSTR::null(), 0, TIMER_ALL_ACCESS.0)
+            })
+            .map_err(|error| io::Error::other(format!("CreateWaitableTimerExW failed: {error}")))?;
+            Ok(Self {
+                raised,
+                timer: OwnedHandle(timer),
+            })
+        }
+
+        /// Cut the current (or next) wait short.
+        pub fn raise(&self) {
+            unsafe {
+                let _ = SetEvent(self.raised.0);
+            }
+        }
+
+        /// Block until `deadline` unless raised first. Returns true when
+        /// raised (the request is consumed).
+        pub fn wait_until(&self, deadline: Instant) -> bool {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return unsafe { WaitForSingleObject(self.raised.0, 0) } == WAIT_OBJECT_0;
+            }
+            // Relative due time: negative, in 100 ns units. Arming the timer
+            // also clears a signal left over from an earlier wait.
+            let due = -i64::try_from(left.as_nanos().div_ceil(100)).unwrap_or(i64::MAX);
+            let armed = unsafe { SetWaitableTimer(self.timer.0, &due, 0, None, None, false) };
+            if armed.is_err() {
+                let result = unsafe { WaitForSingleObject(self.raised.0, timeout_millis(left)) };
+                return result == WAIT_OBJECT_0;
+            }
+            let handles = [self.raised.0, self.timer.0];
+            unsafe { WaitForMultipleObjects(&handles, false, INFINITE) == WAIT_OBJECT_0 }
+        }
+    }
 }
 
 /// Non-Windows fallback (the crate targets Windows): plain crossterm polling,
@@ -156,6 +221,21 @@ mod imp {
 
     impl SnapshotSignal {
         pub fn raise(&self) {}
+    }
+
+    /// Unsupported off Windows: callers fall back to a condition variable.
+    pub struct DeadlineWait;
+
+    impl DeadlineWait {
+        pub fn new() -> io::Result<Self> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        pub fn raise(&self) {}
+
+        pub fn wait_until(&self, _deadline: std::time::Instant) -> bool {
+            false
+        }
     }
 
     impl EventWait {
@@ -177,7 +257,7 @@ mod imp {
     }
 }
 
-pub use imp::{EventWait, SnapshotSignal};
+pub use imp::{DeadlineWait, EventWait, SnapshotSignal};
 
 #[cfg(test)]
 mod tests {
@@ -206,6 +286,44 @@ mod tests {
             return None;
         }
         Some(waiter)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deadline_wait_is_precise_and_raise_cuts_it_short_once() {
+        let wait = DeadlineWait::new().unwrap();
+
+        // Precise: a coarse (timer-tick) wait is ~10 ms late on average here.
+        let mut late = Duration::ZERO;
+        for _ in 0..20 {
+            let deadline = std::time::Instant::now() + Duration::from_millis(20);
+            assert!(!wait.wait_until(deadline));
+            let now = std::time::Instant::now();
+            assert!(now >= deadline, "woke before the deadline");
+            late += now - deadline;
+        }
+        let average = late / 20;
+        eprintln!("deadline wait average lateness: {average:?}");
+        assert!(average < Duration::from_millis(6), "{average:?}");
+
+        // A pending raise returns at once and is consumed.
+        wait.raise();
+        let far = std::time::Instant::now() + Duration::from_secs(60);
+        assert!(wait.wait_until(far));
+        let soon = std::time::Instant::now() + Duration::from_millis(5);
+        assert!(!wait.wait_until(soon));
+
+        // A raise from another thread wakes a long wait promptly.
+        let wait = std::sync::Arc::new(wait);
+        let raiser = std::sync::Arc::clone(&wait);
+        let thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            raiser.raise();
+        });
+        let started = std::time::Instant::now();
+        assert!(wait.wait_until(started + Duration::from_secs(10)));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        thread.join().unwrap();
     }
 
     #[cfg(windows)]

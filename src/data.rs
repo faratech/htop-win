@@ -168,23 +168,49 @@ impl Drop for SnapshotReceiver {
     }
 }
 
-/// Early-wake request for the collector's inter-tick sleep.
-#[derive(Default)]
-struct CollectorWake {
-    pending: Mutex<bool>,
-    signal: Condvar,
+/// Early-wake request for the collector's inter-tick sleep. Prefers a
+/// high-resolution timer wait: a condition-variable timeout rounds up to the
+/// ~15.6 ms Windows timer tick, which started every collection up to a tick
+/// late (and capped short refresh intervals at ~64 Hz).
+enum CollectorWake {
+    Timer(crate::event_wait::DeadlineWait),
+    Condvar {
+        pending: Mutex<bool>,
+        signal: Condvar,
+    },
+}
+
+impl Default for CollectorWake {
+    fn default() -> Self {
+        match crate::event_wait::DeadlineWait::new() {
+            Ok(wait) => Self::Timer(wait),
+            Err(_) => Self::Condvar {
+                pending: Mutex::new(false),
+                signal: Condvar::new(),
+            },
+        }
+    }
 }
 
 impl CollectorWake {
     fn notify(&self) {
-        *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = true;
-        self.signal.notify_one();
+        match self {
+            Self::Timer(wait) => wait.raise(),
+            Self::Condvar { pending, signal } => {
+                *pending.lock().unwrap_or_else(PoisonError::into_inner) = true;
+                signal.notify_one();
+            }
+        }
     }
 
     /// Sleep until `deadline` unless woken first. Returns true when woken
     /// early (the request is consumed).
     fn wait_until(&self, deadline: Instant) -> bool {
-        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        let (pending, signal) = match self {
+            Self::Timer(wait) => return wait.wait_until(deadline),
+            Self::Condvar { pending, signal } => (pending, signal),
+        };
+        let mut pending = pending.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if std::mem::take(&mut *pending) {
                 return true;
@@ -195,8 +221,7 @@ impl CollectorWake {
             if left.is_zero() {
                 return false;
             }
-            pending = self
-                .signal
+            pending = signal
                 .wait_timeout(pending, left)
                 .unwrap_or_else(PoisonError::into_inner)
                 .0;
