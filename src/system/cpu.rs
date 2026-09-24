@@ -75,8 +75,11 @@ const LAYOUT_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 /// Cached processor topology shared by the per-tick CPU refresh and the CPU%
 /// capacity denominator so neither enumerates processor groups every tick.
 #[cfg(windows)]
-static LAYOUT_CACHE: std::sync::Mutex<Option<(Vec<(u16, u32)>, std::time::Instant)>> =
-    std::sync::Mutex::new(None);
+static LAYOUT_CACHE: std::sync::Mutex<Option<CachedLayout>> = std::sync::Mutex::new(None);
+
+/// The processor layout and when it was read.
+#[cfg(windows)]
+type CachedLayout = (Vec<(u16, u32)>, std::time::Instant);
 
 /// Runs `f` against the cached layout, refreshing it under the lock when the
 /// TTL has lapsed. Shared by the full-clone accessor and the clone-free len

@@ -407,10 +407,11 @@ thread_local! {
     static PID_INDEX_SCRATCH: std::cell::RefCell<HashMap<u32, usize>> =
         std::cell::RefCell::new(HashMap::new());
     /// Survivor-liveness flags, one per entry of the incoming process vec.
-    static ALIVE_SCRATCH: std::cell::RefCell<Vec<bool>> = std::cell::RefCell::new(Vec::new());
+    static ALIVE_SCRATCH: std::cell::RefCell<Vec<bool>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// Processes that appeared in this tick's raw list but not in the vec.
     static NEW_PROCESSES: std::cell::RefCell<Vec<ProcessInfo>> =
-        std::cell::RefCell::new(Vec::new());
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Which subsystems `SystemMetrics::refresh` collects this tick. Gates mirror
@@ -872,11 +873,16 @@ mod tests {
         use super::collect_gates;
         use super::set_collect_gates;
 
-        let mut metrics = SystemMetrics::default();
-        metrics.net_rx_bytes = 42;
-        metrics.net_tx_bytes = 43;
-        metrics.cpu.core_usage = vec![7.5];
-        metrics.battery_percent = Some(88.0);
+        let mut metrics = SystemMetrics {
+            net_rx_bytes: 42,
+            net_tx_bytes: 43,
+            cpu: super::CpuInfo {
+                core_usage: vec![7.5],
+                ..Default::default()
+            },
+            battery_percent: Some(88.0),
+            ..Default::default()
+        };
 
         // All gates off: refresh leaves every gated value untouched.
         set_collect_gates(0);

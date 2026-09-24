@@ -1340,10 +1340,11 @@ mod layout_equivalence_tests {
                     .direction(Direction::Horizontal)
                     .constraints(constraints)
                     .split(inner);
-                for col_idx in 0..cols {
+                assert_eq!(expected.len(), cols);
+                for (col_idx, expected) in expected.iter().enumerate() {
                     assert_eq!(
                         ratio_column_rect(inner, col_idx, cols),
-                        expected[col_idx],
+                        *expected,
                         "width={width} cols={cols} col={col_idx}"
                     );
                 }
@@ -1361,10 +1362,11 @@ mod layout_equivalence_tests {
                     .direction(Direction::Vertical)
                     .constraints(constraints)
                     .split(area);
-                for row_idx in 0..n {
+                assert_eq!(expected.len(), n);
+                for (row_idx, expected) in expected.iter().enumerate() {
                     assert_eq!(
                         length_row_rect(area, row_idx, n),
-                        expected[row_idx],
+                        *expected,
                         "height={height} n={n} row={row_idx}"
                     );
                 }

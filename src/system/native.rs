@@ -232,9 +232,13 @@ thread_local! {
     static PROCESS_RATES: std::cell::RefCell<ProcessRates> =
         std::cell::RefCell::new(ProcessRates::default());
     /// Per-tick cache-update tuples (48 B/process), capacity kept.
-    static CACHE_UPDATES: std::cell::RefCell<Vec<(u32, u64, u64, u64, u64, u64)>> =
-        std::cell::RefCell::new(Vec::new());
+    static CACHE_UPDATES: std::cell::RefCell<Vec<CacheUpdate>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
+
+/// (pid, kernel time, user time, create time, bytes read, bytes written),
+/// as `ProcessCache::update_times_batch_into` takes them.
+type CacheUpdate = (u32, u64, u64, u64, u64, u64);
 
 /// Runs `f` with the rate tables filled by the most recent
 /// [`calculate_process_rates`] call on this thread.

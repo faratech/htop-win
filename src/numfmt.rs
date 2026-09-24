@@ -160,7 +160,7 @@ mod tests {
 
     #[test]
     fn round0_matches_format_on_random_samples() {
-        let mut state = 0xDEADBEEF_CAFE_F00Du64;
+        let mut state = 0xDEAD_BEEF_CAFE_F00Du64;
         for _ in 0..40_000 {
             state ^= state << 13;
             state ^= state >> 7;
@@ -240,14 +240,12 @@ mod bytes_tests {
     use super::{scaled_bytes, scaled_bytes_round0};
 
     fn reference(bytes: u64, divisor_pow2: u32, decimals: usize) -> String {
-        let divisor = f64::from(1u32 << divisor_pow2.min(31) as u32);
-        // powers above 31 need f64 math; express divisor as f64 pow2
+        // Powers above 31 overflow a u32 shift, so the divisor is an f64 power of two.
         let divisor = f64::powi(2.0, divisor_pow2 as i32);
-        let _ = divisor; // silence unused when inlined below
         if decimals == 1 {
-            format!("{:.1}", bytes as f64 / f64::powi(2.0, divisor_pow2 as i32))
+            format!("{:.1}", bytes as f64 / divisor)
         } else {
-            format!("{:.0}", bytes as f64 / f64::powi(2.0, divisor_pow2 as i32))
+            format!("{:.0}", bytes as f64 / divisor)
         }
     }
 
