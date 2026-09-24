@@ -444,6 +444,29 @@ impl SystemMetrics {
     /// Refresh system metrics (CPU, memory, uptime, hostname, battery, network)
     /// Does NOT refresh processes - use get_processes_native() for that
     pub fn refresh(&mut self) {
+        self.refresh_with(true);
+    }
+
+    /// The first collection, for the first frame: everything except a CPU
+    /// counter sample. Setting the counters up costs hundreds of milliseconds
+    /// and their first sample reads zero anyway, so the CPU meters start at
+    /// zero exactly as before; call [`Self::prime_cpu`] once the snapshot is
+    /// published.
+    pub fn refresh_initial(&mut self) {
+        self.refresh_with(false);
+    }
+
+    /// Set up the CPU counters and take their priming sample (see
+    /// [`Self::refresh_initial`]), so the next refresh reports real rates.
+    /// Skipped while CPU collection is gated off; enabling it later primes on
+    /// that first refresh, as before.
+    pub fn prime_cpu(&self) {
+        if COLLECT_GATES.load(std::sync::atomic::Ordering::Relaxed) & collect_gates::CPU != 0 {
+            cpu::prime_counters();
+        }
+    }
+
+    fn refresh_with(&mut self, sample_cpu: bool) {
         // Gate transitions re-prime rate baselines so the first tick after a
         // subsystem is re-enabled reports a clean zero rate instead of a
         // gap-averaged value.
@@ -460,7 +483,11 @@ impl SystemMetrics {
         // Update CPU info using native API
         // In-place refresh keeps the per-core vecs' capacity across ticks.
         if gates & collect_gates::CPU != 0 {
-            self.cpu.refresh_in_place();
+            if sample_cpu {
+                self.cpu.refresh_in_place();
+            } else {
+                self.cpu.zero_fill();
+            }
         }
 
         // Update memory info using native API

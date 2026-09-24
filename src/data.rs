@@ -168,6 +168,11 @@ impl Drop for SnapshotReceiver {
     }
 }
 
+/// Delay before the collector's second sample (at most one refresh interval):
+/// rates need two samples, so this is how soon after startup CPU% shows real
+/// values. Long enough for stable readings.
+const EARLY_SECOND_SAMPLE_MS: u64 = 250;
+
 /// Early-wake request for the collector's inter-tick sleep. Prefers a
 /// high-resolution timer wait: a condition-variable timeout rounds up to the
 /// ~15.6 ms Windows timer tick, which started every collection up to a tick
@@ -324,20 +329,17 @@ impl DataCollector {
         let mut metrics = SystemMetrics::default();
         let mut processes = Vec::new();
 
-        // Initial refresh -- move the vec, no clone
+        // Initial refresh -- move the vec, no clone. It skips the CPU counter
+        // sample (see `SystemMetrics::refresh_initial`) so the first frame
+        // does not wait for the counters to be set up.
         let start = Instant::now();
-        metrics.refresh();
+        metrics.refresh_initial();
         metrics.update_processes_native(&mut processes);
         let enrichment = ProcessEnrichmentRequirements::from_bits(
             enrichment_requirements.load(Ordering::Acquire),
         );
         hydrate_or_enrich(&mut processes, enrichment);
 
-        // Fixed-schedule pacing: sleep until a deadline that advances by the
-        // tick rate, so the real period is exactly `rate` instead of
-        // `rate + collect time` (sleep-based pacing drifts by the work done).
-        let mut last_rate = tick_rate_ms.load(Ordering::Relaxed);
-        let mut next_tick = Instant::now() + Duration::from_millis(last_rate.max(1));
         if data_tx
             .publish(SystemSnapshot {
                 metrics: metrics.clone(),
@@ -351,6 +353,19 @@ impl DataCollector {
             return;
         }
         let mut published_enrichment = enrichment;
+
+        // With the first frame on its way, set up the CPU counters, then take
+        // the second sample early: CPU% (per core and per process) needs two
+        // samples, so real numbers show within a quarter second of the
+        // counters being ready instead of a full refresh interval later.
+        metrics.prime_cpu();
+
+        // Fixed-schedule pacing: sleep until a deadline that advances by the
+        // tick rate, so the real period is exactly `rate` instead of
+        // `rate + collect time` (sleep-based pacing drifts by the work done).
+        let mut last_rate = tick_rate_ms.load(Ordering::Relaxed);
+        let mut next_tick =
+            Instant::now() + Duration::from_millis(last_rate.clamp(1, EARLY_SECOND_SAMPLE_MS));
         // While paused, collection is skipped entirely; the first tick after
         // resume clears stale gap-averaged rates (see below).
         let mut was_paused = false;

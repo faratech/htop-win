@@ -47,6 +47,52 @@ impl CpuInfo {
     pub fn refresh_in_place(&mut self) {
         *self = Self::default();
     }
+
+    /// Zero readings for every logical processor: exactly what the counters'
+    /// first sample reports (rates need two samples), without setting the
+    /// counters up (see [`prime_counters`]).
+    #[cfg(windows)]
+    pub fn zero_fill(&mut self) {
+        zero_readings(
+            cached_processor_layout_len(),
+            &mut self.core_usage,
+            &mut self.core_breakdown,
+        );
+    }
+
+    #[cfg(not(windows))]
+    pub fn zero_fill(&mut self) {
+        *self = Self::default();
+    }
+}
+
+/// Set up the PDH counters and take their first (priming) sample, so the next
+/// [`CpuInfo::refresh_in_place`] reports real rates. Setup loads Windows'
+/// performance-counter machinery and costs hundreds of milliseconds, so the
+/// collector runs it after the first frame is published, not before it.
+#[cfg(windows)]
+pub(crate) fn prime_counters() {
+    let (mut usage, mut breakdowns) = (Vec::new(), Vec::new());
+    get_cpu_info_pdh_into(&mut usage, &mut breakdowns);
+}
+
+#[cfg(not(windows))]
+pub(crate) fn prime_counters() {}
+
+/// `cpu_count` zero-usage readings (breakdowns fully idle).
+#[cfg(windows)]
+fn zero_readings(cpu_count: usize, core_usage: &mut Vec<f32>, breakdowns: &mut Vec<CpuBreakdown>) {
+    core_usage.clear();
+    core_usage.resize(cpu_count, 0.0);
+    breakdowns.clear();
+    breakdowns.resize(
+        cpu_count,
+        CpuBreakdown {
+            user: 0.0,
+            system: 0.0,
+            idle: 100.0,
+        },
+    );
 }
 
 /// Re-prime flag for [`reset_first_sample`]: the PDH state lives inside
@@ -335,32 +381,12 @@ fn get_cpu_info_pdh_into(core_usage: &mut Vec<f32>, breakdowns: &mut Vec<CpuBrea
     if !state.first_sample_done {
         state.first_sample_done = true;
         // Zeros for the first sample
-        core_usage.clear();
-        core_usage.resize(cpu_count, 0.0);
-        breakdowns.clear();
-        breakdowns.resize(
-            cpu_count,
-            CpuBreakdown {
-                user: 0.0,
-                system: 0.0,
-                idle: 100.0,
-            },
-        );
+        zero_readings(cpu_count, core_usage, breakdowns);
         return;
     }
 
     // Get formatted counter values in place
-    core_usage.clear();
-    core_usage.resize(cpu_count, 0.0);
-    breakdowns.clear();
-    breakdowns.resize(
-        cpu_count,
-        CpuBreakdown {
-            user: 0.0,
-            system: 0.0,
-            idle: 100.0,
-        },
-    );
+    zero_readings(cpu_count, core_usage, breakdowns);
 
     for (idx, counters) in state.core_counters.iter().enumerate() {
         let user_pct = unsafe { get_counter_value(&counters.user) };

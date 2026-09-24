@@ -57,6 +57,8 @@ struct BenchmarkStats {
     frame_latencies: Vec<Duration>,
     /// Snapshots the collector replaced before the UI took them.
     superseded_snapshots: u64,
+    /// Process creation to the first frame drawn (loader startup included).
+    first_frame: Option<Duration>,
     total_start: Option<Instant>,
     process_cpu_start: Duration,
 }
@@ -210,6 +212,29 @@ fn get_process_cpu_time() -> Duration {
     }
 }
 
+/// Time since this process was created, loader and runtime startup included
+/// (the benchmark's launch-to-first-frame figure).
+#[cfg(windows)]
+fn since_process_start() -> Option<Duration> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+
+    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    let mut created = FILETIME::default();
+    let mut unused = [FILETIME::default(); 3];
+    let [exit, kernel, user] = &mut unused;
+    unsafe { GetProcessTimes(GetCurrentProcess(), &mut created, exit, kernel, user) }.ok()?;
+    let now = unsafe { GetSystemTimePreciseAsFileTime() };
+    let elapsed_100ns = ticks(now).checked_sub(ticks(created))?;
+    Some(Duration::from_nanos(elapsed_100ns.saturating_mul(100)))
+}
+
+#[cfg(not(windows))]
+fn since_process_start() -> Option<Duration> {
+    None
+}
+
 #[cfg(not(windows))]
 fn get_process_cpu_time() -> Duration {
     Duration::ZERO
@@ -263,6 +288,7 @@ impl BenchmarkStats {
             snapshot_lags: Vec::new(),
             frame_latencies: Vec::new(),
             superseded_snapshots: 0,
+            first_frame: None,
             total_start: Some(Instant::now()),
             process_cpu_start: get_process_cpu_time(),
         }
@@ -270,6 +296,12 @@ impl BenchmarkStats {
 
     fn record_refresh(&mut self, duration: Duration) {
         self.refresh_times.push(duration);
+    }
+
+    fn record_first_frame(&mut self) {
+        if self.first_frame.is_none() {
+            self.first_frame = since_process_start();
+        }
     }
 
     fn record_draw(&mut self, duration: Duration, frame: terminal::FrameStats) {
@@ -385,6 +417,15 @@ impl BenchmarkStats {
             println!(
                 "║   Dropped (superseded) snapshots: {:>6}                     ║",
                 self.superseded_snapshots
+            );
+        }
+
+        if let Some(first_frame) = self.first_frame {
+            println!("╠══════════════════════════════════════════════════════════════╣");
+            println!("║ STARTUP                                                      ║");
+            println!(
+                "║   First frame: {:>10} after launch                     ║",
+                bench_ms(first_frame)
             );
         }
 
@@ -669,8 +710,11 @@ fn run_tui_inner(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // Drain any pending input events to prevent stray keypresses on startup
-    while event::poll(Duration::from_millis(10))? {
+    // Drain input already pending at startup so it cannot act as stray
+    // keypresses. No timeout: a wait here would delay the first frame, and
+    // the key release of the Enter that launched us is ignored anyway (only
+    // presses are handled).
+    while event::poll(Duration::ZERO)? {
         let _ = event::read();
     }
 
@@ -812,6 +856,7 @@ fn run_app(
         let draw_start = Instant::now();
         terminal.draw(|f| ui::draw(f, app))?;
         if let Some(stats) = bench_stats.as_mut() {
+            stats.record_first_frame();
             stats.record_draw(draw_start.elapsed(), terminal.last_frame());
         }
         false

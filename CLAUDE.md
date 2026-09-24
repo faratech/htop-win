@@ -43,7 +43,7 @@ htop-win is a Windows htop clone with a custom TUI library. The codebase follows
 ### System Module (`system/`)
 
 - **`mod.rs`** - `SystemMetrics` struct aggregating all system data, refresh logic
-- **`cpu.rs`** - CPU per-core usage via direct Windows API (`NtQuerySystemInformation`)
+- **`cpu.rs`** - CPU per-core usage via PDH performance counters (`\Processor Information(group,n)`), covering every processor group
 - **`memory.rs`** - Memory/swap stats via Windows API, `format_bytes()` / `push_bytes()` helpers
 - **`cache.rs`** - Process data caching to reduce Windows API calls
 - **`process.rs`** - Process enumeration via `NtQuerySystemInformation`, Windows API calls for:
@@ -122,6 +122,11 @@ then `frame.finish_base()`. Everything drawn after that (dialogs, error banner) 
 - Timed waits that pace work use `event_wait::DeadlineWait` (a high-resolution waitable timer).
   Never use a `Condvar` or millisecond timeout for them: on Windows those round up to the
   ~15.6 ms timer tick, so every collection would start late.
+- Startup: the collector's first collection (`SystemMetrics::refresh_initial`) skips the CPU counter
+  sample. PDH setup costs ~300-400 ms and its first sample reads zero anyway. `prime_cpu()` runs
+  right after the first snapshot is published, and the second sample follows 250 ms later, so real CPU%
+  arrives ~0.8 s after launch. Keep slow one-time setup off the path to the first frame; `--benchmark` reports
+  "First frame … after launch".
 - Visible-row metadata: `enrich_viewport()` applies cached facts before the draw.
   `run_deferred_enrichment()` runs the Windows queries after the frame is out and requests a redraw.
 
