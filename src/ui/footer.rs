@@ -197,6 +197,19 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
             (None, "", ""),
         ],
+        DialogState::ConfirmReset => &[
+
+            (None, "Enter", "Reset"),
+            (None, "Esc", "Cancel"),
+            (None, "", ""),
+            (None, "", ""),
+            (None, "", ""),
+            (None, "", ""),
+            (None, "", ""),
+            (None, "", ""),
+            (None, "", ""),
+            (None, "", ""),
+        ],
         DialogState::Priority { .. } => &[
 
             (None, "↑/↓", "Select"),
@@ -349,8 +362,8 @@ fn build_status_line(app: &App) -> Vec<Span<'static>> {
         return spans; // Status message takes precedence
     }
 
-    // Show persistent update available indicator
-    if let Some((ref version, _)) = app.update_available {
+    // Show persistent update available indicator (if auto_update is enabled)
+    if app.config.auto_update && let Some((ref version, _)) = app.update_available {
         spans.push(Span::styled(
             format!("[Update v{} ready - restart to apply] ", version),
             Style::default()

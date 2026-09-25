@@ -3,7 +3,7 @@ use crate::terminal::{
     ScrollbarOrientation, ScrollbarState, Span, Style,
 };
 
-use crate::app::{App, DialogState, SetupItem, SortColumn};
+use crate::app::{App, DialogState, SetupEntry, SetupItem, SortColumn};
 use crate::system::format_bytes;
 use crate::ui::colors::ColorScheme;
 use crate::ui::{centered_rect, centered_rect_fixed};
@@ -297,6 +297,8 @@ pub fn draw_help(frame: &mut Frame, app: &mut App) {
         "  SEARCH & SORT",
         "  ─────────────────────────────────────────────────────────────",
         "    n                  Find next search match",
+        "    Shift+F3           Find previous search match",
+        "    Esc                Clear search highlight",
         "    N                  Sort by PID",
         "    P                  Sort by CPU%",
         "    M                  Sort by Memory%",
@@ -306,8 +308,11 @@ pub fn draw_help(frame: &mut Frame, app: &mut App) {
         "  ─────────────────────────────────────────────────────────────",
         "  PROCESS ACTIONS",
         "  ─────────────────────────────────────────────────────────────",
-        "    Enter              Show process details (PID, memory, I/O)",
-        "    e                  Environment inspection unavailable",
+        "    Enter              Show process details (PID, memory, I/O, GPU)",
+        "    e, E               Toggle Windows Efficiency Mode (EcoQoS)",
+        "    o, O               Open file location in Windows Explorer",
+        "    y                  Copy executable path to clipboard",
+        "    Y                  Copy PID to clipboard",
         "    w                  Wrap executable path",
         "    a                  Set CPU affinity",
         "    Z                  Pause/resume process list updates",
@@ -617,6 +622,47 @@ pub fn draw_kill_confirm(frame: &mut Frame, app: &mut App) {
     cache_dialog_geometry(app, area);
 }
 
+/// Draw reset settings confirmation dialog
+pub fn draw_confirm_reset(frame: &mut Frame, app: &mut App) {
+    let area = centered_rect_fixed(52, 8, frame.area());
+    let theme = &app.theme;
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "Reset all settings to default values?",
+            Style::default()
+                .fg(theme.failed_read)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "This will restore default colors, columns, and meters.",
+            Style::default().fg(theme.text_dim),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("[Y/Enter]", Style::default().fg(theme.meter_value_ok)),
+            Span::raw(" Yes, reset  "),
+            Span::styled("[N/Esc]", Style::default().fg(theme.failed_read)),
+            Span::raw(" Cancel"),
+        ]),
+    ];
+
+    let dialog = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .title(" Reset Settings ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(theme.failed_read))
+                .style(Style::default().bg(theme.background)),
+        )
+        .style(Style::default().fg(theme.text).bg(theme.background));
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(dialog, area);
+    cache_dialog_geometry(app, area);
+}
+
 /// Draw priority class dialog
 pub fn draw_priority(frame: &mut Frame, app: &mut App) {
     use crate::app::WindowsPriorityClass;
@@ -710,22 +756,38 @@ pub fn draw_setup(frame: &mut Frame, app: &mut App) {
     let theme = &app.theme;
     let area = centered_rect(60, 60, frame.area());
 
-    // Items and their order come from SetupItem::ALL — the same table the
-    // input handler dispatches on — so draw and input can't get out of sync.
-    let items: Vec<ListItem> = SetupItem::ALL
+    // Entries come from SetupEntry::ALL — headers and items in display order.
+    let items: Vec<ListItem> = SetupEntry::ALL
         .iter()
         .enumerate()
-        .map(|(idx, item)| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!(" {:<30} ", item.label()),
-                    item_style(idx == selected, theme),
-                ),
-                Span::styled(
-                    setup_item_value(*item, app),
-                    Style::default().fg(theme.meter_value_ok),
-                ),
-            ]))
+        .map(|(idx, entry)| match entry {
+            SetupEntry::Section(title) => {
+                let rule_len = 42usize.saturating_sub(title.len() + 4);
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("── {} ", title),
+                        Style::default()
+                            .fg(theme.meter_label)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "─".repeat(rule_len),
+                        Style::default().fg(theme.border),
+                    ),
+                ]))
+            }
+            SetupEntry::Item(item) => {
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("   {:<28} ", item.label()),
+                        item_style(idx == selected, theme),
+                    ),
+                    Span::styled(
+                        setup_item_value(*item, app),
+                        Style::default().fg(theme.meter_value_ok),
+                    ),
+                ]))
+            }
         })
         .collect();
 
@@ -743,6 +805,8 @@ pub fn draw_setup(frame: &mut Frame, app: &mut App) {
 fn setup_item_value(item: SetupItem, app: &App) -> String {
     match item {
         SetupItem::RefreshRate => format!("{} ms", app.config.refresh_rate_ms),
+        SetupItem::AutoUpdate => bool_to_str(app.config.auto_update),
+        SetupItem::MouseEnabled => bool_to_str(app.config.mouse_enabled),
         SetupItem::CpuMeterMode => meter_mode_str(app.config.cpu_meter_mode),
         SetupItem::MemoryMeterMode => meter_mode_str(app.config.memory_meter_mode),
         SetupItem::GpuMeterMode => meter_mode_str(app.config.gpu_meter_mode),
@@ -750,6 +814,7 @@ fn setup_item_value(item: SetupItem, app: &App) -> String {
         SetupItem::ShowKernelThreads => bool_to_str(app.config.show_kernel_threads),
         SetupItem::ShowUserThreads => bool_to_str(app.config.show_user_threads),
         SetupItem::ShowProgramPath => bool_to_str(app.config.show_program_path),
+        SetupItem::HighlightBasename => bool_to_str(app.config.highlight_basename),
         SetupItem::HighlightNewProcesses => bool_to_str(app.config.highlight_new_processes),
         SetupItem::HighlightLargeNumbers => bool_to_str(app.config.highlight_large_numbers),
         SetupItem::TreeView => bool_to_str(app.tree_view),
@@ -869,6 +934,15 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
              \n\
              ───────────────────────────────────────────────────────\n\
              \n\
+             GPU & ACCELERATORS\n\
+             \n\
+             GPU Usage       {}%\n\
+             GPU Memory      {}\n\
+             NPU Usage       {}%\n\
+             NPU Memory      {}\n\
+             \n\
+             ───────────────────────────────────────────────────────\n\
+             \n\
              PATHS\n\
              \n\
              Executable\n   {}\n\
@@ -897,6 +971,10 @@ pub fn draw_process_info(frame: &mut Frame, app: &mut App) {
             format_bytes(proc.io_write_rate),
             format_bytes(proc.io_read_bytes),
             format_bytes(proc.io_write_bytes),
+            crate::numfmt::tenths_str(proc.gpu_percent, 0),
+            format_bytes(proc.gpu_memory),
+            crate::numfmt::tenths_str(proc.npu_percent, 0),
+            format_bytes(proc.npu_memory),
             exe_display,
         )
     };

@@ -123,6 +123,10 @@ pub struct Config {
     // Confirmation dialogs
     /// Show confirmation dialog before killing processes
     pub confirm_kill: bool,
+
+    // Updates
+    /// Automatic background update checks and downloads
+    pub auto_update: bool,
 }
 
 impl Default for Config {
@@ -183,6 +187,7 @@ impl Default for Config {
             mouse_enabled: true,
             readonly: false,
             confirm_kill: true, // Show confirmation dialogs by default
+            auto_update: true,  // Automatically check for updates in background
         }
     }
 }
@@ -434,6 +439,7 @@ impl Config {
             mouse_enabled: get_bool("mouse_enabled", defaults.mouse_enabled),
             readonly: get_bool("readonly", defaults.readonly),
             confirm_kill: get_bool("confirm_kill", defaults.confirm_kill),
+            auto_update: get_bool("auto_update", defaults.auto_update),
         }
     }
 
@@ -592,6 +598,7 @@ impl Config {
         map.insert("mouse_enabled".to_string(), Value::Bool(self.mouse_enabled));
         map.insert("readonly".to_string(), Value::Bool(self.readonly));
         map.insert("confirm_kill".to_string(), Value::Bool(self.confirm_kill));
+        map.insert("auto_update".to_string(), Value::Bool(self.auto_update));
 
         Value::Object(map)
     }
@@ -618,11 +625,13 @@ mod tests {
         assert_eq!(config.refresh_rate_ms, 1500);
         assert!(!config.tree_view_default);
         assert!(config.show_cpu_meters);
+        assert!(config.auto_update);
     }
 
     #[test]
     fn test_serialization() {
-        let config = Config::default();
+        let mut config = Config::default();
+        config.auto_update = false;
         let json_value = config.to_json();
         let json_str = json::to_string_pretty(&json_value);
         let parsed = json::parse(&json_str).unwrap();
@@ -634,6 +643,7 @@ mod tests {
         assert_eq!(loaded.gpu_meter_mode, config.gpu_meter_mode);
         assert_eq!(loaded.show_npu_meter, config.show_npu_meter);
         assert_eq!(loaded.npu_meter_mode, config.npu_meter_mode);
+        assert_eq!(loaded.auto_update, false);
     }
 
     #[test]

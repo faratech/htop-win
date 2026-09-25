@@ -38,6 +38,7 @@ struct Args {
     inefficient: bool,
     install: bool,
     update: bool,
+    no_auto_update: bool,
     force: bool,
     gpu_debug: bool,
     cpu_debug: bool,
@@ -140,6 +141,9 @@ fn parse_args() -> Result<Args, lexopt::Error> {
             Long("update") => {
                 args.update = true;
             }
+            Long("no-auto-update") => {
+                args.no_auto_update = true;
+            }
             Long("force") | Short('f') => {
                 args.force = true;
             }
@@ -181,6 +185,7 @@ fn print_help() {
     );
     println!("      --install                Install for the current user and add it to PATH");
     println!("      --update                 Check for updates and install if available");
+    println!("      --no-auto-update         Disable automatic background updates");
     println!("  -f, --force                  Force install/update even if same version");
     println!("      --gpu-debug              Print GPU/NPU adapter diagnostics and exit");
     println!("      --cpu-debug              Print CPU / processor-group diagnostics and exit");
@@ -530,6 +535,9 @@ fn apply_config_overrides(config: &mut Config, args: &Args) {
         config.highlight_new_processes = true;
         config.highlight_duration_ms = delay.saturating_mul(1000);
     }
+    if args.no_auto_update {
+        config.auto_update = false;
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -577,8 +585,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
+    let (config, first_run) = load_session_config(&args);
+    let mouse_enabled = config.mouse_enabled && !args.no_mouse;
+
     // Apply any pending update before starting (downloaded in previous session)
-    let update_just_applied = installer::apply_pending_update();
+    // only if automatic updates are enabled.
+    let update_just_applied = if config.auto_update {
+        installer::apply_pending_update()
+    } else {
+        false
+    };
 
     // Enable Efficiency Mode by default (reduces CPU usage via EcoQoS)
     if !args.inefficient {
@@ -588,9 +604,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Enable SeDebugPrivilege to access service account info (NETWORK SERVICE, LOCAL SERVICE)
     // Only succeeds when running as Administrator
     system::enable_debug_privilege();
-
-    let (config, first_run) = load_session_config(&args);
-    let mouse_enabled = config.mouse_enabled && !args.no_mouse;
 
     // Restore the terminal before the panic message prints, so it lands on
     // the normal screen instead of the soon-to-vanish alternate one. Panic
@@ -791,8 +804,9 @@ fn run_tui_inner(
     *bench_stats = benchmark_mode.map(|_| BenchmarkStats::new());
 
     // Spawn background update check (skip if we just applied an update, since
-    // the running binary is still the old version and would re-download)
-    let update_rx = if update_just_applied {
+    // the running binary is still the old version and would re-download, or if
+    // automatic updates are disabled in config)
+    let update_rx = if update_just_applied || !app.config.auto_update {
         // Create a dummy channel that never sends anything
         let (_, rx) = std::sync::mpsc::channel();
         rx
@@ -974,6 +988,7 @@ fn run_app(
 
         // Check for update result from background thread
         if !app.update_checked
+            && app.config.auto_update
             && let Ok(status) = update_rx.try_recv()
         {
             app.update_checked = true;
@@ -1101,6 +1116,20 @@ mod tests {
         apply_config_overrides(&mut config, &args);
 
         assert!(!config.readonly);
+    }
+
+    #[test]
+    fn cli_no_auto_update_disables_auto_update() {
+        let args = Args {
+            no_auto_update: true,
+            ..Args::default()
+        };
+        let mut config = Config::default();
+        assert!(config.auto_update);
+
+        apply_config_overrides(&mut config, &args);
+
+        assert!(!config.auto_update);
     }
 
     #[test]

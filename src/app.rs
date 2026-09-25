@@ -531,30 +531,75 @@ impl ScreenTab {
     }
 }
 
-/// One row of the F2 Setup dialog, in display order via `SetupItem::ALL`.
+/// One entry in the F2 Setup dialog (either a category section header or an interactive setting).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SetupEntry {
+    Section(&'static str),
+    Item(SetupItem),
+}
+
+impl SetupEntry {
+    pub const ALL: &'static [SetupEntry] = &[
+        SetupEntry::Section("General"),
+        SetupEntry::Item(SetupItem::RefreshRate),
+        SetupEntry::Item(SetupItem::AutoUpdate),
+        SetupEntry::Item(SetupItem::MouseEnabled),
+        SetupEntry::Item(SetupItem::ColorScheme),
+
+        SetupEntry::Section("Process Display"),
+        SetupEntry::Item(SetupItem::TreeView),
+        SetupEntry::Item(SetupItem::ShowProgramPath),
+        SetupEntry::Item(SetupItem::HighlightBasename),
+        SetupEntry::Item(SetupItem::ShowUserThreads),
+        SetupEntry::Item(SetupItem::ShowKernelThreads),
+        SetupEntry::Item(SetupItem::HighlightNewProcesses),
+        SetupEntry::Item(SetupItem::HighlightLargeNumbers),
+        SetupEntry::Item(SetupItem::ConfigureColumns),
+
+        SetupEntry::Section("Meters & Hardware"),
+        SetupEntry::Item(SetupItem::CpuMeterMode),
+        SetupEntry::Item(SetupItem::MemoryMeterMode),
+        SetupEntry::Item(SetupItem::GpuMeterMode),
+        SetupEntry::Item(SetupItem::GpuMeterAdapter),
+        SetupEntry::Item(SetupItem::NpuMeterMode),
+
+        SetupEntry::Section("Safety & Maintenance"),
+        SetupEntry::Item(SetupItem::ConfirmKill),
+        SetupEntry::Item(SetupItem::ResetAllSettings),
+    ];
+}
+
+/// One row of setting in the F2 Setup dialog.
 ///
 /// `draw_setup` renders each item's label and current value, and
-/// `handle_setup_keys` dispatches Enter/Left/Right on the item — both iterate
-/// this table, so the rendered list and the input handling can never disagree
-/// about item order or count (issue #27 was caused by exactly that: the draw
-/// list and the numeric match arms drifting apart).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `handle_setup_keys` dispatches Enter/Left/Right on the item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SetupItem {
+    // General
     RefreshRate,
+    AutoUpdate,
+    MouseEnabled,
+    ColorScheme,
+
+    // Process Display
+    TreeView,
+    ShowProgramPath,
+    HighlightBasename,
+    ShowUserThreads,
+    ShowKernelThreads,
+    HighlightNewProcesses,
+    HighlightLargeNumbers,
+    ConfigureColumns,
+
+    // Meters & Hardware
     CpuMeterMode,
     MemoryMeterMode,
     GpuMeterMode,
-    NpuMeterMode,
-    ShowKernelThreads,
-    ShowUserThreads,
-    ShowProgramPath,
-    HighlightNewProcesses,
-    HighlightLargeNumbers,
-    TreeView,
-    ConfirmKill,
-    ColorScheme,
-    ConfigureColumns,
     GpuMeterAdapter,
+    NpuMeterMode,
+
+    // Safety & Maintenance
+    ConfirmKill,
     // Destructive action, always kept last in the list.
     ResetAllSettings,
 }
@@ -562,50 +607,64 @@ pub enum SetupItem {
 impl SetupItem {
     pub const ALL: &'static [SetupItem] = &[
         SetupItem::RefreshRate,
+        SetupItem::AutoUpdate,
+        SetupItem::MouseEnabled,
+        SetupItem::ColorScheme,
+        SetupItem::TreeView,
+        SetupItem::ShowProgramPath,
+        SetupItem::HighlightBasename,
+        SetupItem::ShowUserThreads,
+        SetupItem::ShowKernelThreads,
+        SetupItem::HighlightNewProcesses,
+        SetupItem::HighlightLargeNumbers,
+        SetupItem::ConfigureColumns,
         SetupItem::CpuMeterMode,
         SetupItem::MemoryMeterMode,
         SetupItem::GpuMeterMode,
-        SetupItem::NpuMeterMode,
-        SetupItem::ShowKernelThreads,
-        SetupItem::ShowUserThreads,
-        SetupItem::ShowProgramPath,
-        SetupItem::HighlightNewProcesses,
-        SetupItem::HighlightLargeNumbers,
-        SetupItem::TreeView,
-        SetupItem::ConfirmKill,
-        SetupItem::ColorScheme,
-        SetupItem::ConfigureColumns,
         SetupItem::GpuMeterAdapter,
+        SetupItem::NpuMeterMode,
+        SetupItem::ConfirmKill,
         SetupItem::ResetAllSettings,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
             SetupItem::RefreshRate => "Refresh rate",
+            SetupItem::AutoUpdate => "Automatic updates",
+            SetupItem::MouseEnabled => "Mouse support",
+            SetupItem::ColorScheme => "Color scheme",
+            SetupItem::TreeView => "Tree view",
+            SetupItem::ShowProgramPath => "Show program path",
+            SetupItem::HighlightBasename => "Highlight program basename",
+            SetupItem::ShowUserThreads => "Show user threads",
+            SetupItem::ShowKernelThreads => "Show kernel threads",
+            SetupItem::HighlightNewProcesses => "Highlight new processes",
+            SetupItem::HighlightLargeNumbers => "Highlight large numbers",
+            SetupItem::ConfigureColumns => "Configure columns",
             SetupItem::CpuMeterMode => "CPU meter mode",
             SetupItem::MemoryMeterMode => "Memory meter mode",
             SetupItem::GpuMeterMode => "GPU meter mode",
-            SetupItem::NpuMeterMode => "NPU meter mode",
-            SetupItem::ShowKernelThreads => "Show kernel threads",
-            SetupItem::ShowUserThreads => "Show user threads",
-            SetupItem::ShowProgramPath => "Show program path",
-            SetupItem::HighlightNewProcesses => "Highlight new processes",
-            SetupItem::HighlightLargeNumbers => "Highlight large numbers",
-            SetupItem::TreeView => "Tree view",
-            SetupItem::ConfirmKill => "Confirm force terminate",
-            SetupItem::ColorScheme => "Color scheme",
-            SetupItem::ConfigureColumns => "Configure columns",
             SetupItem::GpuMeterAdapter => "GPU meter adapter",
+            SetupItem::NpuMeterMode => "NPU meter mode",
+            SetupItem::ConfirmKill => "Confirm force terminate",
             SetupItem::ResetAllSettings => "Reset all settings",
         }
     }
 
-    /// Stable row lookup for submenus that return to Setup.
+    /// Stable row lookup for submenus and tests that reference dialog rows in SetupEntry::ALL.
     pub fn index(self) -> usize {
-        Self::ALL
+        SetupEntry::ALL
             .iter()
-            .position(|item| *item == self)
-            .expect("every SetupItem must be present in SetupItem::ALL")
+            .position(|entry| *entry == SetupEntry::Item(self))
+            .expect("every SetupItem must be present in SetupEntry::ALL")
+    }
+
+    /// Index of the first navigable item (skipping leading section headers).
+    pub fn first_navigable_index() -> usize {
+        SetupEntry::ALL
+            .iter()
+            .position(|entry| matches!(entry, SetupEntry::Item(_)))
+            .unwrap_or(0)
     }
 }
 
@@ -801,6 +860,7 @@ pub enum DialogState {
         selected: usize,
         identity: ProcessIdentity,
     },
+    ConfirmReset,
 }
 
 impl DialogState {
@@ -1008,6 +1068,35 @@ fn next_char_boundary(buffer: &str, cursor: usize) -> usize {
         .next()
         .map(|ch| cursor + ch.len_utf8())
         .unwrap_or(buffer.len())
+}
+
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new("clip")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to run clip: {}", e))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let status = child
+            .wait()
+            .map_err(|e| format!("Failed waiting for clip: {}", e))?;
+        if !status.success() {
+            return Err("clip command failed".to_string());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        Ok(())
+    }
 }
 
 impl App {
@@ -1512,7 +1601,9 @@ impl App {
                 if matches!(self.dialog, DialogState::Setup { .. }) {
                     self.close_setup();
                 } else {
-                    self.dialog = DialogState::Setup { selected: 0 };
+                    self.dialog = DialogState::Setup {
+                        selected: SetupItem::first_navigable_index(),
+                    };
                 }
             }
             3 => self.start_search(),
@@ -2631,6 +2722,41 @@ impl App {
         }
     }
 
+    /// Find previous search match
+    pub fn find_prev(&mut self) {
+        if self.search_string_lower.is_empty() || self.display.is_empty() {
+            return;
+        }
+        let len = self.display.len();
+        let start = if self.selected_index == 0 {
+            len - 1
+        } else {
+            self.selected_index - 1
+        };
+        for i in 0..len {
+            let idx = (start + len - (i % len)) % len;
+            let Some(p) = self.displayed(idx) else {
+                continue;
+            };
+            if p.name_lower.contains(&self.search_string_lower)
+                || p.command_lower.contains(&self.search_string_lower)
+            {
+                self.selected_index = idx;
+                self.ensure_visible();
+                break;
+            }
+        }
+    }
+
+    /// Clear active search query and remove search highlights.
+    pub fn clear_search(&mut self) {
+        if !self.search_string.is_empty() {
+            self.search_string.clear();
+            self.search_string_lower.clear();
+            self.needs_process_update = true;
+        }
+    }
+
     /// Execute only the immutable request captured when the dialog opened.
     pub fn kill_target_process(&mut self) {
         if let DialogState::Kill { request } = &self.dialog {
@@ -2736,6 +2862,225 @@ impl App {
                     format!("Failed to set efficiency mode: {}", e),
                     Instant::now(),
                 ));
+            }
+        }
+    }
+
+    /// Toggle Windows Efficiency Mode (EcoQoS) directly on the selected or tagged processes
+    pub fn toggle_selected_efficiency_mode(&mut self) {
+        if self.readonly_blocked("change process efficiency mode") {
+            return;
+        }
+
+        let targets: Vec<(ProcessIdentity, String, bool)> = if self.tagged_pids.is_empty() {
+            if let Some(proc) = self.selected_process() {
+                vec![(proc.identity(), proc.name.to_string(), proc.efficiency_mode)]
+            } else {
+                return;
+            }
+        } else {
+            self.tagged_pids
+                .iter()
+                .filter_map(|id| {
+                    self.processes
+                        .iter()
+                        .find(|p| p.identity() == *id)
+                        .map(|p| (p.identity(), p.name.to_string(), p.efficiency_mode))
+                })
+                .collect()
+        };
+
+        if targets.is_empty() {
+            return;
+        }
+
+        let target_state = if targets.len() == 1 {
+            !targets[0].2
+        } else {
+            targets.iter().any(|(_, _, eff)| !*eff)
+        };
+
+        let mut success = 0;
+        let mut failed = 0;
+        let mut last_err = None;
+
+        for (identity, name, _) in &targets {
+            match crate::system::set_efficiency_mode(*identity, target_state) {
+                Ok(_) => {
+                    success += 1;
+                    if let Some(proc) = self.processes.iter_mut().find(|p| p.identity() == *identity) {
+                        proc.efficiency_mode = target_state;
+                    }
+                }
+                Err(e) => {
+                    failed += 1;
+                    last_err = Some(format!("{}: {}", name, e));
+                }
+            }
+        }
+
+        let state_str = if target_state { "enabled" } else { "disabled" };
+        if failed == 0 {
+            if targets.len() == 1 {
+                self.status_message = Some((
+                    format!("Efficiency mode {} for {}", state_str, targets[0].1),
+                    Instant::now(),
+                ));
+            } else {
+                self.status_message = Some((
+                    format!("Efficiency mode {} for {} processes", state_str, success),
+                    Instant::now(),
+                ));
+            }
+        } else if success == 0 {
+            self.last_error = Some((
+                format!("Failed to set efficiency mode: {}", last_err.unwrap_or_default()),
+                Instant::now(),
+            ));
+        } else {
+            self.status_message = Some((
+                format!(
+                    "Efficiency mode {}: {} succeeded, {} failed",
+                    state_str, success, failed
+                ),
+                Instant::now(),
+            ));
+        }
+        self.needs_process_update = true;
+    }
+
+    /// Get the executable path of the selected process
+    pub fn selected_process_exe_path(&mut self) -> Option<String> {
+        let proc = self.selected_process()?;
+        let (raw_path, identity) = if !proc.exe_path.is_empty() {
+            (proc.exe_path.to_string(), None)
+        } else {
+            let id = proc.identity();
+            let path = crate::system::get_process_exe_path(id);
+            if !path.is_empty() {
+                (path, Some(id))
+            } else if !proc.command.is_empty() && (proc.command.contains('\\') || proc.command.contains('/')) {
+                (proc.command.to_string(), None)
+            } else {
+                return None;
+            }
+        };
+
+        let clean = raw_path
+            .strip_prefix(r"\\?\")
+            .unwrap_or(&raw_path)
+            .trim_matches('"')
+            .replace('/', "\\");
+
+        if clean.is_empty() {
+            return None;
+        }
+
+        // Cache resolved path on process so future lookups are instant
+        if let Some(id) = identity {
+            let shared: std::sync::Arc<str> = std::sync::Arc::from(clean.clone());
+            if let Some(p) = self.processes.iter_mut().find(|p| p.identity() == id) {
+                p.exe_path = shared.clone();
+                p.command = shared;
+            }
+        }
+
+        Some(clean)
+    }
+
+    /// Open the selected process's executable location in Windows Explorer
+    pub fn open_file_location(&mut self) {
+        let Some(path) = self.selected_process_exe_path() else {
+            let name = self
+                .selected_process()
+                .map(|p| p.name.to_string())
+                .unwrap_or_else(|| "process".to_string());
+            self.last_error = Some((
+                format!("Cannot open location for '{name}': path unavailable (access denied or system process)"),
+                Instant::now(),
+            ));
+            return;
+        };
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            use std::process::Command;
+
+            let p = std::path::Path::new(&path);
+            let mut cmd = Command::new("explorer.exe");
+            if p.exists() {
+                // Must use raw_arg because explorer.exe /select,"<path>" requires the quotes
+                // to enclose ONLY the path, not the leading /select, switch.
+                // Standard .arg() would wrap the entire "/select,..." in quotes if there are spaces.
+                cmd.raw_arg(format!("/select,\"{}\"", path));
+            } else if let Some(parent) = p.parent().filter(|par| par.exists()) {
+                cmd.arg(parent);
+            } else {
+                self.last_error = Some((
+                    format!("Path not found on disk: {path}"),
+                    Instant::now(),
+                ));
+                return;
+            }
+
+            match cmd.spawn() {
+                Ok(_) => {
+                    self.status_message = Some((
+                        format!("Opened in Explorer: {}", path),
+                        Instant::now(),
+                    ));
+                }
+                Err(e) => {
+                    self.last_error = Some((
+                        format!("Failed to launch Explorer: {}", e),
+                        Instant::now(),
+                    ));
+                }
+            }
+        }
+
+        #[cfg(not(windows))]
+        {
+            self.status_message = Some((
+                format!("File location: {}", path),
+                Instant::now(),
+            ));
+        }
+    }
+
+    /// Copy selected process's executable path (or name if path is not available) to clipboard
+    pub fn copy_selected_process_path(&mut self) {
+        let text = self
+            .selected_process_exe_path()
+            .or_else(|| self.selected_process().map(|p| p.name.to_string()));
+        let Some(text) = text else { return; };
+        match copy_to_clipboard(&text) {
+            Ok(()) => {
+                self.status_message = Some((
+                    format!("Copied path to clipboard: {}", text),
+                    Instant::now(),
+                ));
+            }
+            Err(e) => {
+                self.last_error = Some((e, Instant::now()));
+            }
+        }
+    }
+
+    /// Copy selected process's PID to clipboard
+    pub fn copy_selected_process_pid(&mut self) {
+        let Some(pid) = self.selected_process().map(|p| p.pid) else { return; };
+        let text = pid.to_string();
+        match copy_to_clipboard(&text) {
+            Ok(()) => {
+                self.status_message = Some((
+                    format!("Copied PID {} to clipboard", text),
+                    Instant::now(),
+                ));
+            }
+            Err(e) => {
+                self.last_error = Some((e, Instant::now()));
             }
         }
     }
@@ -3411,7 +3756,35 @@ mod tests {
         // Keep the destructive action at the bottom of the Setup list
         // (issue #27) — draw and input both derive order from this table.
         assert_eq!(SetupItem::ALL.last(), Some(&SetupItem::ResetAllSettings));
-        assert_eq!(SetupItem::GpuMeterAdapter.index(), SetupItem::ALL.len() - 2);
+        assert_eq!(
+            SetupEntry::ALL.last(),
+            Some(&SetupEntry::Item(SetupItem::ResetAllSettings))
+        );
+        // GPU adapter selection is logically adjacent to GPU meter mode
+        assert_eq!(
+            SetupItem::GpuMeterAdapter.index(),
+            SetupItem::GpuMeterMode.index() + 1
+        );
+    }
+
+    #[test]
+    fn all_setup_items_are_mapped_and_unique() {
+        use std::collections::HashSet;
+        let mut seen_items = HashSet::new();
+        let mut seen_indices = HashSet::new();
+
+        for &item in SetupItem::ALL {
+            assert!(seen_items.insert(item), "duplicate item in SetupItem::ALL");
+            let idx = item.index();
+            assert!(seen_indices.insert(idx), "duplicate index in SetupEntry::ALL");
+            assert_eq!(SetupEntry::ALL[idx], SetupEntry::Item(item));
+        }
+
+        assert_eq!(seen_items.len(), SetupItem::ALL.len());
+
+        let first = SetupItem::first_navigable_index();
+        assert!(matches!(SetupEntry::ALL[first], SetupEntry::Item(_)));
+        assert_eq!(first, SetupItem::RefreshRate.index());
     }
 
     #[test]
@@ -4273,5 +4646,78 @@ mod tests {
                 processes.len()
             );
         }
+    }
+
+    #[test]
+    fn find_prev_and_clear_search_behavior() {
+        let mut app = App::new(Config::default());
+        let mut p1 = process(10, 0);
+        p1.name = Arc::from("apple.exe");
+        p1.name_lower = Arc::from("apple.exe");
+        let mut p2 = process(20, 0);
+        p2.name = Arc::from("banana.exe");
+        p2.name_lower = Arc::from("banana.exe");
+        let mut p3 = process(30, 0);
+        p3.name = Arc::from("apple_pie.exe");
+        p3.name_lower = Arc::from("apple_pie.exe");
+
+        app.processes = vec![p1, p2, p3];
+        app.update_displayed_processes();
+
+        app.search_string = "apple".to_string();
+        app.search_string_lower = "apple".to_string();
+        app.update_displayed_processes();
+
+        // Selected starts at 0 (apple.exe)
+        assert_eq!(app.selected_index, 0);
+
+        // find_next moves to index 2 (apple_pie.exe)
+        app.find_next();
+        assert_eq!(app.selected_index, 2);
+
+        // find_prev wraps back to index 0 (apple.exe)
+        app.find_prev();
+        assert_eq!(app.selected_index, 0);
+
+        // find_prev again wraps backwards to index 2 (apple_pie.exe)
+        app.find_prev();
+        assert_eq!(app.selected_index, 2);
+
+        // Clearing search
+        app.clear_search();
+        assert!(app.search_string.is_empty());
+        assert!(app.search_string_lower.is_empty());
+        assert!(app.needs_process_update);
+    }
+
+    #[test]
+    fn open_file_location_resolves_and_cleans_paths() {
+        let mut app = App::new(Config::default());
+        let mut p1 = process(10, 0);
+        p1.name = Arc::from("my_app.exe");
+        p1.exe_path = Arc::from(r"\\?\C:/Program Files/My App/my_app.exe");
+        app.processes = vec![p1];
+        app.update_displayed_processes();
+
+        let path = app.selected_process_exe_path();
+        assert_eq!(path.as_deref(), Some(r"C:\Program Files\My App\my_app.exe"));
+
+        // Running open_file_location sets status notice (on non-windows in tests)
+        app.open_file_location();
+        let (msg, _) = app.status_message.as_ref().expect("status message expected");
+        assert!(msg.contains(r"C:\Program Files\My App\my_app.exe"));
+
+        // When path is unavailable, reports explicit error notice
+        let mut p2 = process(20, 0);
+        p2.name = Arc::from("system_proc.exe");
+        p2.exe_path = Arc::from("");
+        p2.command = Arc::from("system_proc.exe"); // no slashes
+        app.processes = vec![p2];
+        app.update_displayed_processes();
+        assert_eq!(app.selected_process_exe_path(), None);
+        app.open_file_location();
+        let (err, _) = app.last_error.as_ref().expect("error message expected");
+        assert!(err.contains("system_proc.exe"));
+        assert!(err.contains("access denied or system process"));
     }
 }

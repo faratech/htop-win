@@ -127,6 +127,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         DialogState::CommandWrap { .. } => dialogs::draw_command_wrap(frame, app),
         DialogState::ColumnConfig { .. } => dialogs::draw_column_config(frame, app),
         DialogState::Affinity { .. } => dialogs::draw_affinity(frame, app),
+        DialogState::ConfirmReset => dialogs::draw_confirm_reset(frame, app),
         DialogState::None => {}
     }
 

@@ -2,7 +2,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 
-use crate::app::{App, DialogState, SetupItem, SortColumn};
+use crate::app::{App, DialogState, SetupEntry, SetupItem, SortColumn};
 
 /// Handle scroll keys for dialogs. Returns true if the key was handled.
 /// Content length isn't known here; offsets are clamped at render time
@@ -130,6 +130,7 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> bool {
         DialogState::CommandWrap { .. } => handle_command_wrap_keys(app, key),
         DialogState::ColumnConfig { .. } => handle_column_config_keys(app, key),
         DialogState::Affinity { .. } => handle_affinity_keys(app, key),
+        DialogState::ConfirmReset => handle_confirm_reset_keys(app, key),
     }
 }
 
@@ -331,9 +332,29 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
             }
         }
 
-        // Environment variables
-        KeyCode::Char('e') => {
-            app.enter_environment_mode();
+        // Windows Efficiency Mode (EcoQoS)
+        KeyCode::Char('e') | KeyCode::Char('E') => {
+            app.toggle_selected_efficiency_mode();
+        }
+
+        // Open executable file location in Explorer
+        KeyCode::Char('o') | KeyCode::Char('O') => {
+            app.open_file_location();
+        }
+
+        // Copy path / PID to clipboard
+        KeyCode::Char('y') => {
+            app.copy_selected_process_path();
+        }
+        KeyCode::Char('Y') => {
+            app.copy_selected_process_pid();
+        }
+
+        // Clear active search query and highlights
+        KeyCode::Esc => {
+            if !app.search_string.is_empty() {
+                app.clear_search();
+            }
         }
 
         // Function keys
@@ -342,6 +363,9 @@ fn handle_normal_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::F(2) | KeyCode::Char('S') => {
             app.handle_function_key(2);
+        }
+        KeyCode::F(3) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            app.find_prev();
         }
         KeyCode::F(3) | KeyCode::Char('/') => {
             app.handle_function_key(3);
@@ -437,7 +461,11 @@ fn handle_search_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::F(3) => {
             app.update_search_from_dialog(false);
-            app.find_next();
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                app.find_prev();
+            } else {
+                app.find_next();
+            }
         }
         KeyCode::Backspace => {
             app.input_backspace();
@@ -656,7 +684,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
         }
         KeyCode::Enter | KeyCode::Char(' ') => {
             // Toggle the selected setting or open its submenu
-            let Some(&item) = SetupItem::ALL.get(selected) else {
+            let Some(SetupEntry::Item(item)) = SetupEntry::ALL.get(selected) else {
                 return false;
             };
             match item {
@@ -673,26 +701,34 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     };
                     app.mark_config_dirty();
                 }
+                SetupItem::AutoUpdate => {
+                    app.config.auto_update = !app.config.auto_update;
+                    app.mark_config_dirty();
+                }
+                SetupItem::MouseEnabled => {
+                    app.config.mouse_enabled = !app.config.mouse_enabled;
+                    app.mark_config_dirty();
+                }
                 SetupItem::CpuMeterMode => {
                     app.config.cpu_meter_mode = cycle_meter_mode(app.config.cpu_meter_mode);
-                    app.ensure_meter_visible(item);
+                    app.ensure_meter_visible(*item);
                     app.mark_config_dirty();
                 }
                 SetupItem::MemoryMeterMode => {
                     app.config.memory_meter_mode = cycle_meter_mode(app.config.memory_meter_mode);
-                    app.ensure_meter_visible(item);
+                    app.ensure_meter_visible(*item);
                     app.mark_config_dirty();
                 }
                 SetupItem::GpuMeterMode => {
                     // Meter only appears on GPU machines
                     app.config.gpu_meter_mode = cycle_meter_mode(app.config.gpu_meter_mode);
-                    app.ensure_meter_visible(item);
+                    app.ensure_meter_visible(*item);
                     app.mark_config_dirty();
                 }
                 SetupItem::NpuMeterMode => {
                     // Meter only appears on NPU machines
                     app.config.npu_meter_mode = cycle_meter_mode(app.config.npu_meter_mode);
-                    app.ensure_meter_visible(item);
+                    app.ensure_meter_visible(*item);
                     app.mark_config_dirty();
                 }
                 SetupItem::ShowKernelThreads => {
@@ -707,6 +743,11 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                 }
                 SetupItem::ShowProgramPath => {
                     app.config.show_program_path = !app.config.show_program_path;
+                    app.needs_process_update = true;
+                    app.mark_config_dirty();
+                }
+                SetupItem::HighlightBasename => {
+                    app.config.highlight_basename = !app.config.highlight_basename;
                     app.needs_process_update = true;
                     app.mark_config_dirty();
                 }
@@ -742,7 +783,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     app.enter_gpu_select_mode();
                 }
                 SetupItem::ResetAllSettings => {
-                    app.reset_settings();
+                    app.dialog = DialogState::ConfirmReset;
                 }
             }
         }
@@ -750,8 +791,21 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
             // Allow left/right to adjust values for some settings
             let forward = key.code == KeyCode::Right;
             let mut changed = false;
-            match SetupItem::ALL.get(selected) {
-                Some(SetupItem::RefreshRate) => {
+            match SetupEntry::ALL.get(selected) {
+                Some(SetupEntry::Item(SetupItem::AutoUpdate)) => {
+                    app.config.auto_update = !app.config.auto_update;
+                    changed = true;
+                }
+                Some(SetupEntry::Item(SetupItem::MouseEnabled)) => {
+                    app.config.mouse_enabled = !app.config.mouse_enabled;
+                    changed = true;
+                }
+                Some(SetupEntry::Item(SetupItem::HighlightBasename)) => {
+                    app.config.highlight_basename = !app.config.highlight_basename;
+                    app.needs_process_update = true;
+                    changed = true;
+                }
+                Some(SetupEntry::Item(SetupItem::RefreshRate)) => {
                     app.config.refresh_rate_ms = if forward {
                         match app.config.refresh_rate_ms {
                             100 => 250,
@@ -775,7 +829,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     };
                     changed = true;
                 }
-                Some(SetupItem::CpuMeterMode) => {
+                Some(SetupEntry::Item(SetupItem::CpuMeterMode)) => {
                     app.config.cpu_meter_mode = if forward {
                         cycle_meter_mode(app.config.cpu_meter_mode)
                     } else {
@@ -784,7 +838,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     app.ensure_meter_visible(SetupItem::CpuMeterMode);
                     changed = true;
                 }
-                Some(SetupItem::MemoryMeterMode) => {
+                Some(SetupEntry::Item(SetupItem::MemoryMeterMode)) => {
                     app.config.memory_meter_mode = if forward {
                         cycle_meter_mode(app.config.memory_meter_mode)
                     } else {
@@ -793,7 +847,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     app.ensure_meter_visible(SetupItem::MemoryMeterMode);
                     changed = true;
                 }
-                Some(SetupItem::GpuMeterMode) => {
+                Some(SetupEntry::Item(SetupItem::GpuMeterMode)) => {
                     app.config.gpu_meter_mode = if forward {
                         cycle_meter_mode(app.config.gpu_meter_mode)
                     } else {
@@ -802,7 +856,7 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                     app.ensure_meter_visible(SetupItem::GpuMeterMode);
                     changed = true;
                 }
-                Some(SetupItem::NpuMeterMode) => {
+                Some(SetupEntry::Item(SetupItem::NpuMeterMode)) => {
                     app.config.npu_meter_mode = if forward {
                         cycle_meter_mode(app.config.npu_meter_mode)
                     } else {
@@ -817,14 +871,94 @@ fn handle_setup_keys(app: &mut App, key: KeyEvent) -> bool {
                 app.mark_config_dirty();
             }
         }
-        // Up/Down/j/k/PgUp/PgDn/Home/End move the selection.
+        // Up/Down/j/k/PgUp/PgDn/Home/End move the selection, skipping section headers.
         other => {
             if let DialogState::Setup { ref mut selected } = app.dialog {
-                handle_list_nav(selected, SetupItem::ALL.len(), other);
+                handle_setup_nav(selected, other);
             }
         }
     }
     false
+}
+
+fn handle_confirm_reset_keys(app: &mut App, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+            app.reset_settings();
+            app.dialog = DialogState::Setup {
+                selected: SetupItem::first_navigable_index(),
+            };
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+            app.dialog = DialogState::Setup {
+                selected: SetupItem::ResetAllSettings.index(),
+            };
+        }
+        _ => {}
+    }
+    false
+}
+
+/// Navigate the Setup dialog, automatically skipping non-selectable section headers.
+fn handle_setup_nav(selected: &mut usize, key: KeyCode) {
+    let len = SetupEntry::ALL.len();
+    if len == 0 {
+        return;
+    }
+    match key {
+        KeyCode::Up | KeyCode::Char('k') => {
+            let mut next = selected.checked_sub(1).unwrap_or(len - 1);
+            while matches!(SetupEntry::ALL.get(next), Some(SetupEntry::Section(_))) {
+                next = next.checked_sub(1).unwrap_or(len - 1);
+            }
+            *selected = next;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            let mut next = if *selected + 1 >= len { 0 } else { *selected + 1 };
+            while matches!(SetupEntry::ALL.get(next), Some(SetupEntry::Section(_))) {
+                next = if next + 1 >= len { 0 } else { next + 1 };
+            }
+            *selected = next;
+        }
+        KeyCode::Home => {
+            *selected = SetupItem::first_navigable_index();
+        }
+        KeyCode::End => {
+            let mut last = len.saturating_sub(1);
+            while matches!(SetupEntry::ALL.get(last), Some(SetupEntry::Section(_))) && last > 0 {
+                last -= 1;
+            }
+            *selected = last;
+        }
+        KeyCode::PageUp => {
+            let mut next = selected
+                .saturating_sub(5)
+                .max(SetupItem::first_navigable_index());
+            while matches!(SetupEntry::ALL.get(next), Some(SetupEntry::Section(_))) {
+                if next > 0 {
+                    next -= 1;
+                } else {
+                    next = SetupItem::first_navigable_index();
+                    break;
+                }
+            }
+            *selected = next;
+        }
+        KeyCode::PageDown => {
+            let last = len.saturating_sub(1);
+            let mut next = (*selected + 5).min(last);
+            while matches!(SetupEntry::ALL.get(next), Some(SetupEntry::Section(_))) {
+                if next < last {
+                    next += 1;
+                } else {
+                    next = selected.saturating_sub(1);
+                    break;
+                }
+            }
+            *selected = next;
+        }
+        _ => {}
+    }
 }
 
 fn handle_process_info_keys(app: &mut App, key: KeyEvent) -> bool {
@@ -1228,7 +1362,7 @@ fn dialog_nav_len(app: &App) -> usize {
         DialogState::SortSelect { .. } | DialogState::ColumnConfig { .. } => {
             SortColumn::all().len()
         }
-        DialogState::Setup { .. } => SetupItem::ALL.len(),
+        DialogState::Setup { .. } => SetupEntry::ALL.len(),
         DialogState::Priority { .. } => crate::app::WindowsPriorityClass::all().len(),
         DialogState::UserSelect { users, .. } => users.len() + 1,
         DialogState::ColorScheme { .. } => crate::ui::colors::ColorScheme::all().len(),
@@ -1366,6 +1500,12 @@ fn kill_confirmation_row(app: &App, inner: crate::terminal::Rect) -> Option<u16>
 fn select_dialog_row(app: &mut App, nav_value: usize) -> bool {
     let len = dialog_nav_len(app);
     if nav_value >= len {
+        return false;
+    }
+    // Prevent selecting a Section header row in the Setup dialog
+    if matches!(app.dialog, DialogState::Setup { .. })
+        && matches!(SetupEntry::ALL.get(nav_value), Some(SetupEntry::Section(_)))
+    {
         return false;
     }
     if let Some(sel) = dialog_selection_mut(&mut app.dialog) {
@@ -1512,7 +1652,9 @@ fn handle_element_action(app: &mut App, x: u16, y: u16, action: crate::app::UIAc
 
             // Footer area double-click - open setup
             (UIElement::Footer, UIAction::DoubleClick) => {
-                app.dialog = DialogState::Setup { selected: 0 };
+                app.dialog = DialogState::Setup {
+                    selected: SetupItem::first_navigable_index(),
+                };
             }
 
             _ => {}
@@ -1597,10 +1739,7 @@ mod tests {
         app.config.show_cpu_meters = false;
         app.config.cpu_meter_mode = MeterMode::Hidden;
 
-        let cpu_row = SetupItem::ALL
-            .iter()
-            .position(|i| *i == SetupItem::CpuMeterMode)
-            .unwrap();
+        let cpu_row = SetupItem::CpuMeterMode.index();
         app.dialog = DialogState::Setup { selected: cpu_row };
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::empty());
         assert!(!handle_key_event(&mut app, enter));
@@ -1854,5 +1993,203 @@ mod tests {
             app.status_message.as_ref().map(|(m, _)| m.as_str()),
             loading
         );
+    }
+
+    #[test]
+    fn setup_navigation_skips_section_headers() {
+        let mut app = test_app();
+        // Start on ColorScheme (last item before Process Display section header)
+        app.dialog = DialogState::Setup {
+            selected: SetupItem::ColorScheme.index(),
+        };
+
+        // Moving Down must skip the "Process Display" section header and land on TreeView
+        handle_key_event(&mut app, press(KeyCode::Down));
+        assert!(matches!(
+            app.dialog,
+            DialogState::Setup { selected } if selected == SetupItem::TreeView.index()
+        ));
+
+        // Moving Up must skip the section header and land back on ColorScheme
+        handle_key_event(&mut app, press(KeyCode::Up));
+        assert!(matches!(
+            app.dialog,
+            DialogState::Setup { selected } if selected == SetupItem::ColorScheme.index()
+        ));
+
+        // Home key jumps to first navigable item (RefreshRate, index 1, not section header 0)
+        handle_key_event(&mut app, press(KeyCode::Home));
+        assert!(matches!(
+            app.dialog,
+            DialogState::Setup { selected } if selected == SetupItem::RefreshRate.index()
+        ));
+
+        // Moving Up from first item wraps around to last item (ResetAllSettings)
+        handle_key_event(&mut app, press(KeyCode::Up));
+        assert!(matches!(
+            app.dialog,
+            DialogState::Setup { selected } if selected == SetupItem::ResetAllSettings.index()
+        ));
+
+        // Moving Down from last item wraps around to first item (RefreshRate)
+        handle_key_event(&mut app, press(KeyCode::Down));
+        assert!(matches!(
+            app.dialog,
+            DialogState::Setup { selected } if selected == SetupItem::RefreshRate.index()
+        ));
+
+        // End key jumps to last item
+        handle_key_event(&mut app, press(KeyCode::End));
+        assert!(matches!(
+            app.dialog,
+            DialogState::Setup { selected } if selected == SetupItem::ResetAllSettings.index()
+        ));
+    }
+
+    #[test]
+    fn setup_mouse_click_rejects_section_headers() {
+        let mut app = test_app();
+        app.dialog = DialogState::Setup {
+            selected: SetupItem::RefreshRate.index(),
+        };
+
+        // Attempting to select row 0 (Section header "General") must be rejected
+        assert!(!select_dialog_row(&mut app, 0));
+        assert!(matches!(
+            app.dialog,
+            DialogState::Setup { selected } if selected == SetupItem::RefreshRate.index()
+        ));
+
+        // Selecting row 2 (AutoUpdate) must succeed
+        assert!(select_dialog_row(&mut app, SetupItem::AutoUpdate.index()));
+        assert!(matches!(
+            app.dialog,
+            DialogState::Setup { selected } if selected == SetupItem::AutoUpdate.index()
+        ));
+    }
+
+    #[test]
+    fn setup_auto_update_toggle() {
+        let mut app = test_app();
+        assert!(app.config.auto_update);
+
+        app.dialog = DialogState::Setup {
+            selected: SetupItem::AutoUpdate.index(),
+        };
+
+        // Pressing Enter toggles auto_update to false
+        handle_key_event(&mut app, press(KeyCode::Enter));
+        assert!(!app.config.auto_update);
+        assert!(app.config_dirty);
+
+        // Pressing Space toggles it back to true
+        handle_key_event(&mut app, press(KeyCode::Char(' ')));
+        assert!(app.config.auto_update);
+
+        // Pressing Right toggles it
+        handle_key_event(&mut app, press(KeyCode::Right));
+        assert!(!app.config.auto_update);
+
+        // Pressing Left toggles it
+        handle_key_event(&mut app, press(KeyCode::Left));
+        assert!(app.config.auto_update);
+    }
+
+    #[test]
+    fn setup_mouse_and_basename_toggles() {
+        let mut app = test_app();
+        assert!(app.config.mouse_enabled);
+        assert!(!app.config.highlight_basename);
+
+        // Toggle MouseEnabled
+        app.dialog = DialogState::Setup {
+            selected: SetupItem::MouseEnabled.index(),
+        };
+        handle_key_event(&mut app, press(KeyCode::Enter));
+        assert!(!app.config.mouse_enabled);
+        handle_key_event(&mut app, press(KeyCode::Right));
+        assert!(app.config.mouse_enabled);
+
+        // Toggle HighlightBasename
+        app.dialog = DialogState::Setup {
+            selected: SetupItem::HighlightBasename.index(),
+        };
+        handle_key_event(&mut app, press(KeyCode::Enter));
+        assert!(app.config.highlight_basename);
+        handle_key_event(&mut app, press(KeyCode::Left));
+        assert!(!app.config.highlight_basename);
+    }
+
+    #[test]
+    fn setup_reset_settings_confirm_and_cancel() {
+        let mut app = test_app();
+        app.config.refresh_rate_ms = 5000;
+        app.dialog = DialogState::Setup {
+            selected: SetupItem::ResetAllSettings.index(),
+        };
+
+        // Pressing Enter opens ConfirmReset dialog rather than immediately resetting
+        handle_key_event(&mut app, press(KeyCode::Enter));
+        assert!(matches!(app.dialog, DialogState::ConfirmReset));
+        assert_eq!(app.config.refresh_rate_ms, 5000);
+
+        // Pressing 'n' cancels and returns to Setup on ResetAllSettings
+        handle_key_event(&mut app, press(KeyCode::Char('n')));
+        assert!(matches!(
+            app.dialog,
+            DialogState::Setup { selected } if selected == SetupItem::ResetAllSettings.index()
+        ));
+        assert_eq!(app.config.refresh_rate_ms, 5000);
+
+        // Open confirm again and press Esc to cancel
+        handle_key_event(&mut app, press(KeyCode::Enter));
+        assert!(matches!(app.dialog, DialogState::ConfirmReset));
+        handle_key_event(&mut app, press(KeyCode::Esc));
+        assert!(matches!(
+            app.dialog,
+            DialogState::Setup { selected } if selected == SetupItem::ResetAllSettings.index()
+        ));
+
+        // Open confirm again and press 'y' to confirm reset
+        handle_key_event(&mut app, press(KeyCode::Enter));
+        assert!(matches!(app.dialog, DialogState::ConfirmReset));
+        handle_key_event(&mut app, press(KeyCode::Char('y')));
+        assert!(matches!(
+            app.dialog,
+            DialogState::Setup { selected } if selected == SetupItem::first_navigable_index()
+        ));
+        assert_eq!(app.config.refresh_rate_ms, Config::default().refresh_rate_ms);
+    }
+
+    #[test]
+    fn normal_keys_search_prev_and_esc_clear() {
+        let mut app = test_app();
+        app.search_string = "test".to_string();
+        app.search_string_lower = "test".to_string();
+
+        // Esc clears search string in normal mode
+        handle_key_event(&mut app, press(KeyCode::Esc));
+        assert!(app.search_string.is_empty());
+        assert!(app.search_string_lower.is_empty());
+
+        // Shift+F3 triggers find_prev without error
+        let shift_f3 = KeyEvent::new(KeyCode::F(3), KeyModifiers::SHIFT);
+        assert!(!handle_key_event(&mut app, shift_f3));
+    }
+
+    #[test]
+    fn normal_keys_process_actions_dispatch() {
+        let mut app = test_app();
+        // Efficiency mode toggle
+        assert!(!handle_key_event(&mut app, press(KeyCode::Char('e'))));
+        assert!(!handle_key_event(&mut app, press(KeyCode::Char('E'))));
+
+        // Open file location
+        assert!(!handle_key_event(&mut app, press(KeyCode::Char('o'))));
+        assert!(!handle_key_event(&mut app, press(KeyCode::Char('O'))));
+
+        // Copy path / PID to clipboard
+        assert!(!handle_key_event(&mut app, press(KeyCode::Char('y'))));
+        assert!(!handle_key_event(&mut app, press(KeyCode::Char('Y'))));
     }
 }
