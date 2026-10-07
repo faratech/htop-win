@@ -17,7 +17,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
 
       - name: Download Windows binaries from release
         env:
@@ -81,7 +81,7 @@ jobs:
           }
 
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@v4.2.2
         continue-on-error: true
         with:
           subject-path: 'binaries/*.exe'

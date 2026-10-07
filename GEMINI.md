@@ -46,7 +46,7 @@ Responsible for rendering the application state.
 ## Building and Running
 
 ### Prerequisites
-*   Rust 1.85+ (2024 edition)
+*   Rust 1.99+ (2024 edition; pinned to 1.99.0 in `rust-toolchain.toml`)
 *   Windows 10/11 environment (for running)
 
 ### Commands

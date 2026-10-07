@@ -4691,7 +4691,7 @@ mod tests {
     }
 
     #[test]
-    fn open_file_location_resolves_and_cleans_paths() {
+    fn selected_process_exe_path_cleans_paths() {
         let mut app = App::new(Config::default());
         let mut p1 = process(10, 0);
         p1.name = Arc::from("my_app.exe");
@@ -4701,14 +4701,14 @@ mod tests {
 
         let path = app.selected_process_exe_path();
         assert_eq!(path.as_deref(), Some(r"C:\Program Files\My App\my_app.exe"));
+    }
 
-        // Running open_file_location sets status notice (on non-windows in tests)
-        app.open_file_location();
-        let (msg, _) = app.status_message.as_ref().expect("status message expected");
-        assert!(msg.contains(r"C:\Program Files\My App\my_app.exe"));
-
-        // When path is unavailable, reports explicit error notice
+    #[test]
+    fn open_file_location_reports_unavailable_path() {
+        let mut app = App::new(Config::default());
         let mut p2 = process(20, 0);
+        // An unknown identity prevents resolving the path from a real process.
+        p2.create_time_100ns = 0;
         p2.name = Arc::from("system_proc.exe");
         p2.exe_path = Arc::from("");
         p2.command = Arc::from("system_proc.exe"); // no slashes

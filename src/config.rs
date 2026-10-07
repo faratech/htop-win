@@ -630,8 +630,10 @@ mod tests {
 
     #[test]
     fn test_serialization() {
-        let mut config = Config::default();
-        config.auto_update = false;
+        let config = Config {
+            auto_update: false,
+            ..Config::default()
+        };
         let json_value = config.to_json();
         let json_str = json::to_string_pretty(&json_value);
         let parsed = json::parse(&json_str).unwrap();
@@ -643,7 +645,7 @@ mod tests {
         assert_eq!(loaded.gpu_meter_mode, config.gpu_meter_mode);
         assert_eq!(loaded.show_npu_meter, config.show_npu_meter);
         assert_eq!(loaded.npu_meter_mode, config.npu_meter_mode);
-        assert_eq!(loaded.auto_update, false);
+        assert!(!loaded.auto_update);
     }
 
     #[test]

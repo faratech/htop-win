@@ -1,6 +1,5 @@
 # Rust / Cargo
 /target/
-Cargo.lock
 
 # Reference code (not part of this project)
 /htop-reference/

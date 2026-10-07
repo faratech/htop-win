@@ -248,7 +248,7 @@ impl ProcessCache {
     /// Take one stat from the budget, if any remain.
     fn take_exe_budget(&self) -> bool {
         self.exe_budget
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
             .is_ok()
     }
 
