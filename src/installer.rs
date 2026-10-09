@@ -1702,10 +1702,91 @@ mod tests {
         )
         .expect_err("a non-Fara signer must be rejected");
         assert!(
-            error.starts_with("unexpected publisher"),
+            error.starts_with("unexpected publisher") && !error.contains("CN=\"?\""),
             "{}: {error}",
             signed.display()
         );
+    }
+
+    /// The accept path, which no synthetic fixture reaches: the published
+    /// v0.2.13 binary (signed by release.yml with the Faratech profile, its
+    /// 3-day leaf certificate long expired, so the timestamp must carry it)
+    /// must pass WinVerifyTrust, the chain/EKU pin and the VERSIONINFO
+    /// identity checks, and the install copy must work while the verification
+    /// handle denies writers. A one-byte change must fail verification.
+    /// Needs the network, so it runs only on GitHub Actions, and never skips
+    /// there.
+    #[test]
+    fn published_release_binary_is_accepted_and_a_modified_copy_is_not() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        if std::env::var_os("GITHUB_ACTIONS").is_none() {
+            eprintln!("skipped: downloads a release asset; runs on GitHub Actions");
+            return;
+        }
+        let directory = test_directory("release-asset");
+        fs::create_dir_all(&directory).unwrap();
+        let asset = directory.join("htop-win-amd64.exe");
+        let status = std::process::Command::new("curl.exe")
+            .args(["--fail", "--silent", "--show-error", "--location"])
+            .args(["--retry", "3", "--output"])
+            .arg(&asset)
+            .arg(
+                "https://github.com/faratech/htop-win/releases/download/v0.2.13/htop-win-amd64.exe",
+            )
+            .status()
+            .expect("run curl.exe");
+        assert!(status.success(), "download failed: {status}");
+
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(&asset)
+            .unwrap();
+        for revocation in [RevocationCheck::Online, RevocationCheck::SkipAtStartup] {
+            let chain = authenticode_signer_chain(&asset, &held, revocation)
+                .unwrap_or_else(|error| panic!("{revocation:?}: {error}"));
+            assert_eq!(
+                update_trust::check_signer_chain(&chain),
+                Ok(()),
+                "{chain:?}"
+            );
+        }
+        let strings = read_version_strings(&asset).expect("version resource");
+        assert_eq!(
+            update_trust::check_update_identity(
+                &strings,
+                VersionRule::Release("0.2.13"),
+                "0.2.12",
+                is_newer_version
+            ),
+            Ok(()),
+            "{strings:?}"
+        );
+
+        // Writers are refused while the handle is held; the install copy is not.
+        assert!(
+            fs::OpenOptions::new().write(true).open(&asset).is_err(),
+            "a writer opened the file during verification"
+        );
+        let target = directory.join("installed").join("htop.exe");
+        install_update_file(&asset, &target).expect("copy while the handle is held");
+        drop(held);
+        assert_eq!(fs::read(&target).unwrap(), fs::read(&asset).unwrap());
+
+        let mut modified = fs::read(&asset).unwrap();
+        modified[0x1000] ^= 0x01;
+        let modified_path = directory.join("modified.exe");
+        fs::write(&modified_path, &modified).unwrap();
+        let error = open_verified_update(
+            &modified_path,
+            RevocationCheck::SkipAtStartup,
+            VersionRule::NewerThanRunning,
+        )
+        .expect_err("a modified release binary must be rejected");
+        assert!(error.contains("Authenticode"), "{error}");
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

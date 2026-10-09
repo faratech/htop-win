@@ -71,18 +71,24 @@ fn describe(subject: &[(String, String)]) -> String {
 /// Accept only a signature by [`UPDATE_PUBLISHER`] issued through Microsoft's
 /// Trusted Signing hierarchy.
 pub fn check_signer_chain(chain: &SignerChain) -> Result<(), String> {
-    let [leaf, issuing_ca, pca, root, ..] = chain.subjects.as_slice() else {
-        return Err(format!(
-            "signer chain has {} certificates, expected the 4-level Trusted Signing chain",
-            chain.subjects.len()
-        ));
-    };
+    // The publisher is checked first so that any other signer is reported as
+    // such, whatever shape its chain has.
+    let leaf = chain
+        .subjects
+        .first()
+        .ok_or("signer chain has no certificates")?;
     if !subject_is(leaf, UPDATE_PUBLISHER, UPDATE_PUBLISHER) {
         return Err(format!(
             "unexpected publisher: {}, expected CN and O {UPDATE_PUBLISHER:?}",
             describe(leaf)
         ));
     }
+    let [_, issuing_ca, pca, root, ..] = chain.subjects.as_slice() else {
+        return Err(format!(
+            "signer chain has {} certificates, expected the 4-level Trusted Signing chain",
+            chain.subjects.len()
+        ));
+    };
     if single_attribute(issuing_ca, OID_ORGANIZATION) != Some(MICROSOFT_ORGANIZATION)
         || !subject_is(pca, TRUSTED_SIGNING_PCA, MICROSOFT_ORGANIZATION)
         || !subject_is(root, TRUSTED_SIGNING_ROOT, MICROSOFT_ORGANIZATION)
@@ -308,11 +314,35 @@ mod tests {
         ]);
         let mut short = release_chain();
         short.subjects.truncate(3);
+        let mut leaf_only = release_chain();
+        leaf_only.subjects.truncate(1);
 
-        for chain in [other_root, other_pca, other_issuer, lookalike_root, short] {
+        for chain in [
+            other_root,
+            other_pca,
+            other_issuer,
+            lookalike_root,
+            short,
+            leaf_only,
+        ] {
             let error = check_signer_chain(&chain).expect_err("chain must be rejected");
             assert!(!error.starts_with("unexpected publisher"), "{error}");
         }
+        assert!(check_signer_chain(&SignerChain::default()).is_err());
+    }
+
+    /// Another publisher is reported as such even when its chain is not the
+    /// 4-level Trusted Signing shape (e.g. Microsoft's own 3-level chain).
+    #[test]
+    fn other_publishers_are_rejected_whatever_their_chain_length() {
+        let mut chain = release_chain();
+        chain.subjects[0] = subject(&[
+            (OID_ORGANIZATION, "Microsoft Corporation"),
+            (OID_COMMON_NAME, "Microsoft Corporation"),
+        ]);
+        chain.subjects.truncate(3);
+        let error = check_signer_chain(&chain).expect_err("other publisher accepted");
+        assert!(error.starts_with("unexpected publisher"), "{error}");
     }
 
     #[test]
