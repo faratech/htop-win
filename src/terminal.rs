@@ -601,6 +601,14 @@ impl<'a> From<Span<'a>> for Text<'a> {
 /// sequences) fall back to the heap.
 const SYMBOL_INLINE_CAP: usize = 15;
 
+/// Longest symbol a cell keeps, in UTF-8 bytes. A cell shows one grapheme
+/// cluster, and real clusters (ZWJ emoji, Indic conjuncts, stacked combining
+/// marks) are a few dozen bytes, so this only trims pathological input such
+/// as a pasted run of thousands of combining marks. It also keeps every heap
+/// length within the two bytes `set_heap` stores it in.
+const SYMBOL_MAX_LEN: usize = 256;
+const _: () = assert!(SYMBOL_MAX_LEN <= u16::MAX as usize);
+
 /// `meta` value marking the heap representation. Everything from 0 to
 /// [`SYMBOL_INLINE_CAP`] is the inline byte length instead.
 const SYMBOL_HEAP_TAG: u8 = u8::MAX;
@@ -618,9 +626,10 @@ const SYMBOL_INLINE_EMPTY: Symbol = Symbol {
 /// Packed into 16 bytes: `head` (8) + `tail` (7) hold the inline UTF-8 bytes,
 /// and `meta` doubles as the discriminant — `0..=SYMBOL_INLINE_CAP` is the
 /// inline byte length, [`SYMBOL_HEAP_TAG`] marks the heap form (pointer in
-/// `head`, byte length in `tail[0..2]`, capped at 65 535). `repr(C)` makes
-/// `head`/`tail` contiguous so the inline text reads as one slice; because
-/// the heap pointer is hand-managed, `Clone` and `Drop` are manual.
+/// `head`, byte length in `tail[0..2]`; [`SYMBOL_MAX_LEN`] keeps it in range).
+/// `repr(C)` makes `head`/`tail` contiguous so the inline text reads as one
+/// slice; because the heap pointer is hand-managed, `Clone` and `Drop` are
+/// manual.
 #[repr(C)]
 pub struct Symbol {
     head: usize,
@@ -706,8 +715,14 @@ impl Symbol {
     }
 
     /// Append already-sanitized UTF-8 text, spilling to the heap when the
-    /// inline array cannot hold it.
+    /// inline array cannot hold it. Text past [`SYMBOL_MAX_LEN`] is dropped
+    /// at a char boundary.
     fn push_raw(&mut self, text: &str) {
+        let room = SYMBOL_MAX_LEN.saturating_sub(self.len());
+        let text = &text[..text.floor_char_boundary(room)];
+        if text.is_empty() {
+            return;
+        }
         if self.meta != SYMBOL_HEAP_TAG && self.len() + text.len() > SYMBOL_INLINE_CAP {
             self.spill_to_heap();
         }
@@ -760,7 +775,9 @@ impl Symbol {
     }
 
     fn set_heap(&mut self, boxed: Box<str>) {
-        let len = boxed.len().min(u16::MAX as usize);
+        // `take_heap_box` and `as_str` rebuild the slice from this stored
+        // length, so it must be the Box's exact length, never a saturated one.
+        let len = u16::try_from(boxed.len()).expect("push_raw caps symbols at SYMBOL_MAX_LEN");
         let ptr = Box::into_raw(boxed) as *mut u8 as usize;
         self.head = ptr;
         self.tail = [0; 7];
@@ -3541,6 +3558,46 @@ mod tests {
         // Appending still works on the spilled representation.
         symbol.push_sanitized_str("r");
         assert_eq!(symbol.as_str(), "abcdefghijklmnopqr");
+    }
+
+    /// Issue #111: the heap length is stored in two bytes. A cell that grew
+    /// past 65 535 bytes used to read back a truncated, possibly non-UTF-8
+    /// prefix and rebuild its Box with the wrong length.
+    #[test]
+    fn symbol_growth_is_capped_on_a_char_boundary() {
+        // Enclosing circle (U+20DD, 3 bytes) is width 0, so width-0 runs
+        // append it to the previous cell one grapheme at a time.
+        let mark = "\u{20DD}";
+        let mut appended = Symbol::default();
+        appended.clear();
+        appended.push_sanitized_str("e");
+        for _ in 0..30_000 {
+            appended.push_sanitized_str(mark);
+        }
+        let expected = format!("e{}", mark.repeat((SYMBOL_MAX_LEN - 1) / mark.len()));
+        assert_eq!(appended.as_str(), expected);
+
+        // One 90 001-byte grapheme cluster in a single push.
+        let mut cell = BufferCell::default();
+        cell.set_symbol(&format!("e{}", mark.repeat(30_000)));
+        assert_eq!(cell.symbol.as_str(), expected);
+
+        let cloned = cell.symbol.clone();
+        assert_eq!(cloned, cell.symbol);
+        drop(cloned);
+        cell.reset();
+        assert!(cell.symbol.is_inline());
+    }
+
+    #[test]
+    fn long_combining_run_in_a_string_stays_within_the_symbol_cap() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+        let text = format!("e{}x", "\u{0301}".repeat(40_000));
+        buf.set_string(0, 0, &text, Style::default());
+        let first = buf.get(0, 0).unwrap().symbol.as_str();
+        assert!(first.len() <= SYMBOL_MAX_LEN, "{} bytes", first.len());
+        assert!(first.starts_with('e'));
+        assert_eq!(buf.get(1, 0).unwrap().symbol.as_str(), "x");
     }
 
     #[test]
