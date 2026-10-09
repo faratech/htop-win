@@ -9,7 +9,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, RwLock};
-use std::time::{Duration, Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use super::process::ProcessArch;
 
@@ -35,6 +35,7 @@ pub mod config {
 
 /// FILETIME of the Unix epoch (1601-01-01 → 1970-01-01) in 100ns ticks, used
 /// to express mtimes and process create times in the same units.
+#[cfg(any(test, not(windows)))]
 const UNIX_EPOCH_FILETIME_100NS: u64 = 116444736000000000;
 
 /// How long an exe-status entry stays fresh before its file is re-stat'd.
@@ -157,6 +158,191 @@ fn exe_status_jitter(exe_path: &str, start_time_100ns: u64) -> Duration {
     hash ^= hash >> 33;
     let nanos = hash % EXE_STATUS_MAX_JITTER.as_nanos().max(1) as u64;
     Duration::from_nanos(nanos)
+}
+
+/// What [`stat_local_file`] learned about a file without leaving the machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LocalFileStat {
+    /// Opened on a local disk volume; last write time in FILETIME units.
+    Present { last_write_100ns: u64 },
+    /// The local volume reports the file, or one of its directories, missing.
+    Missing,
+    /// Not looked at, or not answerable: the path is not on a local disk
+    /// volume, a reparse point lies on the way, access was denied, ...
+    Unknown,
+}
+
+/// Stat a Win32 path only if it provably stays on a local disk volume.
+///
+/// Process image paths of other users' processes are attacker-chosen, and
+/// any file system access to a UNC, WebDAV or mapped-drive path from an
+/// elevated htop authenticates to that host with the administrator's
+/// credentials (issue #108). So this is an allowlist, not a filter:
+/// - Only a strict `X:\name\...` path is accepted. Its drive is mapped to an
+///   NT device through the DOS device link (`QueryDosDeviceW`, an object
+///   manager lookup with no I/O), and the device must be exactly
+///   `\Device\HarddiskVolume<N>`. Network redirectors (`\Device\Mup`,
+///   `\Device\LanmanRedirector`, `\Device\WebDavRedirector`), `subst`
+///   targets (`\??\...`) and every `\\...` form are never touched.
+/// - The NT path is opened with `NtOpenFile` and `OBJ_DONT_REPARSE`, so a
+///   symlink or junction in any directory of the path (planted before or
+///   after the process started) fails the open instead of redirecting it.
+///   `FILE_OPEN_REPARSE_POINT` opens a reparse point in the last component
+///   itself rather than its target.
+pub fn stat_local_file(win32_path: &str) -> LocalFileStat {
+    #[cfg(not(windows))]
+    if win32_path.starts_with('/') && !win32_path.starts_with("//") {
+        // Development builds on Unix: absolute Unix paths are local.
+        return stat_unix_path(win32_path);
+    }
+    match native_volume_path(win32_path, dos_device_target) {
+        Some(native) => open_without_reparse(&native),
+        None => LocalFileStat::Unknown,
+    }
+}
+
+/// The NT path of a strict drive-letter Win32 path whose drive is a local
+/// disk volume, or `None`. `dos_device` resolves an upper-case drive letter
+/// to its DOS device target.
+fn native_volume_path(
+    win32_path: &str,
+    dos_device: impl Fn(u8) -> Option<String>,
+) -> Option<String> {
+    let (letter, rest) = match win32_path.as_bytes() {
+        [letter, b':', b'\\', ..] if letter.is_ascii_alphabetic() => {
+            (letter.to_ascii_uppercase(), &win32_path[3..])
+        }
+        _ => return None,
+    };
+    // Plain names only: no empty, "." or ".." components, and none of the
+    // characters Win32 would reinterpret ('/') or that select streams (':').
+    let plain_component = |name: &str| {
+        !name.is_empty() && name != "." && name != ".." && !name.contains(['/', ':', '\0'])
+    };
+    if !rest.split('\\').all(plain_component) {
+        return None;
+    }
+    let device = dos_device(letter)?;
+    is_local_volume_device(&device).then(|| format!("{device}\\{rest}"))
+}
+
+/// Exactly `\Device\HarddiskVolume<N>`: the device object of a local disk
+/// volume, with nothing after the number.
+fn is_local_volume_device(device: &str) -> bool {
+    device
+        .strip_prefix(r"\Device\HarddiskVolume")
+        .is_some_and(|number| !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// First target of the DOS device link for drive `letter` (`X:`).
+#[cfg(windows)]
+fn dos_device_target(letter: u8) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::QueryDosDeviceW;
+
+    let name = [u16::from(letter), u16::from(b':'), 0];
+    let mut target = [0u16; 512];
+    let len = unsafe { QueryDosDeviceW(windows::core::PCWSTR(name.as_ptr()), Some(&mut target)) };
+    // A multi-string; the first entry is the current target.
+    let first = target[..len as usize].split(|&c| c == 0).next()?;
+    (!first.is_empty()).then(|| String::from_utf16_lossy(first))
+}
+
+/// Development builds on Unix have no drive letters: every letter maps to
+/// a pretend local volume, so drive paths read as missing local files.
+#[cfg(not(windows))]
+fn dos_device_target(_letter: u8) -> Option<String> {
+    Some(r"\Device\HarddiskVolume1".to_string())
+}
+
+#[cfg(windows)]
+fn open_without_reparse(native_path: &str) -> LocalFileStat {
+    use windows::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows::Wdk::Storage::FileSystem::{
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, NtOpenFile,
+    };
+    use windows::Win32::Foundation::{
+        CloseHandle, HANDLE, OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, STATUS_OBJECT_NAME_NOT_FOUND,
+        STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, GetFileInformationByHandle, SYNCHRONIZE,
+    };
+    use windows::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let mut wide: Vec<u16> = native_path.encode_utf16().collect();
+    let Ok(byte_len) = u16::try_from(wide.len() * 2) else {
+        return LocalFileStat::Unknown;
+    };
+    let name = UNICODE_STRING {
+        Length: byte_len,
+        MaximumLength: byte_len,
+        Buffer: windows::core::PWSTR(wide.as_mut_ptr()),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        ObjectName: &name,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        ..Default::default()
+    };
+    let mut handle = HANDLE::default();
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let status = unsafe {
+        NtOpenFile(
+            &mut handle,
+            (FILE_READ_ATTRIBUTES | SYNCHRONIZE).0,
+            &attributes,
+            &mut io_status,
+            (FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0,
+            (FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT).0,
+        )
+    };
+    if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND {
+        return LocalFileStat::Missing;
+    }
+    if status.0 < 0 {
+        // Includes STATUS_REPARSE_POINT_ENCOUNTERED.
+        return LocalFileStat::Unknown;
+    }
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let queried = unsafe { GetFileInformationByHandle(handle, &mut info) }.is_ok();
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+    if !queried {
+        return LocalFileStat::Unknown;
+    }
+    let written = info.ftLastWriteTime;
+    LocalFileStat::Present {
+        last_write_100ns: (u64::from(written.dwHighDateTime) << 32)
+            | u64::from(written.dwLowDateTime),
+    }
+}
+
+#[cfg(not(windows))]
+fn open_without_reparse(native_path: &str) -> LocalFileStat {
+    stat_unix_path(native_path)
+}
+
+#[cfg(not(windows))]
+fn stat_unix_path(path: &str) -> LocalFileStat {
+    use std::time::UNIX_EPOCH;
+
+    match std::fs::metadata(path) {
+        Ok(metadata) => metadata
+            .modified()
+            .ok()
+            .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+            .map_or(LocalFileStat::Unknown, |since_epoch| {
+                LocalFileStat::Present {
+                    last_write_100ns: UNIX_EPOCH_FILETIME_100NS
+                        .saturating_add(since_epoch.as_secs().saturating_mul(10_000_000))
+                        .saturating_add(u64::from(since_epoch.subsec_nanos() / 100)),
+                }
+            }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LocalFileStat::Missing,
+        Err(_) => LocalFileStat::Unknown,
+    }
 }
 
 /// Total number of cached entries across every path (test cross-check for
@@ -393,8 +579,6 @@ impl ProcessCache {
         jitter: bool,
         budgeted: bool,
     ) -> (bool, bool) {
-        use std::fs;
-
         if exe_path.is_empty() {
             return (false, false);
         }
@@ -426,26 +610,17 @@ impl ProcessCache {
             return existing.map_or((false, false), |(updated, deleted, _)| (updated, deleted));
         }
 
-        // Cache miss or due - do filesystem check. The comparison only needs
-        // the file's own mtime converted into FILETIME units; no wall-clock
+        // Cache miss or due - do filesystem check. Only files on local disk
+        // volumes are opened, never through a reparse point (see
+        // `stat_local_file`); anything else gets the neutral verdict, cached
+        // like any other. Both times are FILETIME units, so no wall-clock
         // read is required here.
-        let result = match fs::metadata(exe_path) {
-            Ok(metadata) => {
-                let exe_updated = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
-                    .map(|mtime_unix| {
-                        let mtime_100ns = UNIX_EPOCH_FILETIME_100NS
-                            .saturating_add(mtime_unix.as_secs().saturating_mul(10_000_000))
-                            .saturating_add((mtime_unix.subsec_nanos() / 100) as u64);
-                        mtime_100ns > start_time_100ns
-                    })
-                    .unwrap_or(false);
-                (exe_updated, false)
+        let result = match stat_local_file(exe_path) {
+            LocalFileStat::Present { last_write_100ns } => {
+                (last_write_100ns > start_time_100ns, false)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (false, true),
-            Err(_) => (false, false),
+            LocalFileStat::Missing => (false, true),
+            LocalFileStat::Unknown => (false, false),
         };
 
         // Update cache (size-capped; shed expired entries before clearing)
@@ -542,7 +717,7 @@ impl Default for ProcessCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::SystemTime;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     impl ProcessCache {
         fn with_exe_status<R>(&self, f: impl FnOnce(&ExeStatusMap) -> R) -> R {
@@ -691,6 +866,168 @@ mod tests {
 
     fn path_str(path: &std::path::Path) -> &str {
         path.to_str().expect("utf-8 temp path")
+    }
+
+    /// DOS device targets as `QueryDosDeviceW` reports them for local
+    /// volumes, mapped network and WebDAV drives, and `subst` drives.
+    fn fake_dos_devices(letter: u8) -> Option<String> {
+        let target = match letter {
+            b'C' => r"\Device\HarddiskVolume3",
+            b'D' => r"\Device\HarddiskVolume12",
+            b'Z' => r"\Device\LanmanRedirector\;Z:000000000001a2b3\attacker\share",
+            b'Y' => r"\Device\Mup\;WebDavRedirector\;Y:000000000001a2b3\attacker@SSL\DavWWWRoot",
+            b'W' => r"\Device\WebDavRedirector\;W:000000000001a2b3\attacker\DavWWWRoot",
+            b'S' => r"\??\UNC\attacker\share",
+            b'T' => r"\??\C:\tools",
+            b'V' => r"\Device\HarddiskVolume",
+            b'U' => r"\Device\HarddiskVolume3\..\Mup\attacker\share",
+            b'R' => r"\Device\HarddiskVolumeShadowCopy1",
+            _ => return None,
+        };
+        Some(target.to_string())
+    }
+
+    /// Issue #108: only strict drive-letter paths on a local disk volume
+    /// reach the file system; every other spelling is refused unopened.
+    #[test]
+    fn only_paths_on_local_disk_volumes_get_a_native_path() {
+        assert_eq!(
+            native_volume_path(r"C:\Windows\System32\cmd.exe", fake_dos_devices).as_deref(),
+            Some(r"\Device\HarddiskVolume3\Windows\System32\cmd.exe")
+        );
+        assert_eq!(
+            native_volume_path(r"d:\tools\app.exe", fake_dos_devices).as_deref(),
+            Some(r"\Device\HarddiskVolume12\tools\app.exe")
+        );
+
+        for hostile in [
+            // UNC, in every Win32 and NT spelling.
+            r"\\attacker\share\x.exe",
+            "//attacker/share/x.exe",
+            r"\/attacker/share\x.exe",
+            r"\\?\UNC\attacker\share\x.exe",
+            r"\\.\UNC\attacker\share\x.exe",
+            r"\??\UNC\attacker\share\x.exe",
+            r"\\?\GLOBALROOT\Device\Mup\attacker\share\x.exe",
+            r"\Device\Mup\attacker\share\x.exe",
+            r"UNC\attacker\share\x.exe",
+            // WebDAV.
+            r"\\attacker@SSL\DavWWWRoot\x.exe",
+            r"\\attacker@SSL@443\DavWWWRoot\x.exe",
+            r"\\attacker@80\share\x.exe",
+            // Drives that are mapped network or WebDAV shares, subst
+            // drives, malformed or non-volume devices, and unmapped letters.
+            r"Z:\x.exe",
+            r"Y:\x.exe",
+            r"W:\x.exe",
+            r"S:\x.exe",
+            r"T:\x.exe",
+            r"V:\x.exe",
+            r"U:\x.exe",
+            r"R:\x.exe",
+            r"Q:\x.exe",
+            // Local drive, but not a plain path.
+            r"\\?\C:\Windows\x.exe",
+            r"\\.\C:\Windows\x.exe",
+            "C:/Windows/x.exe",
+            r"C:\Windows/x.exe",
+            r"C:\Windows\..\..\Device\Mup\attacker\x.exe",
+            r"C:\Windows\.\x.exe",
+            r"C:\Windows\\x.exe",
+            r"C:\Windows\x.exe\",
+            r"C:\x.exe:stream",
+            "C:\\x\0.exe",
+            r"C:\",
+            "C:x.exe",
+            "C:",
+            r"\Windows\x.exe",
+            "x.exe",
+            "",
+        ] {
+            assert_eq!(
+                native_volume_path(hostile, fake_dos_devices),
+                None,
+                "{hostile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_images_get_the_neutral_verdict() {
+        let cache = ProcessCache::new();
+        let start_time = filetime_from_unix_secs(1_000);
+        let t0 = Instant::now();
+        for path in [
+            r"\\htop-win-test.invalid\share\x.exe",
+            "//htop-win-test.invalid/share/x.exe",
+            r"\\?\UNC\htop-win-test.invalid\share\x.exe",
+            r"\\?\GLOBALROOT\Device\Mup\htop-win-test.invalid\share\x.exe",
+        ] {
+            assert_eq!(
+                cache.check_exe_status_at(path, start_time, t0),
+                (false, false),
+                "{path}"
+            );
+        }
+    }
+
+    /// A junction anywhere in the path must stop the open (`OBJ_DONT_REPARSE`)
+    /// rather than be followed, even when it points somewhere local.
+    #[cfg(windows)]
+    #[test]
+    fn reparse_points_in_the_path_are_not_followed() {
+        let base = temp_exe_path("reparse");
+        let real = base.join("real");
+        let junction = base.join("junction");
+        std::fs::create_dir_all(&real).expect("create temp dir");
+        let file = real.join("x.exe");
+        write_file_with_mtime(&file, UNIX_EPOCH + Duration::from_secs(2_000));
+
+        assert!(matches!(
+            stat_local_file(path_str(&file)),
+            LocalFileStat::Present { .. }
+        ));
+        assert_eq!(
+            stat_local_file(path_str(&real.join("missing.exe"))),
+            LocalFileStat::Missing
+        );
+
+        let mklink_junction = |link: &std::path::Path, target: &std::path::Path| {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        // A junction whose target does not exist: following it would read
+        // "missing", so anything but Missing proves it was not followed.
+        let dangling = base.join("dangling");
+        let made =
+            mklink_junction(&junction, &real) && mklink_junction(&dangling, &base.join("nowhere"));
+        if made {
+            assert_eq!(
+                stat_local_file(path_str(&junction.join("x.exe"))),
+                LocalFileStat::Unknown
+            );
+            assert_eq!(
+                stat_local_file(path_str(&dangling.join("x.exe"))),
+                LocalFileStat::Unknown
+            );
+            // As the last component the junction is opened itself (or
+            // refused), never resolved to its target.
+            assert_ne!(stat_local_file(path_str(&dangling)), LocalFileStat::Missing);
+        } else {
+            // Junctions need no privilege, so CI must exercise this case.
+            assert!(
+                std::env::var_os("GITHUB_ACTIONS").is_none(),
+                "mklink /J failed on CI; the OBJ_DONT_REPARSE case did not run"
+            );
+            eprintln!("skipped junction case: mklink /J failed");
+        }
+        let _ = std::fs::remove_dir(&dangling);
+        let _ = std::fs::remove_dir(&junction);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
