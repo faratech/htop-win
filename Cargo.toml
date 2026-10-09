@@ -27,12 +27,15 @@ windows = { version = "0.62.2", features = [
     "Win32_System_SystemInformation",
     "Win32_System_Performance",
     "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_Console",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinHttp",
     "Wdk_System_SystemInformation",
     "Wdk_Graphics_Direct3D",
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
 ] }
 
 [build-dependencies]

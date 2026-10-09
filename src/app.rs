@@ -3007,21 +3007,47 @@ impl App {
             use std::os::windows::process::CommandExt;
             use std::process::Command;
 
+            use crate::system::cache::{LocalFileStat, stat_local_file};
+
+            // Only plain paths on a local disk, checked without following
+            // reparse points: the path can come from another user's process,
+            // and touching a network location would authenticate this
+            // (possibly elevated) session to that host (#108).
+            let is_present =
+                |path: &str| matches!(stat_local_file(path), LocalFileStat::Present { .. });
             let p = std::path::Path::new(&path);
             let mut cmd = Command::new("explorer.exe");
-            if p.exists() {
-                // Must use raw_arg because explorer.exe /select,"<path>" requires the quotes
-                // to enclose ONLY the path, not the leading /select, switch.
-                // Standard .arg() would wrap the entire "/select,..." in quotes if there are spaces.
-                cmd.raw_arg(format!("/select,\"{}\"", path));
-            } else if let Some(parent) = p.parent().filter(|par| par.exists()) {
-                cmd.arg(parent);
-            } else {
-                self.last_error = Some((
-                    format!("Path not found on disk: {path}"),
-                    Instant::now(),
-                ));
-                return;
+            match stat_local_file(&path) {
+                LocalFileStat::Present { .. } => {
+                    // Must use raw_arg because explorer.exe /select,"<path>" requires the quotes
+                    // to enclose ONLY the path, not the leading /select, switch.
+                    // Standard .arg() would wrap the entire "/select,..." in quotes if there are spaces.
+                    cmd.raw_arg(format!("/select,\"{}\"", path));
+                }
+                LocalFileStat::Missing => {
+                    match p
+                        .parent()
+                        .filter(|par| par.to_str().is_some_and(is_present))
+                    {
+                        Some(parent) => {
+                            cmd.arg(parent);
+                        }
+                        None => {
+                            self.last_error =
+                                Some((format!("Path not found on disk: {path}"), Instant::now()));
+                            return;
+                        }
+                    }
+                }
+                LocalFileStat::Unknown => {
+                    self.last_error = Some((
+                        format!(
+                            "Not opening {path}: not a plain path on a local disk (y copies the path)"
+                        ),
+                        Instant::now(),
+                    ));
+                    return;
+                }
             }
 
             match cmd.spawn() {
