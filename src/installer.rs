@@ -23,6 +23,8 @@ use windows::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingl
 #[cfg(windows)]
 use windows::core::{PCWSTR, PWSTR, w};
 
+use crate::update_trust::{self, SignerChain, Subject, VersionRule, VersionStrings};
+
 /// Get the installation path for htop
 pub fn get_install_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let local_app_data = std::env::var("LOCALAPPDATA")?;
@@ -338,9 +340,9 @@ const MIN_UPDATE_SIZE: usize = 100 * 1024;
 
 /// Reject anything that is not plausibly a Windows PE executable, so a CDN
 /// error page or truncated download is never installed over the working exe.
-/// (Transport integrity comes from WinHTTP's TLS; if stronger guarantees are
-/// ever wanted, Authenticode via WinVerifyTrust — zero new deps — is the next
-/// step, not a hand-rolled checksum.)
+/// This is only a cheap pre-filter: authenticity comes from
+/// [`open_verified_update`], which every update must pass before it is staged
+/// and again before it is installed.
 fn validate_pe_executable(body: &[u8]) -> Result<(), String> {
     if body.len() < MIN_UPDATE_SIZE {
         return Err(format!(
@@ -394,6 +396,361 @@ fn validate_target_pe_executable(body: &[u8]) -> Result<(), String> {
             target_arch()
         ))
     }
+}
+
+/// How [`open_verified_update`] checks certificate revocation.
+#[derive(Clone, Copy, Debug)]
+enum RevocationCheck {
+    /// Check the whole chain except the root, fetching CRL/OCSP data as
+    /// needed. Used whenever the file was just downloaded or is installed on
+    /// explicit request.
+    Online,
+    /// Skip the revocation check and never touch the network. Only for
+    /// applying a staged update at startup: staging already checked
+    /// revocation online, startup must not wait on CRL/OCSP downloads, and an
+    /// offline launch must not discard a verified update.
+    SkipAtStartup,
+}
+
+/// Open `path` without write or delete sharing and prove it is the htop-win
+/// release it claims to be. Every check fails closed:
+/// 1. WinVerifyTrust (WINTRUST_ACTION_GENERIC_VERIFY_V2) must return success.
+/// 2. The primary signature's chain must be the Trusted Signing chain for
+///    "Fara Technologies LLC" ([`update_trust::check_signer_chain`]).
+/// 3. The VERSIONINFO of the same, still-locked file must name htop-win and
+///    a FileVersion allowed by `rule` ([`update_trust::check_update_identity`]),
+///    so neither another Fara Technologies program nor an older htop-win
+///    (rollback) is accepted.
+///
+/// Callers that install the file keep the returned handle open until the
+/// copy finishes, so the bytes installed are the bytes verified.
+fn open_verified_update(
+    path: &Path,
+    revocation: RevocationCheck,
+    rule: VersionRule<'_>,
+) -> Result<File, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ.0)
+        .open(path)
+        .map_err(|error| format!("failed to open update for verification: {error}"))?;
+    let chain = authenticode_signer_chain(path, &file, revocation)?;
+    update_trust::check_signer_chain(&chain)?;
+    let strings = read_version_strings(path)?;
+    update_trust::check_update_identity(
+        &strings,
+        rule,
+        env!("CARGO_PKG_VERSION"),
+        is_newer_version,
+    )?;
+    Ok(file)
+}
+
+/// Run WinVerifyTrust on the open file and return the chain it built for
+/// the primary signature. Any status other than success is an error.
+fn authenticode_signer_chain(
+    path: &Path,
+    file: &File,
+    revocation: RevocationCheck,
+) -> Result<SignerChain, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows::Win32::Foundation::{HWND, INVALID_HANDLE_VALUE};
+    use windows::Win32::Security::WinTrust::{
+        WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_DATA_0, WINTRUST_FILE_INFO,
+        WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_DISABLE_MD2_MD4,
+        WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT, WTD_REVOKE_NONE, WTD_REVOKE_WHOLECHAIN,
+        WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY, WTD_UI_NONE, WinVerifyTrust,
+    };
+
+    let wide_path: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut file_info = WINTRUST_FILE_INFO {
+        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
+        pcwszFilePath: PCWSTR(wide_path.as_ptr()),
+        hFile: HANDLE(file.as_raw_handle()),
+        pgKnownSubject: std::ptr::null_mut(),
+    };
+    let (revocation_checks, provider_flags) = match revocation {
+        RevocationCheck::Online => (
+            WTD_REVOKE_WHOLECHAIN,
+            WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT | WTD_DISABLE_MD2_MD4,
+        ),
+        RevocationCheck::SkipAtStartup => (
+            WTD_REVOKE_NONE,
+            WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_DISABLE_MD2_MD4,
+        ),
+    };
+    let mut data = WINTRUST_DATA {
+        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+        dwUIChoice: WTD_UI_NONE,
+        fdwRevocationChecks: revocation_checks,
+        dwUnionChoice: WTD_CHOICE_FILE,
+        Anonymous: WINTRUST_DATA_0 {
+            pFile: &mut file_info,
+        },
+        dwStateAction: WTD_STATEACTION_VERIFY,
+        dwProvFlags: provider_flags,
+        ..Default::default()
+    };
+    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    // INVALID_HANDLE_VALUE as the window means no interactive user: never show UI.
+    let no_ui = HWND(INVALID_HANDLE_VALUE.0);
+
+    unsafe {
+        let status = WinVerifyTrust(no_ui, &mut action, (&raw mut data).cast());
+        let result = if status == 0 {
+            // The provider state stays valid until WTD_STATEACTION_CLOSE.
+            read_signer_chain(data.hWVTStateData)
+        } else {
+            Err(format!(
+                "Authenticode verification failed ({:#010x}: {})",
+                status as u32,
+                windows::core::HRESULT(status).message().trim_end()
+            ))
+        };
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        let _ = WinVerifyTrust(no_ui, &mut action, (&raw mut data).cast());
+        result
+    }
+}
+
+/// Subjects (leaf to root) and leaf EKUs of signer 0, the primary signature.
+unsafe fn read_signer_chain(state: HANDLE) -> Result<SignerChain, String> {
+    use windows::Win32::Security::WinTrust::{
+        WTHelperGetProvCertFromChain, WTHelperGetProvSignerFromChain, WTHelperProvDataFromStateData,
+    };
+
+    let missing = || "Authenticode verification returned no signer chain".to_string();
+    let provider = unsafe { WTHelperProvDataFromStateData(state) };
+    if provider.is_null() {
+        return Err(missing());
+    }
+    let signer = unsafe { WTHelperGetProvSignerFromChain(provider, 0, false, 0) };
+    if signer.is_null() {
+        return Err(missing());
+    }
+    let mut chain = SignerChain::default();
+    for index in 0..unsafe { (*signer).csCertChain } {
+        let entry = unsafe { WTHelperGetProvCertFromChain(signer, index) };
+        if entry.is_null() || unsafe { (*entry).pCert.is_null() } {
+            return Err(missing());
+        }
+        let cert = unsafe { (*entry).pCert };
+        chain.subjects.push(unsafe { cert_subject(cert) }?);
+        if index == 0 {
+            chain.leaf_ekus = unsafe { cert_extended_key_usages(cert) }?;
+        }
+    }
+    Ok(chain)
+}
+
+/// The certificate's subject as parsed RDN attributes, in encoded order.
+/// Values that are not strings decode to U+FFFD, which matches nothing.
+unsafe fn cert_subject(
+    cert: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
+) -> Result<Subject, String> {
+    use windows::Win32::Security::Cryptography::{
+        CERT_NAME_INFO, CERT_RDN_ENCODED_BLOB, CERT_RDN_OCTET_STRING, CryptDecodeObjectEx,
+        X509_ASN_ENCODING, X509_UNICODE_NAME,
+    };
+
+    let info = unsafe { (*cert).pCertInfo };
+    if info.is_null() {
+        return Err("signing certificate has no CERT_INFO".into());
+    }
+    let blob = unsafe { (*info).Subject };
+    let encoded = unsafe { std::slice::from_raw_parts(blob.pbData, blob.cbData as usize) };
+    let decode_error =
+        |error: windows::core::Error| format!("cannot decode certificate subject: {error}");
+    let mut size = 0u32;
+    unsafe {
+        CryptDecodeObjectEx(
+            X509_ASN_ENCODING,
+            X509_UNICODE_NAME,
+            encoded,
+            0,
+            None,
+            None,
+            &mut size,
+        )
+    }
+    .map_err(decode_error)?;
+    // u64 storage keeps the decoded structures aligned.
+    let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
+    unsafe {
+        CryptDecodeObjectEx(
+            X509_ASN_ENCODING,
+            X509_UNICODE_NAME,
+            encoded,
+            0,
+            None,
+            Some(buffer.as_mut_ptr().cast()),
+            &mut size,
+        )
+    }
+    .map_err(decode_error)?;
+
+    let name = unsafe { &*buffer.as_ptr().cast::<CERT_NAME_INFO>() };
+    let mut subject = Subject::new();
+    for rdn in unsafe { raw_slice(name.rgRDN, name.cRDN) } {
+        for attribute in unsafe { raw_slice(rdn.rgRDNAttr, rdn.cRDNAttr) } {
+            let oid = unsafe { attribute.pszObjId.to_string() }
+                .map_err(|_| "certificate subject has a non-UTF-8 OID".to_string())?;
+            let value_type = attribute.dwValueType as i32;
+            let value = if value_type == CERT_RDN_ENCODED_BLOB.0
+                || value_type == CERT_RDN_OCTET_STRING.0
+            {
+                "\u{FFFD}".to_string()
+            } else {
+                // X509_UNICODE_NAME decodes string values to UTF-16.
+                let bytes = unsafe { raw_slice(attribute.Value.pbData, attribute.Value.cbData) };
+                let units: Vec<u16> = bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&pair| u16::from_le_bytes(pair))
+                    .collect();
+                String::from_utf16(&units)
+                    .map_err(|_| "certificate subject has invalid UTF-16".to_string())?
+                    .trim_end_matches('\0')
+                    .to_string()
+            };
+            subject.push((oid, value));
+        }
+    }
+    Ok(subject)
+}
+
+/// EKU OIDs from the certificate's extension (not from store properties).
+unsafe fn cert_extended_key_usages(
+    cert: *const windows::Win32::Security::Cryptography::CERT_CONTEXT,
+) -> Result<Vec<String>, String> {
+    use windows::Win32::Security::Cryptography::{
+        CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG, CTL_USAGE, CertGetEnhancedKeyUsage,
+    };
+
+    let read_error =
+        |error: windows::core::Error| format!("cannot read signing certificate EKUs: {error}");
+    let flags = CERT_FIND_EXT_ONLY_ENHKEY_USAGE_FLAG.0;
+    let mut size = 0u32;
+    unsafe { CertGetEnhancedKeyUsage(cert, flags, None, &mut size) }.map_err(read_error)?;
+    let mut buffer = vec![0u64; (size as usize).div_ceil(8)];
+    unsafe { CertGetEnhancedKeyUsage(cert, flags, Some(buffer.as_mut_ptr().cast()), &mut size) }
+        .map_err(read_error)?;
+    let usage = unsafe { &*buffer.as_ptr().cast::<CTL_USAGE>() };
+    unsafe { raw_slice(usage.rgpszUsageIdentifier, usage.cUsageIdentifier) }
+        .iter()
+        .map(|oid| unsafe { oid.to_string() }.map_err(|_| "EKU OID is not UTF-8".to_string()))
+        .collect()
+}
+
+/// `len` elements at `ptr`, or an empty slice for a null pointer.
+unsafe fn raw_slice<'a, T>(ptr: *const T, len: u32) -> &'a [T] {
+    if ptr.is_null() || len == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+    }
+}
+
+/// The VERSIONINFO strings of the (locked) update file, read from the file
+/// itself (FILE_VER_GET_NEUTRAL: never a side-by-side .mui file).
+fn read_version_strings(path: &Path) -> Result<VersionStrings, String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        FILE_VER_GET_NEUTRAL, GetFileVersionInfoExW, GetFileVersionInfoSizeExW, VerQueryValueW,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut ignored = 0u32;
+    let size = unsafe {
+        GetFileVersionInfoSizeExW(FILE_VER_GET_NEUTRAL, PCWSTR(wide.as_ptr()), &mut ignored)
+    };
+    if size == 0 {
+        return Err("update has no version resource".into());
+    }
+    let mut block = vec![0u8; size as usize];
+    unsafe {
+        GetFileVersionInfoExW(
+            FILE_VER_GET_NEUTRAL,
+            PCWSTR(wide.as_ptr()),
+            None,
+            size,
+            block.as_mut_ptr().cast(),
+        )
+    }
+    .map_err(|error| format!("cannot read version resource: {error}"))?;
+
+    // Bytes of `query` inside `block`, or None if absent or out of bounds.
+    let query = |query: &str, unit: usize| -> Option<&[u8]> {
+        let query: Vec<u16> = query.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut value: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut len = 0u32;
+        let found = unsafe {
+            VerQueryValueW(
+                block.as_ptr().cast(),
+                PCWSTR(query.as_ptr()),
+                &mut value,
+                &mut len,
+            )
+        };
+        let start = (value as usize).checked_sub(block.as_ptr() as usize)?;
+        let end = start.checked_add(len as usize * unit)?;
+        (found.as_bool() && !value.is_null()).then(|| block.get(start..end))?
+    };
+    let translation = query("\\VarFileInfo\\Translation", 1)
+        .filter(|bytes| bytes.len() >= 4)
+        .ok_or("version resource has no translation table")?;
+    let language = u16::from_le_bytes([translation[0], translation[1]]);
+    let code_page = u16::from_le_bytes([translation[2], translation[3]]);
+    let string = |name: &str| -> Option<String> {
+        let bytes = query(
+            &format!("\\StringFileInfo\\{language:04x}{code_page:04x}\\{name}"),
+            2,
+        )?;
+        let units: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| u16::from_le_bytes(pair))
+            .take_while(|&unit| unit != 0)
+            .collect();
+        String::from_utf16(&units).ok()
+    };
+    Ok(VersionStrings {
+        product_name: string("ProductName"),
+        original_filename: string("OriginalFilename"),
+        internal_name: string("InternalName"),
+        file_version: string("FileVersion"),
+    })
+}
+
+/// Install `update_file` over `target_path` only after it passes
+/// [`open_verified_update`]. The verification handle stays open (denying
+/// writers) until the copy completes.
+fn install_verified_update(
+    update_file: &Path,
+    target_path: &Path,
+    revocation: RevocationCheck,
+    rule: VersionRule<'_>,
+) -> Result<(), String> {
+    let verified = open_verified_update(update_file, revocation, rule)
+        .map_err(|error| format!("update rejected: {error}"))?;
+    let installed = install_update_file(update_file, target_path)
+        .map_err(|error| format!("installation failed: {error}"));
+    drop(verified);
+    installed
 }
 
 const UPDATE_FILE_NAME: &str = "htop-win-update.exe";
@@ -465,15 +822,24 @@ fn write_synced_file(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 /// Write a complete update pair into a private directory, then publish it with
-/// one same-volume directory rename. Readers never observe a partial pair.
-fn stage_pending_update(version: &str, body: &[u8]) -> Result<PendingUpdate, String> {
-    stage_pending_update_in(&update_root_path(), version, body)
+/// one same-volume directory rename. Readers never observe a partial pair, and
+/// nothing is published unless the executable passes [`open_verified_update`]
+/// under `rule`, with an online revocation check since it was just downloaded.
+fn stage_pending_update(
+    version: &str,
+    body: &[u8],
+    rule: VersionRule<'_>,
+) -> Result<PendingUpdate, String> {
+    stage_pending_update_in(&update_root_path(), version, body, |path| {
+        open_verified_update(path, RevocationCheck::Online, rule).map(drop)
+    })
 }
 
 fn stage_pending_update_in(
     root: &Path,
     version: &str,
     body: &[u8],
+    verify: impl Fn(&Path) -> Result<(), String>,
 ) -> Result<PendingUpdate, String> {
     validate_target_pe_executable(body)
         .map_err(|error| format!("downloaded update rejected: {error}"))?;
@@ -490,8 +856,10 @@ fn stage_pending_update_in(
         .map_err(|error| format!("failed to create private update stage: {error}"))?;
 
     let result = (|| -> Result<(), String> {
-        write_synced_file(&staging_dir.join(UPDATE_FILE_NAME), body)
+        let staged_file = staging_dir.join(UPDATE_FILE_NAME);
+        write_synced_file(&staged_file, body)
             .map_err(|error| format!("failed to write staged update: {error}"))?;
+        verify(&staged_file).map_err(|error| format!("downloaded update rejected: {error}"))?;
         write_synced_file(
             &staging_dir.join(UPDATE_METADATA_NAME),
             update_metadata(version).as_bytes(),
@@ -926,6 +1294,12 @@ pub fn update_from_github(force: bool) -> Result<(), Box<dyn std::error::Error>>
         return Ok(());
     }
 
+    // --force may reinstall the current release, never an older one.
+    let rule = if is_newer_version(&latest_version, current_version) {
+        VersionRule::Release(&latest_version)
+    } else {
+        VersionRule::Reinstall(&latest_version)
+    };
     if force && !is_newer_version(&latest_version, current_version) {
         println!("Force reinstalling htop {} from GitHub...", latest_version);
     } else {
@@ -943,12 +1317,12 @@ pub fn update_from_github(force: bool) -> Result<(), Box<dyn std::error::Error>>
     // published generation must never be visible to another instance's
     // cleanup/apply pass before this explicit install consumes it.
     let _lock = UpdateLock::acquire()?;
-    let pending = stage_pending_update(&latest_version, &body)?;
+    let pending = stage_pending_update(&latest_version, &body, rule)?;
 
     println!("Download complete. Installing...");
 
     let target_path = get_install_path()?;
-    install_update_file(&pending.path, &target_path)?;
+    install_verified_update(&pending.path, &target_path, RevocationCheck::Online, rule)?;
     remove_pending_update(&pending);
     print_update_success(&target_path);
     Ok(())
@@ -1004,7 +1378,12 @@ fn remove_installed_update_file(update_file: &Path) {
 pub fn do_install_update(update_file: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
     let _lock = UpdateLock::acquire()?;
     let target_path = get_install_path()?;
-    install_update_file(update_file, &target_path)?;
+    install_verified_update(
+        update_file,
+        &target_path,
+        RevocationCheck::Online,
+        VersionRule::NewerThanRunning,
+    )?;
     remove_installed_update_file(update_file);
     print_update_success(&target_path);
     Ok(())
@@ -1096,7 +1475,11 @@ pub fn check_and_download_update() -> UpdateStatus {
         }
         Err(error) => return UpdateStatus::Failed(error),
     }
-    match stage_pending_update(&latest_version, &body) {
+    match stage_pending_update(
+        &latest_version,
+        &body,
+        VersionRule::Release(&latest_version),
+    ) {
         Ok(update) => UpdateStatus::Downloaded {
             version: update.version,
             path: update.path,
@@ -1166,13 +1549,32 @@ impl PendingUpdateOutcome {
 /// concurrent instance cannot observe or consume the generation mid-install.
 fn apply_pending_update_locked(current_exe: &Path) -> PendingUpdateOutcome {
     match pending_update_for_current_version() {
-        Ok(Some(pending)) => match install_update_file(&pending.path, current_exe) {
-            Ok(()) => {
-                remove_pending_update(&pending);
-                PendingUpdateOutcome::Applied
+        Ok(Some(pending)) => {
+            let verified = match open_verified_update(
+                &pending.path,
+                RevocationCheck::SkipAtStartup,
+                VersionRule::Release(&pending.version),
+            ) {
+                Ok(file) => file,
+                Err(error) => {
+                    // Never keep a file that failed verification: the next
+                    // online check downloads and verifies a fresh copy.
+                    remove_pending_update(&pending);
+                    return PendingUpdateOutcome::Incomplete(format!("update rejected: {error}"));
+                }
+            };
+            let installed = install_update_file(&pending.path, current_exe);
+            drop(verified);
+            match installed {
+                Ok(()) => {
+                    remove_pending_update(&pending);
+                    PendingUpdateOutcome::Applied
+                }
+                Err(error) => {
+                    PendingUpdateOutcome::Incomplete(format!("installation failed: {error}"))
+                }
             }
-            Err(error) => PendingUpdateOutcome::Incomplete(format!("installation failed: {error}")),
-        },
+        }
         Ok(None) => {
             // Clean up any old backup files from previous updates.
             let backup_path = current_exe.with_extension("exe.old");
@@ -1246,6 +1648,158 @@ mod tests {
 
     fn test_directory(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("htop-win-test-{name}-{}", unique_generation_id()))
+    }
+
+    /// Stand-in for the Authenticode check in staging tests that are about
+    /// publication, not signatures (synthetic PEs are unsigned).
+    fn accept_unsigned(_: &Path) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Issue #107: an executable that only passes the MZ/PE/machine checks
+    /// must never be accepted as an update.
+    #[test]
+    fn unsigned_executable_fails_verification() {
+        let directory = test_directory("unsigned");
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(UPDATE_FILE_NAME);
+        fs::write(&path, synthetic_pe()).unwrap();
+
+        for revocation in [RevocationCheck::Online, RevocationCheck::SkipAtStartup] {
+            let error = open_verified_update(&path, revocation, VersionRule::NewerThanRunning)
+                .expect_err("an unsigned file must fail verification");
+            assert!(error.contains("Authenticode"), "{error}");
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    /// A validly signed binary from another publisher must be rejected by the
+    /// pin. This also exercises the WinVerifyTrust success path and the
+    /// chain, RDN and EKU extraction, which unsigned fixtures cannot reach.
+    /// Skips when none of the known embedded-signed binaries is installed
+    /// (GitHub's Windows runners have both).
+    #[test]
+    fn validly_signed_binary_from_another_publisher_is_rejected() {
+        let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
+        let Some(signed) = program_files
+            .iter()
+            .flat_map(|root| {
+                [
+                    root.join("PowerShell").join("7").join("pwsh.exe"),
+                    root.join("Git").join("cmd").join("git.exe"),
+                ]
+            })
+            .find(|path| path.is_file())
+        else {
+            eprintln!("skipped: no embedded-signed third-party binary found");
+            return;
+        };
+
+        let error = open_verified_update(
+            &signed,
+            RevocationCheck::Online,
+            VersionRule::NewerThanRunning,
+        )
+        .expect_err("a non-Fara signer must be rejected");
+        assert!(
+            error.starts_with("unexpected publisher") && !error.contains("CN=\"?\""),
+            "{}: {error}",
+            signed.display()
+        );
+    }
+
+    /// The accept path, which no synthetic fixture reaches: the published
+    /// v0.2.13 binary (signed by release.yml with the Faratech profile, its
+    /// 3-day leaf certificate long expired, so the timestamp must carry it)
+    /// must pass WinVerifyTrust, the chain/EKU pin and the VERSIONINFO
+    /// identity checks, and the install copy must work while the verification
+    /// handle denies writers. A one-byte change must fail verification.
+    /// Needs the network, so it runs only on GitHub Actions, and never skips
+    /// there.
+    #[test]
+    fn published_release_binary_is_accepted_and_a_modified_copy_is_not() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        if std::env::var_os("GITHUB_ACTIONS").is_none() {
+            eprintln!("skipped: downloads a release asset; runs on GitHub Actions");
+            return;
+        }
+        let directory = test_directory("release-asset");
+        fs::create_dir_all(&directory).unwrap();
+        let asset = directory.join("htop-win-amd64.exe");
+        let status = std::process::Command::new("curl.exe")
+            .args(["--fail", "--silent", "--show-error", "--location"])
+            .args(["--retry", "3", "--output"])
+            .arg(&asset)
+            .arg(
+                "https://github.com/faratech/htop-win/releases/download/v0.2.13/htop-win-amd64.exe",
+            )
+            .status()
+            .expect("run curl.exe");
+        assert!(status.success(), "download failed: {status}");
+
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(&asset)
+            .unwrap();
+        for revocation in [RevocationCheck::Online, RevocationCheck::SkipAtStartup] {
+            let chain = authenticode_signer_chain(&asset, &held, revocation)
+                .unwrap_or_else(|error| panic!("{revocation:?}: {error}"));
+            assert_eq!(
+                update_trust::check_signer_chain(&chain),
+                Ok(()),
+                "{chain:?}"
+            );
+        }
+        let strings = read_version_strings(&asset).expect("version resource");
+        assert_eq!(
+            update_trust::check_update_identity(
+                &strings,
+                VersionRule::Release("0.2.13"),
+                "0.2.12",
+                is_newer_version
+            ),
+            Ok(()),
+            "{strings:?}"
+        );
+
+        // Writers are refused while the handle is held; the install copy is not.
+        assert!(
+            fs::OpenOptions::new().write(true).open(&asset).is_err(),
+            "a writer opened the file during verification"
+        );
+        let target = directory.join("installed").join("htop.exe");
+        install_update_file(&asset, &target).expect("copy while the handle is held");
+        drop(held);
+        assert_eq!(fs::read(&target).unwrap(), fs::read(&asset).unwrap());
+
+        let mut modified = fs::read(&asset).unwrap();
+        modified[0x1000] ^= 0x01;
+        let modified_path = directory.join("modified.exe");
+        fs::write(&modified_path, &modified).unwrap();
+        let error = open_verified_update(
+            &modified_path,
+            RevocationCheck::SkipAtStartup,
+            VersionRule::NewerThanRunning,
+        )
+        .expect_err("a modified release binary must be rejected");
+        assert!(error.contains("Authenticode"), "{error}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn stage_publishes_nothing_when_verification_fails() {
+        let root = test_directory("rejected-stage");
+        let error = stage_pending_update_in(&root, "1.2.3", &synthetic_pe(), |_| {
+            Err("not signed by the release publisher".into())
+        })
+        .expect_err("a rejected update must not be staged");
+
+        assert!(error.contains("downloaded update rejected"), "{error}");
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1358,8 +1912,13 @@ mod tests {
     #[test]
     fn test_stage_pending_update_publishes_complete_pair() {
         let root = test_directory("atomic-stage");
-        let update = stage_pending_update_in(&root, "1.2.3-beta.1+build.7", &synthetic_pe())
-            .expect("stage should succeed");
+        let update = stage_pending_update_in(
+            &root,
+            "1.2.3-beta.1+build.7",
+            &synthetic_pe(),
+            accept_unsigned,
+        )
+        .expect("stage should succeed");
 
         assert_eq!(
             validate_pending_pair(
@@ -1392,8 +1951,13 @@ mod tests {
                 let root = root.clone();
                 let body = body.clone();
                 std::thread::spawn(move || {
-                    stage_pending_update_in(&root, &format!("1.2.{}", index + 3), &body)
-                        .expect("concurrent stage should succeed")
+                    stage_pending_update_in(
+                        &root,
+                        &format!("1.2.{}", index + 3),
+                        &body,
+                        accept_unsigned,
+                    )
+                    .expect("concurrent stage should succeed")
                 })
             })
             .collect::<Vec<_>>();
@@ -1417,8 +1981,10 @@ mod tests {
     #[test]
     fn test_invalid_generation_cleanup_preserves_valid_pending_update() {
         let root = test_directory("preserve-valid");
-        let valid = stage_pending_update_in(&root, "1.2.3", &synthetic_pe()).unwrap();
-        let invalid = stage_pending_update_in(&root, "1.2.4", &synthetic_pe()).unwrap();
+        let valid =
+            stage_pending_update_in(&root, "1.2.3", &synthetic_pe(), accept_unsigned).unwrap();
+        let invalid =
+            stage_pending_update_in(&root, "1.2.4", &synthetic_pe(), accept_unsigned).unwrap();
         fs::write(&invalid.path, b"truncated").unwrap();
 
         let updates = load_pending_generations(&root).unwrap();

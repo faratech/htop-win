@@ -142,6 +142,13 @@ Or force reinstall the current version:
 htop --update --force
 ```
 
+Updates (manual and automatic) are installed only if the downloaded binary
+carries a valid Authenticode signature from Fara Technologies LLC through
+Microsoft Trusted Signing, identifies itself as htop-win, and has exactly the
+release's version, newer than the one running (`--force` may reinstall the
+same version, never an older one). Anything else is rejected and nothing is
+replaced.
+
 ### Build from Source
 
 ```powershell

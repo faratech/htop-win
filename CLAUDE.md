@@ -172,8 +172,17 @@ Minimal dependency set for small binary size:
 1. **Background check**: 3 seconds after startup, spawns thread to check GitHub API
 2. **Architecture detection**: Selects correct binary (amd64/arm64) based on `cfg!(target_arch)`
 3. **Download**: Downloads to `%TEMP%\htop-win-update.exe`
-4. **Notification**: Shows "Update vX.Y.Z downloaded. Restart to apply." in status bar
-5. **Apply on restart**: Before UI starts, `apply_pending_update()`:
+4. **Verify**: `open_verified_update()` (decisions in `update_trust.rs`, tested on any host) holds
+   the file open without write/delete sharing and requires, failing closed:
+   WinVerifyTrust success; a primary signer chain of exactly CN/O "Fara Technologies LLC" →
+   a Microsoft EOC CA → "Microsoft ID Verified Code Signing PCA 2021" → "Microsoft Identity
+   Verification Root Certificate Authority 2020", with the Trusted Signing EKU; and VERSIONINFO
+   ProductName/InternalName "htop-win", OriginalFilename "htop-win.exe", FileVersion equal to the
+   release and newer than the running build. It runs before a download is staged (revocation
+   checked online) and again before any install, until the copy completes.
+5. **Notification**: Shows "Update vX.Y.Z downloaded. Restart to apply." in status bar
+6. **Apply on restart**: Before UI starts, `apply_pending_update()`:
+   - Re-verifies the staged file (no network: revocation was checked at staging); deletes it if it fails
    - Renames running `htop.exe` → `htop.exe.old` (Windows allows renaming running exe)
    - Copies update → `htop.exe`
    - Cleans up temp and backup files

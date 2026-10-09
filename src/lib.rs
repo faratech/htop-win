@@ -8,6 +8,9 @@ pub(crate) mod numfmt;
 pub mod system;
 pub mod terminal;
 pub mod ui;
+// Used by the Windows-only installer; compiled everywhere so its tests run on any host.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod update_trust;
 
 #[cfg(windows)]
 pub mod installer;
