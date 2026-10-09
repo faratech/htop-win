@@ -992,20 +992,40 @@ mod tests {
             LocalFileStat::Missing
         );
 
-        let made = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(&junction)
-            .arg(&real)
-            .output()
-            .is_ok_and(|output| output.status.success());
+        let mklink_junction = |link: &std::path::Path, target: &std::path::Path| {
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        // A junction whose target does not exist: following it would read
+        // "missing", so anything but Missing proves it was not followed.
+        let dangling = base.join("dangling");
+        let made =
+            mklink_junction(&junction, &real) && mklink_junction(&dangling, &base.join("nowhere"));
         if made {
             assert_eq!(
                 stat_local_file(path_str(&junction.join("x.exe"))),
                 LocalFileStat::Unknown
             );
+            assert_eq!(
+                stat_local_file(path_str(&dangling.join("x.exe"))),
+                LocalFileStat::Unknown
+            );
+            // As the last component the junction is opened itself (or
+            // refused), never resolved to its target.
+            assert_ne!(stat_local_file(path_str(&dangling)), LocalFileStat::Missing);
         } else {
+            // Junctions need no privilege, so CI must exercise this case.
+            assert!(
+                std::env::var_os("GITHUB_ACTIONS").is_none(),
+                "mklink /J failed on CI; the OBJ_DONT_REPARSE case did not run"
+            );
             eprintln!("skipped junction case: mklink /J failed");
         }
+        let _ = std::fs::remove_dir(&dangling);
         let _ = std::fs::remove_dir(&junction);
         let _ = std::fs::remove_dir_all(&base);
     }
