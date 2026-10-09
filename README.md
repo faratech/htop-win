@@ -112,8 +112,8 @@ Download the latest release for your architecture:
 All release binaries are signed with Azure Trusted Signing and verified with GitHub artifact attestation. Verify downloaded binaries using the GitHub CLI:
 
 ```bash
-gh attestation verify htop-win-amd64.exe --owner faratech
-gh attestation verify htop-win-arm64.exe --owner faratech
+gh attestation verify htop-win-amd64.exe --repo faratech/htop-win --signer-workflow faratech/htop-win/.github/workflows/release.yml
+gh attestation verify htop-win-arm64.exe --repo faratech/htop-win --signer-workflow faratech/htop-win/.github/workflows/release.yml
 ```
 
 ### Install to PATH
