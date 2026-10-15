@@ -254,6 +254,8 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: write
+    env:
+      WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
 
     steps:
       - name: Checkout
@@ -311,8 +313,8 @@ jobs:
           body_path: release_notes.md
 
       - name: Publish to WinGet
-        if: ${{ needs.prepare.outputs.prerelease != 'true' && secrets.WINGET_TOKEN != '' }}
+        if: ${{ needs.prepare.outputs.prerelease != 'true' && env.WINGET_TOKEN != '' }}
         uses: vedantmgoyal2009/winget-releaser@v2
         with:
           identifier: faratech.htop-win
-          token: ${{ secrets.WINGET_TOKEN }}
+          token: ${{ env.WINGET_TOKEN }}
