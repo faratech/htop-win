@@ -309,3 +309,10 @@ jobs:
             artifacts/htop-win-arm64.exe
             artifacts/htop-win-arm64.source.json
           body_path: release_notes.md
+
+      - name: Publish to WinGet
+        if: ${{ needs.prepare.outputs.prerelease != 'true' && secrets.WINGET_TOKEN != '' }}
+        uses: vedantmgoyal2009/winget-releaser@v2
+        with:
+          identifier: faratech.htop-win
+          token: ${{ secrets.WINGET_TOKEN }}
