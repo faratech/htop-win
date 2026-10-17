@@ -1,0 +1,8 @@
+# Link the C runtime statically so release executables do not depend on
+# VCRUNTIME140.dll (VC++ Redistributable), which clean Windows installs lack.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
