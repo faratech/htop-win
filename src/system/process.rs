@@ -250,6 +250,18 @@ fn filetime_value(value: FILETIME) -> u64 {
     ((value.dwHighDateTime as u64) << 32) | value.dwLowDateTime as u64
 }
 
+#[cfg(windows)]
+fn process_creation_time(handle: HANDLE) -> windows::core::Result<u64> {
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe {
+        GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)?;
+    }
+    Ok(filetime_value(creation))
+}
+
 /// Open the process once, verify its creation time, and return that same handle
 /// for the requested operation. This closes the PID-reuse TOCTOU window that
 /// would remain if verification and mutation opened separate handles.
@@ -279,18 +291,14 @@ fn open_verified_process(
             ));
         }
 
-        let mut creation = FILETIME::default();
-        let mut exit = FILETIME::default();
-        let mut kernel = FILETIME::default();
-        let mut user = FILETIME::default();
-        if let Err(error) =
-            GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user)
-        {
-            let _ = CloseHandle(handle);
-            return Err(format!("Cannot verify process identity: {error}"));
-        }
-
-        if filetime_value(creation) != identity.create_time_100ns {
+        let creation = match process_creation_time(handle) {
+            Ok(creation) => creation,
+            Err(error) => {
+                let _ = CloseHandle(handle);
+                return Err(format!("Cannot verify process identity: {error}"));
+            }
+        };
+        if creation != identity.create_time_100ns {
             let _ = CloseHandle(handle);
             return Err(format!(
                 "Process {} exited and its PID was reused",
@@ -308,7 +316,7 @@ fn open_verified_process(
 /// Open a process handle with fallback from full to limited query access
 #[cfg(windows)]
 #[inline]
-pub(crate) fn open_process_query(pid: u32) -> Option<HANDLE> {
+fn open_process_query(pid: u32) -> Option<HANDLE> {
     unsafe {
         match OpenProcess(PROCESS_QUERY_INFORMATION, false, pid) {
             Ok(h) if !h.is_invalid() => Some(h),
@@ -320,43 +328,57 @@ pub(crate) fn open_process_query(pid: u32) -> Option<HANDLE> {
     }
 }
 
+/// Open a query handle with the existing access fallback, then verify that
+/// same handle before collecting data for a snapshot identity. This hot-path
+/// variant needs no formatted errors or allocations.
+#[cfg(windows)]
+pub(crate) fn open_verified_process_query(identity: ProcessIdentity) -> Option<HANDLE> {
+    if identity.create_time_100ns == 0 {
+        return None;
+    }
+    let handle = open_process_query(identity.pid)?;
+    if process_creation_time(handle).ok() == Some(identity.create_time_100ns) {
+        Some(handle)
+    } else {
+        unsafe {
+            let _ = CloseHandle(handle);
+        }
+        None
+    }
+}
+
 /// Query the full executable path from a process handle
 #[cfg(windows)]
 #[inline]
 fn query_exe_path(handle: HANDLE) -> String {
-    use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
-    use windows::core::HRESULT;
+    query_exe_path_with(|buffer, size| unsafe {
+        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), size)
+    })
+}
 
-    unsafe {
-        let mut capacity = 1024usize;
-        loop {
-            let mut buffer = vec![0u16; capacity];
-            let mut size = buffer.len() as u32;
-            match QueryFullProcessImageNameW(
-                handle,
-                PROCESS_NAME_WIN32,
-                PWSTR(buffer.as_mut_ptr()),
-                &mut size,
-            ) {
-                Ok(()) => {
-                    return String::from_utf16_lossy(&buffer[..size as usize]);
+/// Keep the buffer policy separate from the syscall so failures can be tested
+/// without creating an executable at a very long Windows path.
+#[cfg(windows)]
+fn query_exe_path_with(
+    mut query: impl FnMut(&mut [u16], &mut u32) -> windows::core::Result<()>,
+) -> String {
+    const MAX_CAPACITY: usize = 32768;
+    let mut capacity = 1024usize;
+    loop {
+        let mut buffer = vec![0u16; capacity];
+        let mut size = buffer.len() as u32;
+        match query(&mut buffer, &mut size) {
+            Ok(()) => return String::from_utf16_lossy(&buffer[..size as usize]),
+            Err(err) => {
+                // QueryFullProcessImageNameW only defines the output length on
+                // success. An undersized buffer can leave `size` unchanged, so
+                // grow geometrically instead of treating it as a required size.
+                if err.code() != HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0)
+                    || capacity == MAX_CAPACITY
+                {
+                    return String::new();
                 }
-                Err(err) => {
-                    // Only an undersized buffer can be fixed by retrying with a
-                    // bigger one; access denied and friends fail permanently, so
-                    // stop instead of burning five more calls (~126 KB of
-                    // transient allocations) per protected process.
-                    if err.code() != HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) {
-                        return String::new();
-                    }
-                    // On this error the API reports the required length in
-                    // `size`; jump straight to it instead of blind doubling.
-                    let needed = size as usize;
-                    if needed <= capacity || needed > 32768 {
-                        return String::new();
-                    }
-                    capacity = needed;
-                }
+                capacity = (capacity * 2).min(MAX_CAPACITY);
             }
         }
     }
@@ -1671,6 +1693,122 @@ pub fn set_process_affinity(identity: ProcessIdentity, mask: u64) -> Result<(), 
 pub fn set_process_affinity(_identity: ProcessIdentity, _mask: u64) -> Result<(), String> {
     // Not implemented for non-Windows
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod verified_query_tests {
+    use super::{ProcessIdentity, open_verified_process_query, process_creation_time};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{GetCurrentProcess, GetProcessId};
+
+    fn current_identity() -> ProcessIdentity {
+        let creation = process_creation_time(unsafe { GetCurrentProcess() }).unwrap();
+        assert_ne!(creation, 0);
+        ProcessIdentity {
+            pid: std::process::id(),
+            create_time_100ns: creation,
+        }
+    }
+
+    #[test]
+    fn query_handle_matches_the_current_process_identity() {
+        let identity = current_identity();
+        let handle = open_verified_process_query(identity).expect("current process is queryable");
+        let actual_pid = unsafe { GetProcessId(handle) };
+        let actual_creation = process_creation_time(handle).unwrap();
+        unsafe { CloseHandle(handle).unwrap() };
+        assert_eq!(actual_pid, identity.pid);
+        assert_eq!(actual_creation, identity.create_time_100ns);
+    }
+
+    #[test]
+    fn query_handle_rejects_a_reused_pid_identity() {
+        let mut identity = current_identity();
+        identity.create_time_100ns += 1;
+        assert!(open_verified_process_query(identity).is_none());
+    }
+
+    #[test]
+    fn query_handle_rejects_an_unknown_creation_time() {
+        let identity = ProcessIdentity {
+            create_time_100ns: 0,
+            ..current_identity()
+        };
+        assert!(open_verified_process_query(identity).is_none());
+    }
+}
+
+#[cfg(all(test, windows))]
+mod exe_path_query_tests {
+    use super::query_exe_path_with;
+    use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INSUFFICIENT_BUFFER};
+    use windows::core::{Error, HRESULT};
+
+    fn insufficient_buffer() -> Error {
+        Error::from_hresult(HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0))
+    }
+
+    #[test]
+    fn retries_when_insufficient_buffer_leaves_size_unchanged() {
+        let expected = format!("C:\\{}\\程序.exe", "x".repeat(1500));
+        let wide: Vec<u16> = expected.encode_utf16().collect();
+        let mut capacities = Vec::new();
+        let path = query_exe_path_with(|buffer, size| {
+            capacities.push(buffer.len());
+            assert_eq!(*size as usize, buffer.len());
+            if buffer.len() <= wide.len() {
+                // This matches the actual Windows API: error 122 leaves the
+                // input length untouched instead of reporting a required size.
+                return Err(insufficient_buffer());
+            }
+            buffer[..wide.len()].copy_from_slice(&wide);
+            *size = wide.len() as u32;
+            Ok(())
+        });
+        assert_eq!(path, expected);
+        assert_eq!(capacities, vec![1024, 2048]);
+    }
+
+    #[test]
+    fn accepts_a_path_that_fits_only_at_the_maximum_capacity() {
+        let wide = vec![u16::from(b'x'); 32767];
+        let mut capacities = Vec::new();
+        let path = query_exe_path_with(|buffer, size| {
+            capacities.push(buffer.len());
+            if buffer.len() <= wide.len() {
+                return Err(insufficient_buffer());
+            }
+            buffer[..wide.len()].copy_from_slice(&wide);
+            *size = wide.len() as u32;
+            Ok(())
+        });
+        assert_eq!(path.len(), 32767);
+        assert_eq!(capacities, vec![1024, 2048, 4096, 8192, 16384, 32768]);
+    }
+
+    #[test]
+    fn stops_at_the_capacity_limit_when_the_query_never_fits() {
+        let mut capacities = Vec::new();
+        let path = query_exe_path_with(|buffer, _| {
+            capacities.push(buffer.len());
+            Err(insufficient_buffer())
+        });
+        assert!(path.is_empty());
+        assert_eq!(capacities, vec![1024, 2048, 4096, 8192, 16384, 32768]);
+    }
+
+    #[test]
+    fn does_not_retry_access_denied() {
+        let mut calls = 0;
+        let path = query_exe_path_with(|_, _| {
+            calls += 1;
+            Err(Error::from_hresult(HRESULT::from_win32(
+                ERROR_ACCESS_DENIED.0,
+            )))
+        });
+        assert!(path.is_empty());
+        assert_eq!(calls, 1);
+    }
 }
 
 #[cfg(test)]

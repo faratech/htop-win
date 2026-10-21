@@ -13,6 +13,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use super::process::{ProcessIdentity, open_verified_process_query};
+
 use windows::Wdk::Graphics::Direct3D::{
     D3DKMT_ADAPTERINFO, D3DKMT_ADAPTERREGISTRYINFO, D3DKMT_ADAPTERTYPE, D3DKMT_CLOSEADAPTER,
     D3DKMT_ENUMADAPTERS2, D3DKMT_QUERYADAPTERINFO, D3DKMT_QUERYSTATISTICS,
@@ -115,7 +117,8 @@ struct AdapterState {
     needs_reenumeration: bool,
     last_sample: Option<Instant>,
     last_proc_sample: Option<Instant>,
-    /// (pid, process create time) -> previous RunningTime per node, flattened across adapters
+    /// (pid, process create time) -> previous RunningTime per node, flattened
+    /// across adapters; unavailable nodes use UNPRIMED_NODE_RUNNING.
     prev_proc_running: HashMap<(u32, u64), Vec<i64>>,
     /// (gpu, npu) gates last seen by process_stats; a change invalidates the
     /// flattened baselines (a disabled class keeps stale RunningTime values)
@@ -124,8 +127,8 @@ struct AdapterState {
     /// against fresh enumerations to spot topology changes (driver installs,
     /// removals) that never fail an existing statistics query
     enumerated_luids: Vec<LuidKey>,
-    /// LUIDs of render/compute adapters that enumerated but whose statistics
-    /// were unavailable at detection (commonly a discrete GPU in a low-power
+    /// LUIDs of adapters whose type or render/compute statistics were
+    /// unavailable at detection (commonly a discrete GPU in a low-power
     /// state). Non-empty forces a retry on the next topology check so the
     /// adapter appears once it powers up.
     pending_luids: Vec<LuidKey>,
@@ -155,7 +158,7 @@ struct ProcAdapterDesc {
 struct ProcSweepState {
     adapters: Vec<ProcAdapterDesc>,
     /// (pid, create time) -> previous RunningTime per node, flattened across
-    /// adapters in enumeration order.
+    /// adapters in enumeration order; unavailable nodes use UNPRIMED_NODE_RUNNING.
     prev_proc_running: HashMap<(u32, u64), Vec<i64>>,
 }
 
@@ -279,6 +282,30 @@ fn running_time_to_percent(prev: i64, cur: i64, wall_elapsed_secs: f64) -> f32 {
     ((delta / 10_000_000.0) / wall_elapsed_secs * 100.0).clamp(0.0, 100.0) as f32
 }
 
+/// Running-time counters are nonnegative. Reserve this value for a process
+/// node that has not yet produced a successful sample, or whose query failed.
+const UNPRIMED_NODE_RUNNING: i64 = i64::MIN;
+
+/// Update one process node independently: an unused/failing node must not
+/// invalidate its siblings, and its first recovered sample must not reuse a
+/// counter from several intervals ago.
+#[inline]
+fn sample_process_node(previous: &mut i64, running: Option<i64>, elapsed: Option<f64>) -> f32 {
+    let Some(running) = running else {
+        *previous = UNPRIMED_NODE_RUNNING;
+        return 0.0;
+    };
+    let percent = if *previous == UNPRIMED_NODE_RUNNING {
+        0.0
+    } else {
+        elapsed.map_or(0.0, |seconds| {
+            running_time_to_percent(*previous, running, seconds)
+        })
+    };
+    *previous = running;
+    percent
+}
+
 /// Decode a NUL-terminated UTF-16 buffer.
 fn utf16_to_string(buf: &[u16]) -> String {
     let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
@@ -325,17 +352,17 @@ fn for_each_enumerated_adapter(mut f: impl FnMut(&D3DKMT_ADAPTERINFO)) {
 enum AdapterProbe {
     /// A GPU/NPU we can monitor right now.
     Tracked(TrackedAdapter),
-    /// A render/compute adapter whose statistics are currently unavailable
+    /// An adapter whose type or statistics are currently unavailable
     /// (commonly a discrete GPU parked in a low-power D3 state on a hybrid
-    /// laptop). We retry these so they appear once powered up.
+    /// laptop). Retry it before deciding it cannot be tracked.
     Pending,
-    /// Not a GPU/NPU (software/WARP, display-only) or unidentifiable; ignored.
+    /// Identified as unsupported (software/WARP or display-only); ignored.
     Untrackable,
 }
 
 /// Enumerate dxgkrnl adapters; returns the GPUs/NPUs we can track now, the
 /// sorted LUID set of everything enumerated (for the periodic topology check),
-/// and the sorted LUIDs of trackable-but-currently-unavailable adapters to retry.
+/// and the sorted LUIDs of unavailable or not-yet-classified adapters to retry.
 fn detect_adapters() -> (Vec<TrackedAdapter>, Vec<LuidKey>, Vec<LuidKey>) {
     let mut adapters = Vec::new();
     let mut luids = Vec::new();
@@ -367,6 +394,15 @@ fn enumerate_luids() -> Vec<LuidKey> {
 
 /// Classify and probe one enumerated adapter.
 fn build_adapter(info: &D3DKMT_ADAPTERINFO) -> AdapterProbe {
+    build_adapter_with_type_query(info, |query| unsafe {
+        D3DKMTQueryAdapterInfo(query).is_ok()
+    })
+}
+
+fn build_adapter_with_type_query(
+    info: &D3DKMT_ADAPTERINFO,
+    query_type: impl FnOnce(&mut D3DKMT_QUERYADAPTERINFO) -> bool,
+) -> AdapterProbe {
     unsafe {
         // Adapter type: skip software devices and anything we don't track.
         let mut adapter_type = D3DKMT_ADAPTERTYPE::default();
@@ -376,10 +412,10 @@ fn build_adapter(info: &D3DKMT_ADAPTERINFO) -> AdapterProbe {
             pPrivateDriverData: &mut adapter_type as *mut _ as *mut std::ffi::c_void,
             PrivateDriverDataSize: std::mem::size_of::<D3DKMT_ADAPTERTYPE>() as u32,
         };
-        if D3DKMTQueryAdapterInfo(&mut query).is_err() {
-            // Can't even read the type (deep power-down / driver hiccup). We
-            // don't know if it's a GPU, so don't retry it as pending.
-            return AdapterProbe::Untrackable;
+        if !query_type(&mut query) {
+            // A failed query does not identify an unsupported adapter. Keep
+            // retrying it even if its LUID remains in every enumeration.
+            return AdapterProbe::Pending;
         }
         let Some(class) = classify_adapter(adapter_type.Anonymous.Value) else {
             return AdapterProbe::Untrackable;
@@ -598,8 +634,31 @@ fn aggregate_gpus(per_adapter: &[(AdapterClass, AdapterMetrics)]) -> Option<Adap
 pub fn refresh() -> AdapterSnapshot {
     let mut guard = ADAPTER_STATE.lock().unwrap();
     let state = guard.get_or_insert_with(AdapterState::default);
-    let now = Instant::now();
+    let was_present = !state.adapters.is_empty();
+    let snapshot = refresh_at_with(
+        state,
+        Instant::now(),
+        enumerate_luids,
+        detect_adapters,
+        query_adapter_metrics,
+    );
+    let present = !state.adapters.is_empty();
+    if present != was_present {
+        ADAPTERS_PRESENT.store(present, Ordering::Relaxed);
+    }
+    snapshot
+}
 
+/// One refresh with explicit time and native-query boundaries. Production
+/// passes the direct API wrappers; tests can exercise recovery without a
+/// display-driver reset or real-time waits.
+fn refresh_at_with(
+    state: &mut AdapterState,
+    now: Instant,
+    mut read_luids: impl FnMut() -> Vec<LuidKey>,
+    mut detect: impl FnMut() -> (Vec<TrackedAdapter>, Vec<LuidKey>, Vec<LuidKey>),
+    mut query_metrics: impl FnMut(&mut TrackedAdapter, Option<f64>) -> Option<AdapterMetrics>,
+) -> AdapterSnapshot {
     // Periodic topology check. A changed LUID set (new NPU driver, removed
     // eGPU, ...) forces full re-detection below; an unchanged set costs one
     // syscall and leaves all delta baselines untouched.
@@ -612,7 +671,7 @@ pub fn refresh() -> AdapterSnapshot {
         state.last_topology_check = Some(now);
         // Re-detect when the adapter set changed, or when a previously-down
         // adapter is pending — retry it in case it has since powered up.
-        if enumerate_luids() != state.enumerated_luids || !state.pending_luids.is_empty() {
+        if read_luids() != state.enumerated_luids || !state.pending_luids.is_empty() {
             state.needs_reenumeration = true;
         }
     }
@@ -627,7 +686,7 @@ pub fn refresh() -> AdapterSnapshot {
             .iter()
             .map(|a| (a.luid.LowPart, a.luid.HighPart, a.node_count))
             .collect();
-        let (mut adapters, luids, pending) = detect_adapters();
+        let (mut adapters, luids, pending) = detect();
         // Preserve per-adapter utilization baselines for adapters that survived
         // the re-detection (matched by LUID), so a re-enumeration triggered by a
         // pending/transient adapter doesn't reset the working adapters' meters.
@@ -642,12 +701,11 @@ pub fn refresh() -> AdapterSnapshot {
                     a.prev_node_running.clone_from(&o.prev_node_running);
                 }
                 _ => {
-                    let _ = query_adapter_metrics(a, None);
+                    let _ = query_metrics(a, None);
                 }
             }
         }
         state.adapters = adapters;
-        ADAPTERS_PRESENT.store(!state.adapters.is_empty(), Ordering::Relaxed);
         state.enumerated_luids = luids;
         state.pending_luids = pending;
         state.detected = true;
@@ -682,15 +740,24 @@ pub fn refresh() -> AdapterSnapshot {
 
     let mut per_adapter = Vec::with_capacity(state.adapters.len());
     for adapter in &mut state.adapters {
-        let Some(metrics) = query_adapter_metrics(adapter, elapsed) else {
-            // Driver reset or adapter removal: re-enumerate on the next tick.
+        let Some(metrics) = query_metrics(adapter, elapsed) else {
+            // Driver reset or adapter removal: re-enumerate after the backoff.
             // Serve the last good snapshot meanwhile so adapter presence
             // (meters, hardware-aware default columns) doesn't blink off for
-            // one tick; re-detection decides whether it's really gone.
+            // the retry interval; re-detection decides whether it's really gone.
             state.needs_reenumeration = true;
+            // A failed sweep can leave some nodes at their previous sample
+            // and others already advanced. Re-prime every system baseline on
+            // recovery instead of dividing those mixed deltas by one tick.
+            // Per-process baselines use an independent sampling clock.
+            state.last_sample = None;
             // Back off the retry so a persistently sick adapter costs one
             // detection every few ticks, not one per tick.
-            state.next_reenumeration = Some(now + FAILURE_RETRY_INTERVAL);
+            // Keep the first deadline: moving it forward on every failed tick
+            // would prevent retries whenever refreshes are less than 3s apart.
+            state
+                .next_reenumeration
+                .get_or_insert(now + FAILURE_RETRY_INTERVAL);
             return state.last_snapshot.clone();
         };
         per_adapter.push((adapter.class, metrics));
@@ -782,16 +849,18 @@ pub fn process_stats(processes: &[(u32, u64)]) -> HashMap<u32, ProcAdapterStats>
         if pid == 0 || pid == 4 {
             continue;
         }
-        let Some(handle) = super::process::open_process_query(pid) else {
+        let Some(handle) = open_verified_process_query(ProcessIdentity {
+            pid,
+            create_time_100ns: create_time,
+        }) else {
             continue;
         };
 
-        // A PID seen for the first time only sets baselines (reports 0%).
-        let fresh = !sweep.prev_proc_running.contains_key(&key);
+        // A node seen for the first time only sets its baseline (reports 0%).
         let prev = sweep
             .prev_proc_running
             .entry(key)
-            .or_insert_with(|| vec![0; total_nodes]);
+            .or_insert_with(|| vec![UNPRIMED_NODE_RUNNING; total_nodes]);
 
         let mut entry = ProcAdapterStats::default();
         let mut node_index = 0;
@@ -814,19 +883,19 @@ pub fn process_stats(processes: &[(u32, u64)]) -> HashMap<u32, ProcAdapterStats>
                 };
                 stats.Anonymous.QueryProcessNode =
                     D3DKMT_QUERYSTATISTICS_QUERY_NODE { NodeId: node_id };
-                // Failures here are per-process (exited, no adapter reference);
-                // leave zeros rather than tearing down the adapter state.
-                if unsafe { query_statistics(&mut stats) } {
-                    sampled_running_time = true;
-                    let running = unsafe { stats.QueryResult.ProcessNodeInformation.RunningTime };
-                    if !fresh && let Some(secs) = elapsed {
-                        let pct = running_time_to_percent(prev[node_index], running, secs);
-                        match adapter.class {
-                            AdapterClass::Gpu => entry.gpu_percent = entry.gpu_percent.max(pct),
-                            AdapterClass::Npu => entry.npu_percent = entry.npu_percent.max(pct),
-                        }
-                    }
-                    prev[node_index] = running;
+                // Failures here are per-process (exited, no adapter reference).
+                // Invalidate only that node so a later recovery re-primes it,
+                // while other nodes keep producing their normal deltas.
+                let running = if unsafe { query_statistics(&mut stats) } {
+                    Some(unsafe { stats.QueryResult.ProcessNodeInformation.RunningTime })
+                } else {
+                    None
+                };
+                sampled_running_time |= running.is_some();
+                let pct = sample_process_node(&mut prev[node_index], running, elapsed);
+                match adapter.class {
+                    AdapterClass::Gpu => entry.gpu_percent = entry.gpu_percent.max(pct),
+                    AdapterClass::Npu => entry.npu_percent = entry.npu_percent.max(pct),
                 }
                 node_index += 1;
             }
@@ -1065,6 +1134,248 @@ mod tests {
         }
     }
 
+    fn tracked_gpu() -> super::TrackedAdapter {
+        super::TrackedAdapter {
+            class: AdapterClass::Gpu,
+            luid: windows::Win32::Foundation::LUID {
+                LowPart: 1,
+                HighPart: 0,
+            },
+            name: "GPU".to_string(),
+            node_count: 1,
+            segment_count: 0,
+            aperture_segment: Vec::new(),
+            prev_node_running: vec![100],
+        }
+    }
+
+    fn tracked_state(now: std::time::Instant) -> super::AdapterState {
+        super::AdapterState {
+            adapters: vec![tracked_gpu()],
+            detected: true,
+            enumerated_luids: vec![(1, 0)],
+            last_topology_check: Some(now),
+            last_sample: Some(now),
+            last_proc_sample: Some(now),
+            prev_proc_running: std::collections::HashMap::from([((42, 123), vec![77])]),
+            last_snapshot: super::AdapterSnapshot {
+                gpu: Some(metrics("GPU", 20.0, 8 << 30)),
+                npu: None,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn repeated_statistics_failures_reenumerate_at_the_original_deadline() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut state = tracked_state(start);
+        let detections = std::cell::Cell::new(0);
+        let mut detect = || {
+            detections.set(detections.get() + 1);
+            // The failing adapter was removed.
+            (Vec::new(), Vec::new(), Vec::new())
+        };
+        for elapsed in [Duration::ZERO, Duration::from_millis(1500)] {
+            let snapshot = super::refresh_at_with(
+                &mut state,
+                start + elapsed,
+                || panic!("topology check is not due"),
+                &mut detect,
+                |_, _| None,
+            );
+            assert_eq!(snapshot.gpu.unwrap().utilization, 20.0);
+            assert_eq!(detections.get(), 0);
+            assert_eq!(
+                state.next_reenumeration,
+                Some(start + super::FAILURE_RETRY_INTERVAL)
+            );
+        }
+
+        let snapshot = super::refresh_at_with(
+            &mut state,
+            start + super::FAILURE_RETRY_INTERVAL,
+            || panic!("failure recovery must not require a topology change"),
+            &mut detect,
+            |_, _| None,
+        );
+        assert_eq!(detections.get(), 1);
+        assert!(snapshot.gpu.is_none());
+        assert!(state.adapters.is_empty());
+        assert!(!state.needs_reenumeration);
+        assert!(state.next_reenumeration.is_none());
+        assert!(state.last_proc_sample.is_none());
+        assert!(state.prev_proc_running.is_empty());
+    }
+
+    #[test]
+    fn recovery_preserves_process_baselines_and_reprimes_system_sample() {
+        use std::time::Instant;
+
+        let start = Instant::now();
+        let mut state = tracked_state(start);
+        super::refresh_at_with(
+            &mut state,
+            start,
+            || panic!("topology check is not due"),
+            || panic!("recovery is not due yet"),
+            |_, _| None,
+        );
+
+        let snapshot = super::refresh_at_with(
+            &mut state,
+            start + super::FAILURE_RETRY_INTERVAL,
+            || panic!("failure recovery must not require a topology change"),
+            || (vec![tracked_gpu()], vec![(1, 0)], Vec::new()),
+            |adapter, elapsed| {
+                assert_eq!(adapter.prev_node_running, vec![100]);
+                assert_eq!(elapsed, None);
+                adapter.prev_node_running[0] = 200;
+                Some(metrics("GPU", 0.0, 8 << 30))
+            },
+        );
+        assert_eq!(snapshot.gpu.unwrap().utilization, 0.0);
+        assert_eq!(state.adapters[0].prev_node_running, vec![200]);
+        assert_eq!(state.last_proc_sample, Some(start));
+        assert_eq!(state.prev_proc_running[&(42, 123)], vec![77]);
+        assert!(!state.needs_reenumeration);
+        assert!(state.next_reenumeration.is_none());
+    }
+
+    #[test]
+    fn partial_sweep_failures_reprime_all_adapters_then_report_true_utilization() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let adapters = || {
+            let mut gpu = tracked_gpu();
+            gpu.prev_node_running[0] = 0;
+            let mut npu = tracked_gpu();
+            npu.class = AdapterClass::Npu;
+            npu.luid.LowPart = 2;
+            npu.name = "NPU".to_string();
+            npu.prev_node_running[0] = 0;
+            vec![gpu, npu]
+        };
+        let mut state = tracked_state(start);
+        state.adapters = adapters();
+        state.enumerated_luids = vec![(1, 0), (2, 0)];
+        let millis = std::cell::Cell::new(0u64);
+        let detections = std::cell::Cell::new(0);
+        let mut detect = || {
+            detections.set(detections.get() + 1);
+            (adapters(), vec![(1, 0), (2, 0)], Vec::new())
+        };
+        let mut query = |adapter: &mut super::TrackedAdapter, elapsed: Option<f64>| {
+            // GPU reads succeed before the NPU fails, leaving a partial sweep.
+            if adapter.class == AdapterClass::Npu && matches!(millis.get(), 1500 | 3000) {
+                return None;
+            }
+            // Both adapters run at a steady 25%: 2,500 ticks per millisecond.
+            let running = millis.get() as i64 * 2500;
+            let utilization = elapsed.map_or(0.0, |seconds| {
+                super::running_time_to_percent(adapter.prev_node_running[0], running, seconds)
+            });
+            adapter.prev_node_running[0] = running;
+            Some(metrics(&adapter.name, utilization, 8 << 30))
+        };
+
+        for now_ms in [0, 1500, 3000, 4500, 6000] {
+            millis.set(now_ms);
+            let snapshot = super::refresh_at_with(
+                &mut state,
+                start + Duration::from_millis(now_ms),
+                || panic!("periodic topology check is not due"),
+                &mut detect,
+                &mut query,
+            );
+            let expected = if now_ms == 6000 { 25.0 } else { 0.0 };
+            assert_eq!(
+                snapshot.gpu.unwrap().utilization,
+                expected,
+                "GPU at {now_ms}ms"
+            );
+            assert_eq!(
+                snapshot.npu.unwrap().utilization,
+                expected,
+                "NPU at {now_ms}ms"
+            );
+            assert_eq!(state.last_proc_sample, Some(start));
+            assert_eq!(state.prev_proc_running[&(42, 123)], vec![77]);
+        }
+        assert_eq!(detections.get(), 1);
+    }
+
+    #[test]
+    fn failed_type_probe_is_retried_with_unchanged_topology() {
+        use std::time::{Duration, Instant};
+
+        let start = Instant::now();
+        let mut state = super::AdapterState::default();
+        let detections = std::cell::Cell::new(0);
+        let mut detect = || {
+            detections.set(detections.get() + 1);
+            if detections.get() == 1 {
+                let info = windows::Wdk::Graphics::Direct3D::D3DKMT_ADAPTERINFO::default();
+                let failed = super::build_adapter_with_type_query(&info, |_| false);
+                assert!(matches!(failed, super::AdapterProbe::Pending));
+                (Vec::new(), vec![(1, 0)], vec![(1, 0)])
+            } else {
+                // The same adapter becomes queryable after powering up.
+                (vec![tracked_gpu()], vec![(1, 0)], Vec::new())
+            }
+        };
+        let mut sample =
+            |_: &mut super::TrackedAdapter, _: Option<f64>| Some(metrics("GPU", 0.0, 8 << 30));
+
+        let initial = super::refresh_at_with(
+            &mut state,
+            start,
+            || panic!("initial detection does not need a topology check"),
+            &mut detect,
+            &mut sample,
+        );
+        assert!(initial.gpu.is_none());
+        assert_eq!(detections.get(), 1);
+
+        super::refresh_at_with(
+            &mut state,
+            start + super::TOPOLOGY_CHECK_INTERVAL - Duration::from_millis(1),
+            || panic!("pending probes still respect the topology interval"),
+            &mut detect,
+            &mut sample,
+        );
+        assert_eq!(detections.get(), 1);
+
+        let recovered = super::refresh_at_with(
+            &mut state,
+            start + super::TOPOLOGY_CHECK_INTERVAL,
+            || vec![(1, 0)],
+            &mut detect,
+            &mut sample,
+        );
+        assert_eq!(detections.get(), 2);
+        assert!(recovered.gpu.is_some());
+        assert!(state.pending_luids.is_empty());
+    }
+
+    #[test]
+    fn successful_unsupported_type_probe_is_not_pending() {
+        let info = windows::Wdk::Graphics::Direct3D::D3DKMT_ADAPTERINFO::default();
+        let probe = super::build_adapter_with_type_query(&info, |query| {
+            // Software devices are known unsupported, rather than unknown.
+            unsafe {
+                let adapter_type = query.pPrivateDriverData
+                    as *mut windows::Wdk::Graphics::Direct3D::D3DKMT_ADAPTERTYPE;
+                (*adapter_type).Anonymous.Value = 1 << 2;
+            }
+            true
+        });
+        assert!(matches!(probe, super::AdapterProbe::Untrackable));
+    }
+
     #[test]
     fn test_meter_memory_picks_pool_by_vram_size() {
         // Discrete card: large dedicated VRAM -> show the dedicated pool.
@@ -1146,6 +1457,54 @@ mod tests {
         assert_eq!(running_time_to_percent(0, 30_000_000, 1.0), 100.0);
         // Zero or negative wall clock yields 0
         assert_eq!(running_time_to_percent(0, half_sec_100ns, 0.0), 0.0);
+    }
+
+    #[test]
+    fn failed_process_node_reprimes_without_interrupting_a_working_sibling() {
+        let mut previous = [super::UNPRIMED_NODE_RUNNING; 2];
+        // A newly seen process can already have nonzero lifetime counters and
+        // share an existing sweep clock. Its first samples still report zero.
+        assert_eq!(
+            super::sample_process_node(&mut previous[0], Some(5_000_000), Some(1.0)),
+            0.0
+        );
+        assert_eq!(
+            super::sample_process_node(&mut previous[1], Some(20_000_000), Some(1.0)),
+            0.0
+        );
+
+        for second in 1..=4 {
+            let healthy = super::sample_process_node(
+                &mut previous[0],
+                Some(5_000_000 + second * 2_500_000),
+                Some(1.0),
+            );
+            let recovering = super::sample_process_node(
+                &mut previous[1],
+                (second >= 3).then_some(20_000_000 + second * 2_500_000),
+                Some(1.0),
+            );
+            assert_eq!(healthy, 25.0, "working sibling at {second}s");
+            // Fail at 1s and 2s, re-prime at 3s (rather than showing 75%),
+            // and report the true 25% on the following normal interval.
+            assert_eq!(recovering, if second == 4 { 25.0 } else { 0.0 });
+            if second < 3 {
+                assert_eq!(previous[1], super::UNPRIMED_NODE_RUNNING);
+            }
+        }
+    }
+
+    #[test]
+    fn process_node_counter_reset_does_not_break_following_samples() {
+        let mut previous = 20_000_000;
+        assert_eq!(
+            super::sample_process_node(&mut previous, Some(0), Some(1.0)),
+            0.0
+        );
+        assert_eq!(
+            super::sample_process_node(&mut previous, Some(2_500_000), Some(1.0)),
+            25.0
+        );
     }
 
     #[test]

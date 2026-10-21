@@ -1247,13 +1247,13 @@ pub fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> bool {
         app.cancel_pending_user_select();
     }
 
-    // Registered footer keys are global controls and must win over a modal's
-    // outside-click behavior. This makes mouse F10 and keyboard F10 identical.
+    // Footer keys must win over a modal's outside-click behavior, then use the
+    // same contextual dispatch as the keyboard (e.g. F3 means Next in Search).
     if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
         && let Some(crate::app::UIElement::FunctionKey(key)) = app.ui_bounds.element_at(x, y)
         && (app.last_error.is_none() || key == 10)
     {
-        return app.handle_function_key(key);
+        return handle_key_event(app, KeyEvent::new(KeyCode::F(key), mouse.modifiers));
     }
 
     if app.last_error.is_some() {
@@ -1409,6 +1409,27 @@ fn scroll_dialog_content(app: &mut App, up: bool) -> bool {
 
 /// Move the active list dialog's selection by 3, clamped to its navigable range.
 fn move_dialog_selection(app: &mut App, down: bool) {
+    if let DialogState::Setup { ref mut selected } = app.dialog {
+        for _ in 0..3 {
+            let next = if down {
+                SetupEntry::ALL
+                    .iter()
+                    .enumerate()
+                    .skip(selected.saturating_add(1))
+                    .find(|(_, entry)| matches!(entry, SetupEntry::Item(_)))
+            } else {
+                SetupEntry::ALL
+                    .iter()
+                    .enumerate()
+                    .take(*selected)
+                    .rfind(|(_, entry)| matches!(entry, SetupEntry::Item(_)))
+            };
+            if let Some((index, _)) = next {
+                *selected = index;
+            }
+        }
+        return;
+    }
     let last = dialog_nav_len(app).saturating_sub(1);
     if let Some(sel) = dialog_selection_mut(&mut app.dialog) {
         *sel = if down {
@@ -2066,6 +2087,47 @@ mod tests {
             app.dialog,
             DialogState::Setup { selected } if selected == SetupItem::AutoUpdate.index()
         ));
+    }
+
+    #[test]
+    fn setup_mouse_wheel_skips_sections_and_clamps_at_endpoints() {
+        let items: Vec<_> = SetupEntry::ALL
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| matches!(entry, SetupEntry::Item(_)).then_some(index))
+            .collect();
+        let mut app = test_app();
+        for (position, &selected) in items.iter().enumerate() {
+            for down in [false, true] {
+                app.dialog = DialogState::Setup { selected };
+                let wheel = MouseEvent {
+                    kind: if down {
+                        MouseEventKind::ScrollDown
+                    } else {
+                        MouseEventKind::ScrollUp
+                    },
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::empty(),
+                };
+                handle_mouse_event(&mut app, wheel);
+                let expected_position = if down {
+                    (position + 3).min(items.len() - 1)
+                } else {
+                    position.saturating_sub(3)
+                };
+                assert!(matches!(app.dialog, DialogState::Setup { selected }
+                    if selected == items[expected_position]));
+            }
+        }
+
+        app.dialog = DialogState::Setup {
+            selected: SetupItem::RefreshRate.index(),
+        };
+        move_dialog_selection(&mut app, false);
+        let before = app.config.refresh_rate_ms;
+        handle_key_event(&mut app, press(KeyCode::Enter));
+        assert_ne!(app.config.refresh_rate_ms, before);
     }
 
     #[test]

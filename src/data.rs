@@ -17,6 +17,42 @@ fn hydrate_or_enrich(processes: &mut [ProcessInfo], enrichment: ProcessEnrichmen
     }
 }
 
+/// The first collection after a pause re-primes every rate baseline. Display
+/// zero rates for that interval consistently across labels, bars and columns;
+/// cumulative counters and memory readings remain useful immediately.
+fn reset_rates_after_pause(
+    was_paused: &mut bool,
+    metrics: &mut SystemMetrics,
+    processes: &mut [ProcessInfo],
+) {
+    if !std::mem::take(was_paused) {
+        return;
+    }
+    for process in processes {
+        process.cpu_percent = 0.0;
+        process.io_read_rate = 0;
+        process.io_write_rate = 0;
+        process.gpu_percent = 0.0;
+        process.npu_percent = 0.0;
+    }
+    metrics.cpu.core_usage.fill(0.0);
+    for breakdown in &mut metrics.cpu.core_breakdown {
+        breakdown.user = 0.0;
+        breakdown.system = 0.0;
+        breakdown.idle = 100.0;
+    }
+    if let Some(gpu) = metrics.gpu.as_mut() {
+        gpu.utilization = 0.0;
+    }
+    if let Some(npu) = metrics.npu.as_mut() {
+        npu.utilization = 0.0;
+    }
+    metrics.net_rx_rate = 0;
+    metrics.net_tx_rate = 0;
+    metrics.disk_read_rate = 0;
+    metrics.disk_write_rate = 0;
+}
+
 /// Snapshot of system state produced by the background data collector
 pub struct SystemSnapshot {
     pub metrics: SystemMetrics,
@@ -448,24 +484,7 @@ impl DataCollector {
             hydrate_or_enrich(&mut processes, enrichment);
             let duration = start.elapsed();
 
-            if was_paused {
-                was_paused = false;
-                // Rates on the first tick after a pause would be averages
-                // over the whole paused span (every rate denominator uses
-                // real elapsed time). Show a clean zero-rate tick instead;
-                // baselines were refreshed by this collection, so the next
-                // tick shows normal values.
-                for process in processes.iter_mut() {
-                    process.cpu_percent = 0.0;
-                    process.io_read_rate = 0;
-                    process.io_write_rate = 0;
-                }
-                metrics.cpu.core_usage.fill(0.0);
-                metrics.net_rx_rate = 0;
-                metrics.net_tx_rate = 0;
-                metrics.disk_read_rate = 0;
-                metrics.disk_write_rate = 0;
-            }
+            reset_rates_after_pause(&mut was_paused, &mut metrics, &mut processes);
 
             let expands_metadata_coverage = !published_enrichment.contains(enrichment);
             if !paused.load(Ordering::Relaxed) || expands_metadata_coverage {
@@ -502,6 +521,179 @@ mod tests {
             enrichment: ProcessEnrichmentRequirements::default(),
             published_at: Instant::now(),
         }
+    }
+
+    fn process_with_rates() -> ProcessInfo {
+        ProcessInfo {
+            pid: 42,
+            parent_pid: 4,
+            name: "fixture.exe".into(),
+            exe_path: "C:\\fixture.exe".into(),
+            command: "C:\\fixture.exe".into(),
+            user: "SYSTEM".into(),
+            status: b'?',
+            cpu_percent: 75.0,
+            mem_percent: 12.0,
+            virtual_mem: 1000,
+            resident_mem: 500,
+            shared_mem: 100,
+            priority: 8,
+            cpu_time: 123_000_000,
+            thread_count: 3,
+            start_time: 123,
+            create_time_100ns: 456,
+            handle_count: 20,
+            io_read_bytes: 10000,
+            io_write_bytes: 20000,
+            io_read_rate: 100,
+            io_write_rate: 200,
+            gpu_percent: 60.0,
+            gpu_memory: 300,
+            npu_percent: 40.0,
+            npu_memory: 400,
+            name_lower: "fixture.exe".into(),
+            command_lower: "c:\\fixture.exe".into(),
+            user_lower: "system".into(),
+            efficiency_mode: true,
+            is_elevated: true,
+            arch: crate::system::ProcessArch::X64,
+            exe_updated: true,
+            exe_deleted: false,
+        }
+    }
+
+    #[test]
+    fn resume_resets_all_rates_and_preserves_counters_memory_and_metadata() {
+        let mut metrics = SystemMetrics::default();
+        metrics.cpu.core_usage = vec![80.0, 30.0];
+        metrics.cpu.core_breakdown.resize(2, Default::default());
+        for breakdown in &mut metrics.cpu.core_breakdown {
+            breakdown.user = 60.0;
+            breakdown.system = 20.0;
+            breakdown.idle = 20.0;
+        }
+        metrics.gpu = Some(crate::system::GpuInfo {
+            name: "GPU".to_string(),
+            utilization: 80.0,
+            mem_used: 200,
+            mem_total: 1000,
+            ..Default::default()
+        });
+        metrics.npu = Some(crate::system::NpuInfo {
+            name: "NPU".to_string(),
+            utilization: 70.0,
+            mem_used: 300,
+            mem_total: 2000,
+            ..Default::default()
+        });
+        metrics.net_rx_bytes = 1000;
+        metrics.net_tx_bytes = 2000;
+        metrics.disk_read_bytes = 3000;
+        metrics.disk_write_bytes = 4000;
+        metrics.net_rx_rate = 10;
+        metrics.net_tx_rate = 20;
+        metrics.disk_read_rate = 30;
+        metrics.disk_write_rate = 40;
+        metrics.memory.total = 8000;
+        metrics.memory.used = 2500;
+        metrics.uptime = 1234;
+        let mut processes = vec![process_with_rates()];
+        let original = processes[0].clone();
+        let mut was_paused = true;
+
+        reset_rates_after_pause(&mut was_paused, &mut metrics, &mut processes);
+
+        assert!(!was_paused);
+        assert_eq!(metrics.cpu.core_usage, vec![0.0, 0.0]);
+        assert_eq!(metrics.cpu.core_breakdown.len(), 2);
+        for breakdown in &metrics.cpu.core_breakdown {
+            assert_eq!(
+                (breakdown.user, breakdown.system, breakdown.idle),
+                (0.0, 0.0, 100.0)
+            );
+        }
+        let gpu = metrics.gpu.as_ref().unwrap();
+        let npu = metrics.npu.as_ref().unwrap();
+        assert_eq!((gpu.utilization, npu.utilization), (0.0, 0.0));
+        assert_eq!(
+            (gpu.name.as_str(), gpu.mem_used, gpu.mem_total),
+            ("GPU", 200, 1000)
+        );
+        assert_eq!(
+            (npu.name.as_str(), npu.mem_used, npu.mem_total),
+            ("NPU", 300, 2000)
+        );
+        assert_eq!(
+            [
+                metrics.net_rx_rate,
+                metrics.net_tx_rate,
+                metrics.disk_read_rate,
+                metrics.disk_write_rate
+            ],
+            [0; 4]
+        );
+        assert_eq!(
+            [
+                metrics.net_rx_bytes,
+                metrics.net_tx_bytes,
+                metrics.disk_read_bytes,
+                metrics.disk_write_bytes
+            ],
+            [1000, 2000, 3000, 4000]
+        );
+        assert_eq!(
+            (metrics.memory.total, metrics.memory.used, metrics.uptime),
+            (8000, 2500, 1234)
+        );
+
+        let process = &processes[0];
+        assert_eq!(
+            (
+                process.cpu_percent,
+                process.gpu_percent,
+                process.npu_percent
+            ),
+            (0.0, 0.0, 0.0)
+        );
+        assert_eq!((process.io_read_rate, process.io_write_rate), (0, 0));
+        // Compare every remaining field through the derived Debug output;
+        // only the five interval-rate fields are allowed to change.
+        let mut expected = original;
+        expected.cpu_percent = 0.0;
+        expected.io_read_rate = 0;
+        expected.io_write_rate = 0;
+        expected.gpu_percent = 0.0;
+        expected.npu_percent = 0.0;
+        assert_eq!(format!("{process:?}"), format!("{expected:?}"));
+    }
+
+    #[test]
+    fn normal_sample_after_resume_keeps_its_new_rates() {
+        let mut metrics = SystemMetrics::default();
+        let mut processes = vec![process_with_rates()];
+        let mut was_paused = true;
+        reset_rates_after_pause(&mut was_paused, &mut metrics, &mut processes);
+
+        metrics.cpu.core_usage = vec![25.0];
+        metrics.cpu.core_breakdown.resize(1, Default::default());
+        metrics.cpu.core_breakdown[0].user = 20.0;
+        metrics.cpu.core_breakdown[0].system = 5.0;
+        metrics.cpu.core_breakdown[0].idle = 75.0;
+        metrics.net_rx_rate = 10;
+        metrics.disk_write_rate = 20;
+        processes[0] = process_with_rates();
+        let expected = format!("{:?}", processes[0]);
+
+        reset_rates_after_pause(&mut was_paused, &mut metrics, &mut processes);
+
+        assert_eq!(metrics.cpu.core_usage, vec![25.0]);
+        let breakdown = metrics.cpu.core_breakdown[0];
+        assert_eq!(
+            (breakdown.user, breakdown.system, breakdown.idle),
+            (20.0, 5.0, 75.0)
+        );
+        assert_eq!((metrics.net_rx_rate, metrics.disk_write_rate), (10, 20));
+        assert_eq!(format!("{:?}", processes[0]), expected);
     }
 
     #[test]

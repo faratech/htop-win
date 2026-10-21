@@ -206,18 +206,20 @@ mod tests {
 
 /// `(bytes / 2^divisor_pow2)` with one decimal ("13.4"), ties to even —
 /// byte-identical to `format!("{:.1}", bytes as f64 / 2^d)`.
-pub(crate) fn scaled_bytes(bytes: u64, divisor_pow2: u32) -> String {
-    let tenths = round_half_even_div(u128::from(bytes) * 10, divisor_pow2);
-    format!("{}.{}", tenths / 10, tenths % 10)
+#[cfg(test)]
+fn scaled_bytes(bytes: u64, divisor_pow2: u32) -> String {
+    let mut output = String::new();
+    scaled_bytes_into(&mut output, bytes, divisor_pow2);
+    output
 }
 
-/// [`scaled_bytes`] writing into a caller-owned (pooled) string.
+/// Format scaled bytes into a caller-owned (pooled) string.
 pub(crate) fn scaled_bytes_into(buf: &mut String, bytes: u64, divisor_pow2: u32) {
     buf.clear();
     push_scaled_bytes(buf, bytes, divisor_pow2);
 }
 
-/// [`scaled_bytes`] appended to `buf`.
+/// Append scaled bytes to `buf`.
 pub(crate) fn push_scaled_bytes(buf: &mut String, bytes: u64, divisor_pow2: u32) {
     let tenths = round_half_even_div(u128::from(bytes) * 10, divisor_pow2);
     use std::fmt::Write as _;
@@ -226,11 +228,12 @@ pub(crate) fn push_scaled_bytes(buf: &mut String, bytes: u64, divisor_pow2: u32)
 
 /// `(bytes / 2^divisor_pow2)` rounded to an integer — matches
 /// `format!("{:.0}", bytes as f64 / 2^d)`.
-pub(crate) fn scaled_bytes_round0(bytes: u64, divisor_pow2: u32) -> String {
+#[cfg(test)]
+fn scaled_bytes_round0(bytes: u64, divisor_pow2: u32) -> String {
     format!("{}", scaled_round0(bytes, divisor_pow2))
 }
 
-/// The integer [`scaled_bytes_round0`] formats.
+/// Round a byte count to an integer after scaling by a power of two.
 pub(crate) fn scaled_round0(bytes: u64, divisor_pow2: u32) -> u128 {
     round_half_even_div(u128::from(bytes), divisor_pow2)
 }

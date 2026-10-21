@@ -2,22 +2,65 @@
 """Compare CPU utilization between old and new htop-win versions."""
 
 import subprocess
-import time
-import os
 import argparse
+import math
+import shutil
 from pathlib import Path
+
+
+def find_powershell():
+    for name in ("powershell", "powershell.exe", "pwsh"):
+        shell = shutil.which(name)
+        if shell:
+            return shell
+    raise RuntimeError("PowerShell is required to measure Windows process CPU time")
+
+
+def powershell_literal(value):
+    return "'" + str(value).replace("'", "''") + "'"
+
 
 def measure_cpu_time(exe_path, iterations=20, delay=100, runs=3):
     """Run exe multiple times and measure CPU time."""
+    shell = find_powershell()
+    arguments = [
+        "--max-iterations", str(iterations), "--delay", str(delay),
+        "--no-mouse", "--sort", "pid", "--no-auto-update",
+    ]
+    argument_list = powershell_literal(subprocess.list2cmdline(arguments))
     results = []
     for i in range(runs):
         cmd = f'''
-$proc = Start-Process -FilePath '{exe_path}' -ArgumentList '--max-iterations','{iterations}','--delay','{delay}','--no-mouse' -PassThru -WindowStyle Hidden
+$ErrorActionPreference = 'Stop'
+$start = New-Object System.Diagnostics.ProcessStartInfo
+$start.FileName = {powershell_literal(exe_path)}
+$start.Arguments = {argument_list}
+$start.UseShellExecute = $false
+# htop needs console input; inherit the wrapper's console while suppressing
+# any new console window. Direct process creation bypasses shell associations.
+$start.CreateNoWindow = $false
+$start.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+$start.RedirectStandardOutput = $true
+$start.RedirectStandardError = $true
+$proc = New-Object System.Diagnostics.Process
+$proc.StartInfo = $start
+if (-not $proc.Start()) {{
+    throw 'Unable to start benchmark executable'
+}}
+$stdout = $proc.StandardOutput.ReadToEndAsync()
+$stderr = $proc.StandardError.ReadToEndAsync()
+# Keep a process handle before waiting so short-lived children retain exit data.
+$null = $proc.Handle
 $proc.WaitForExit()
-$proc.TotalProcessorTime.TotalMilliseconds
+$childOutput = $stdout.GetAwaiter().GetResult()
+$childError = $stderr.GetAwaiter().GetResult()
+if ($proc.ExitCode -ne 0) {{
+    throw "Benchmark executable exited with code $($proc.ExitCode)`n$childOutput`n$childError"
+}}
+$proc.TotalProcessorTime.TotalMilliseconds.ToString('R', [Globalization.CultureInfo]::InvariantCulture)
 '''
         result = subprocess.run(
-            ['powershell', '-Command', cmd],
+            [shell, '-NoProfile', '-NonInteractive', '-Command', cmd],
             capture_output=True, text=True
         )
         if result.returncode != 0:
@@ -28,13 +71,18 @@ $proc.TotalProcessorTime.TotalMilliseconds
             )
         try:
             cpu_ms = float(result.stdout.strip())
-            results.append(cpu_ms)
-            print(f"  Run {i+1}: {cpu_ms:.0f}ms")
         except ValueError as exc:
             raise RuntimeError(
                 f"Run {i + 1} did not return numeric CPU time for {exe_path}: "
                 f"{result.stdout!r}"
             ) from exc
+        if not math.isfinite(cpu_ms) or cpu_ms < 0:
+            raise RuntimeError(
+                f"Run {i + 1} did not return finite nonnegative CPU time for {exe_path}: "
+                f"{result.stdout!r}"
+            )
+        results.append(cpu_ms)
+        print(f"  Run {i+1}: {cpu_ms:.0f}ms")
     if not results:
         raise RuntimeError(f"No successful benchmark runs for {exe_path}")
     return results
