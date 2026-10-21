@@ -127,6 +127,9 @@ pub fn install_to_path(force: bool) -> Result<(), Box<dyn std::error::Error>> {
     let current_exe = std::env::current_exe()?;
     let current_version = env!("CARGO_PKG_VERSION");
     let target_path = get_install_path()?;
+    // Share the update paths' lock across inspection and replacement: otherwise
+    // an installer can rename a target another process is currently publishing.
+    let _lock = UpdateLock::acquire()?;
 
     if target_path.exists() && paths_refer_to_same_file(&current_exe, &target_path)? {
         println!(
@@ -1329,21 +1332,82 @@ pub fn update_from_github(force: bool) -> Result<(), Box<dyn std::error::Error>>
 }
 
 fn install_update_file(update_file: &Path, target_path: &Path) -> io::Result<()> {
+    let mut source = File::open(update_file)?;
+    let prepared = prepare_update_file(&mut source, target_path)?;
+    publish_prepared_update(prepared, target_path, |from, to| fs::rename(from, to))
+}
+
+/// Own a complete sibling of the destination, removing it on failure unless
+/// rollback also fails and the user needs its path to recover the installation.
+struct PreparedUpdate {
+    path: PathBuf,
+    preserve: bool,
+}
+
+impl Drop for PreparedUpdate {
+    fn drop(&mut self) {
+        if !self.preserve {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn prepare_update_file(
+    source: &mut impl io::Read,
+    target_path: &Path,
+) -> io::Result<PreparedUpdate> {
     if let Some(parent) = target_path.parent() {
         fs::create_dir_all(parent)?;
     }
 
+    let path =
+        target_path.with_file_name(format!(".htop-win-install-{}.tmp", unique_generation_id()));
+    let mut destination = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    let prepared = PreparedUpdate {
+        path,
+        preserve: false,
+    };
+    let result = (|| {
+        io::copy(source, &mut destination)?;
+        destination.sync_all()
+    })();
+    drop(destination);
+    result?;
+    Ok(prepared)
+}
+
+fn publish_prepared_update(
+    mut prepared: PreparedUpdate,
+    target_path: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
     if !target_path.exists() {
-        fs::copy(update_file, target_path)?;
-        return Ok(());
+        return rename(&prepared.path, target_path);
     }
 
     let backup_path = target_path.with_extension("exe.old");
     let _ = fs::remove_file(&backup_path);
-    fs::rename(target_path, &backup_path)?;
+    rename(target_path, &backup_path)?;
 
-    if let Err(error) = fs::copy(update_file, target_path) {
-        let _ = fs::rename(&backup_path, target_path);
+    // Windows may refuse direct replacement of a running image. Both files are
+    // complete before these two renames, but an interruption between them can
+    // still leave the live pathname absent and the old executable at .exe.old.
+    if let Err(error) = rename(&prepared.path, target_path) {
+        if let Err(rollback_error) = rename(&backup_path, target_path) {
+            prepared.preserve = true;
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to publish update at {}: {error}; failed to restore the previous executable: {rollback_error}. Previous executable preserved at {}; complete replacement preserved at {}",
+                    target_path.display(),
+                    backup_path.display(),
+                    prepared.path.display()
+                ),
+            ));
+        }
         return Err(error);
     }
 
@@ -1993,5 +2057,155 @@ mod tests {
         assert!(valid.path.exists());
         assert!(!invalid.generation_dir.unwrap().exists());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_copy_never_changes_the_installed_executable() {
+        struct FailingReader(io::Cursor<Vec<u8>>);
+        impl io::Read for FailingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                let read = io::Read::read(&mut self.0, buffer)?;
+                if read == 0 {
+                    Err(io::Error::other("injected source read failure"))
+                } else {
+                    Ok(read)
+                }
+            }
+        }
+
+        for already_installed in [false, true] {
+            let directory = test_directory("failed-install-copy");
+            fs::create_dir_all(&directory).unwrap();
+            let target = directory.join("htop.exe");
+            if already_installed {
+                fs::write(&target, b"working executable").unwrap();
+            }
+            let mut source = FailingReader(io::Cursor::new(vec![42; 32 * 1024]));
+            let error = prepare_update_file(&mut source, &target).err().unwrap();
+            assert!(error.to_string().contains("source read failure"));
+            if already_installed {
+                assert_eq!(fs::read(&target).unwrap(), b"working executable");
+            } else {
+                assert!(!target.exists());
+            }
+            assert_eq!(
+                fs::read_dir(&directory).unwrap().count(),
+                usize::from(already_installed)
+            );
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn complete_prepared_file_is_published_for_new_and_existing_installs() {
+        for already_installed in [false, true] {
+            let directory = test_directory("complete-install");
+            fs::create_dir_all(&directory).unwrap();
+            let source = directory.join("source.exe");
+            let target = directory.join("htop.exe");
+            let replacement = vec![67; 128 * 1024];
+            fs::write(&source, &replacement).unwrap();
+            if already_installed {
+                fs::write(&target, b"previous executable").unwrap();
+            }
+            install_update_file(&source, &target).unwrap();
+            assert_eq!(fs::read(&target).unwrap(), replacement);
+            assert_eq!(fs::read(&source).unwrap(), replacement);
+            assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+            fs::remove_dir_all(directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_promotion_restores_the_previous_executable() {
+        let directory = test_directory("install-rollback");
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("htop.exe");
+        fs::write(&target, b"previous executable").unwrap();
+        let prepared = prepare_update_file(&mut &b"complete replacement"[..], &target).unwrap();
+        let prepared_path = prepared.path.clone();
+        let mut calls = 0;
+        let result = publish_prepared_update(prepared, &target, |from, to| {
+            calls += 1;
+            if calls == 1 {
+                assert_eq!(fs::read(&prepared_path).unwrap(), b"complete replacement");
+                assert_eq!(fs::read(&target).unwrap(), b"previous executable");
+            }
+            if calls == 2 {
+                // Cause a real filesystem promotion failure, then remove the
+                // obstruction so the real rollback rename can succeed.
+                fs::create_dir(&target)?;
+                let result = fs::rename(from, to);
+                fs::remove_dir(&target)?;
+                result
+            } else {
+                fs::rename(from, to)
+            }
+        });
+        assert!(result.is_err());
+        assert_eq!(calls, 3);
+        assert_eq!(fs::read(&target).unwrap(), b"previous executable");
+        assert!(!prepared_path.exists());
+        assert!(!target.with_extension("exe.old").exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_rollback_preserves_both_files_and_reports_recovery_paths() {
+        let directory = test_directory("install-rollback-failed");
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("htop.exe");
+        fs::write(&target, b"previous executable").unwrap();
+        let prepared = prepare_update_file(&mut &b"complete replacement"[..], &target).unwrap();
+        let prepared_path = prepared.path.clone();
+        let backup_path = target.with_extension("exe.old");
+        let mut calls = 0;
+        let error = publish_prepared_update(prepared, &target, |from, to| {
+            calls += 1;
+            if calls == 2 {
+                // A directory at the live path makes promotion and rollback
+                // fail in the filesystem, rather than returning a mock error.
+                fs::create_dir(&target)?;
+            }
+            fs::rename(from, to)
+        })
+        .unwrap_err();
+        assert_eq!(calls, 3);
+        let message = error.to_string();
+        assert!(message.contains("failed to restore"), "{message}");
+        assert!(
+            message.contains(&backup_path.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&prepared_path.display().to_string()),
+            "{message}"
+        );
+        assert_eq!(fs::read(&backup_path).unwrap(), b"previous executable");
+        assert_eq!(fs::read(&prepared_path).unwrap(), b"complete replacement");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_rename_aside_leaves_the_installed_file_untouched() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+        let directory = test_directory("install-rename-blocked");
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("source.exe");
+        let target = directory.join("htop.exe");
+        fs::write(&source, b"complete replacement").unwrap();
+        fs::write(&target, b"previous executable").unwrap();
+        let held = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ.0)
+            .open(&target)
+            .unwrap();
+        assert!(install_update_file(&source, &target).is_err());
+        assert_eq!(fs::read(&target).unwrap(), b"previous executable");
+        assert_eq!(fs::read_dir(&directory).unwrap().count(), 2);
+        drop(held);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -489,12 +489,15 @@ static MOUSE_CAPTURE_ENABLED: AtomicBool = AtomicBool::new(false);
 /// safe to call from the panic hook, the error path, and the normal exit path
 /// alike (errors are ignored — there is nothing useful to do with them).
 fn restore_terminal() {
-    let _ = disable_raw_mode();
     let mut stdout = io::stdout();
-    let _ = execute!(stdout, LeaveAlternateScreen);
     if MOUSE_CAPTURE_ENABLED.load(Ordering::Relaxed) {
         let _ = execute!(stdout, DisableMouseCapture);
     }
+    // Crossterm's Windows mouse cleanup restores the input mode saved after
+    // raw mode was enabled. Disable raw mode last so that restore cannot
+    // leave line input, echo and Ctrl+C processing disabled on exit.
+    let _ = disable_raw_mode();
+    let _ = execute!(stdout, LeaveAlternateScreen);
     let _ = execute!(stdout, cursor::Show);
 }
 
@@ -1104,6 +1107,71 @@ fn run_app(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn terminal_cleanup_restores_console_input_in_child() {
+        const CHILD: &str = "HTOP_TEST_CONSOLE_CLEANUP_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::terminal_cleanup_restores_console_input_in_child",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "console cleanup child failed: {output:?}"
+            );
+            return;
+        }
+
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::System::Console::{
+            AllocConsole, CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+            ENABLE_PROCESSED_INPUT, FreeConsole, GetConsoleMode, SetConsoleMode,
+        };
+        // Give this subprocess its own console so the test cannot change the
+        // user's console or race with another test's input mode.
+        unsafe {
+            let _ = FreeConsole();
+            AllocConsole().unwrap();
+            // Subprocess stdin may be redirected; query the newly allocated
+            // console itself, as crossterm does, instead of the inherited pipe.
+            let input = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("CONIN$")
+                .unwrap();
+            let handle = windows::Win32::Foundation::HANDLE(input.as_raw_handle());
+            let mut original = CONSOLE_MODE(0);
+            GetConsoleMode(handle, &mut original).unwrap();
+            let cooked = ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT;
+            let baseline = original | cooked;
+            for capture in [false, true] {
+                SetConsoleMode(handle, baseline).unwrap();
+                enable_raw_mode().unwrap();
+                if capture {
+                    execute!(io::stdout(), EnableMouseCapture).unwrap();
+                }
+                MOUSE_CAPTURE_ENABLED.store(capture, Ordering::Relaxed);
+                // The same helper serves normal exit, early setup errors and
+                // the panic hook, and repeated cleanup must remain safe.
+                for _ in 0..2 {
+                    restore_terminal();
+                    let mut restored = CONSOLE_MODE(0);
+                    GetConsoleMode(handle, &mut restored).unwrap();
+                    assert_eq!(restored & cooked, cooked);
+                }
+            }
+            MOUSE_CAPTURE_ENABLED.store(false, Ordering::Relaxed);
+            SetConsoleMode(handle, original).unwrap();
+            FreeConsole().unwrap();
+        }
+    }
 
     #[test]
     fn cli_readonly_is_not_written_into_persisted_config() {

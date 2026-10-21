@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
 Version bumping script for htop-win.
-Updates version in Cargo.toml and media/htop.rc
+Updates version in Cargo.toml, Cargo.lock and media/htop.rc
 """
 
 import re
 import sys
 import argparse
+import subprocess
 from pathlib import Path
 
 PROJECT_DIR = Path(__file__).parent.resolve()
 CARGO_TOML = PROJECT_DIR / "Cargo.toml"
 RESOURCE_FILE = PROJECT_DIR / "media" / "htop.rc"
+LOCK_FILE = PROJECT_DIR / "Cargo.lock"
 
 SEMVER_RE = re.compile(
     r"""
@@ -137,6 +139,30 @@ def update_resource_file(old_version: str, new_version: str) -> bool:
     return True
 
 
+def update_version(old_version: str, new_version: str) -> None:
+    """Keep version files and the workspace lockfile in sync, or restore them."""
+    paths = (CARGO_TOML, RESOURCE_FILE, LOCK_FILE)
+    originals = {path: path.read_bytes() if path.exists() else None for path in paths}
+    try:
+        update_cargo_toml(old_version, new_version)
+        update_resource_file(old_version, new_version)
+        # Updating workspace packages refreshes the root version without
+        # upgrading unrelated dependencies or requiring a network request.
+        subprocess.run(
+            ["cargo", "update", "--workspace", "--offline"],
+            cwd=PROJECT_DIR,
+            check=True,
+        )
+        print("  Updated Cargo.lock")
+    except (OSError, subprocess.CalledProcessError):
+        for path, contents in originals.items():
+            if contents is None:
+                path.unlink(missing_ok=True)
+            else:
+                path.write_bytes(contents)
+        raise
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Bump htop-win version number"
@@ -180,8 +206,11 @@ def main():
         return
 
     print()
-    update_cargo_toml(current_version, new_version)
-    update_resource_file(current_version, new_version)
+    try:
+        update_version(current_version, new_version)
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"Error: version bump failed; original version files restored: {error}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"\nDone! Version bumped to {new_version}")
     print("\nNext steps:")

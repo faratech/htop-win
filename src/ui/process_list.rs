@@ -185,7 +185,7 @@ fn push_bytes_colored(
 
     if bytes >= TB {
         out.push(Span::styled(
-            pfmt!("{}T", crate::numfmt::scaled_bytes(bytes, 40)),
+            fmt_scaled_bytes!(bytes, 40, "T"),
             Style::default().fg(color_tb),
         ));
     } else if bytes >= GB {
@@ -203,7 +203,7 @@ fn push_bytes_colored(
             ));
         } else {
             out.push(Span::styled(
-                pfmt!("{}", crate::numfmt::scaled_bytes_round0(bytes, 30)),
+                pfmt!("{}", crate::numfmt::scaled_round0(bytes, 30)),
                 Style::default().fg(color_gb),
             ));
             out.push(Span::styled("G", Style::default().fg(color_mb))); // Use static str
@@ -222,13 +222,13 @@ fn push_bytes_colored(
             ));
         } else {
             out.push(Span::styled(
-                pfmt!("{}M", crate::numfmt::scaled_bytes_round0(bytes, 20)),
+                pfmt!("{}M", crate::numfmt::scaled_round0(bytes, 20)),
                 Style::default().fg(color_mb),
             ));
         }
     } else if bytes >= KB {
         out.push(Span::styled(
-            pfmt!("{}K", crate::numfmt::scaled_bytes_round0(bytes, 10)),
+            pfmt!("{}K", crate::numfmt::scaled_round0(bytes, 10)),
             Style::default().fg(base_color),
         ));
     } else {
@@ -465,11 +465,7 @@ pub fn draw<'a>(frame: &mut Frame, app: &'a App, area: Rect, column_widths: &[Co
         // Typed as &str so its slices can be borrowed directly into Spans
         // (zero-allocation) instead of cloned — valid because `proc` is
         // borrowed from app.processes for the whole draw.
-        let display_command: &str = if app.config.show_program_path {
-            &proc.command
-        } else {
-            &proc.name
-        };
+        let display_command = app.command_text()(proc);
 
         // Push one column's spans for this process.
         let push_cell = |col: &SortColumn, out: &mut Vec<Span<'a>>| {

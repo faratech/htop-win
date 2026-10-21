@@ -44,7 +44,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch; toolchain set explicitly
         with:
-          toolchain: 1.99.0
+          toolchain: 1.99.1
 
       - name: Resolve and validate release source
         id: source
@@ -164,7 +164,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch; toolchain set explicitly
         with:
-          toolchain: 1.99.0
+          toolchain: 1.99.1
           targets: ${{ matrix.target }}
 
       - name: Build

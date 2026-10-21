@@ -1,6 +1,7 @@
 use crate::terminal::{Frame, Line, Modifier, Rect, Span, Style};
 
 use crate::app::{App, DialogState, FocusRegion};
+use super::text_pool::{pooled_fmt, pooled_str, pooled_string, recycle_spans};
 
 /// Blank run for empty footer slots (max slot width: label 6 + gap 1 + key 1).
 const FOOTER_BLANKS: &str = "                                ";
@@ -25,81 +26,77 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut key_index = 0usize;
 
     // htop style: F1Help  F2Setup (key is black on cyan, label is white, no space between)
-    let spans: Vec<Span> = function_keys
-        .iter()
-        .flat_map(|(key_num, key_str, label)| {
-            if key_str.is_empty() {
-                // Empty key/label pair — fill with blanks sized to match other slots
-                x_pos += empty_slot_width;
-                vec![Span::styled(
-                    &FOOTER_BLANKS[..empty_slot_width as usize],
-                    Style::default().bg(theme.background),
-                )]
-            } else {
-                let key_width = key_str.len() as u16;
-                let total_width = key_width + label_width + slot_gap;
+    let mut spans = Vec::with_capacity(function_keys.len() * 3);
+    for (key_num, key_str, label) in function_keys {
+        if key_str.is_empty() {
+            // Empty key/label pair — fill with blanks sized to match other slots
+            x_pos += empty_slot_width;
+            spans.push(Span::styled(
+                &FOOTER_BLANKS[..empty_slot_width as usize],
+                Style::default().bg(theme.background),
+            ));
+        } else {
+            let key_width = key_str.len() as u16;
+            let total_width = key_width + label_width + slot_gap;
 
-                // Register function key region if it's a valid F-key
-                if let Some(num) = key_num {
-                    app.ui_bounds
-                        .add_function_key(*num, x_pos, area.y, total_width);
-                }
-
-                x_pos += total_width;
-
-                // Check if this key is focused
-                let is_focused =
-                    footer_focused && key_num.is_some() && key_index == focused_key_index;
-                key_index += if key_num.is_some() { 1 } else { 0 };
-
-                // Use inverted colors for focused key
-                let (key_fg, key_bg, label_fg, label_bg) = if is_focused {
-                    // Highlighted/focused: invert colors
-                    (
-                        theme.function_bar_bg,
-                        theme.function_bar_fg,
-                        theme.selection_fg,
-                        theme.selection_bg,
-                    )
-                } else {
-                    // Normal
-                    (
-                        theme.function_bar_fg,
-                        theme.function_bar_bg,
-                        theme.function_key,
-                        theme.background,
-                    )
-                };
-
-                // Truncate label to the dynamic label width (avoids overflow
-                // on narrow terminals) and left-pad to fill the cell.
-                let label_padded = if label_width == 0 {
-                    String::new()
-                } else {
-                    let mut s: String = label.chars().take(label_width as usize).collect();
-                    let missing = (label_width as usize).saturating_sub(s.chars().count());
-                    s.extend(std::iter::repeat_n(' ', missing));
-                    s
-                };
-
-                vec![
-                    Span::styled(*key_str, Style::default().fg(key_fg).bg(key_bg)),
-                    Span::styled(label_padded, Style::default().fg(label_fg).bg(label_bg)),
-                    Span::styled(" ", Style::default().bg(theme.background)),
-                ]
+            // Register function key region if it's a valid F-key
+            if let Some(num) = key_num {
+                app.ui_bounds
+                    .add_function_key(*num, x_pos, area.y, total_width);
             }
-        })
-        .collect();
 
-    let line = Line::from(spans);
+            x_pos += total_width;
+
+            // Check if this key is focused
+            let is_focused =
+                footer_focused && key_num.is_some() && key_index == focused_key_index;
+            key_index += if key_num.is_some() { 1 } else { 0 };
+
+            // Use inverted colors for focused key
+            let (key_fg, key_bg, label_fg, label_bg) = if is_focused {
+                // Highlighted/focused: invert colors
+                (
+                    theme.function_bar_bg,
+                    theme.function_bar_fg,
+                    theme.selection_fg,
+                    theme.selection_bg,
+                )
+            } else {
+                // Normal
+                (
+                    theme.function_bar_fg,
+                    theme.function_bar_bg,
+                    theme.function_key,
+                    theme.background,
+                )
+            };
+
+            // Truncate label to the dynamic label width (avoids overflow
+            // on narrow terminals) and left-pad to fill the cell.
+            let mut label_padded = pooled_string();
+            label_padded.extend(label.chars().take(label_width as usize));
+            let missing = (label_width as usize).saturating_sub(label_padded.chars().count());
+            label_padded.extend(std::iter::repeat_n(' ', missing));
+
+            spans.extend([
+                Span::styled(*key_str, Style::default().fg(key_fg).bg(key_bg)),
+                Span::styled(label_padded, Style::default().fg(label_fg).bg(label_bg)),
+                Span::styled(" ", Style::default().bg(theme.background)),
+            ]);
+        }
+    }
+
+    let mut line = Line::from(spans);
     let background = Style::default().bg(theme.background);
     frame.paint_line(area, &line, background);
+    recycle_spans(&mut line.spans);
 
     // Second line: filter/search status
     if area.height > 1 {
         let status_area = Rect::new(area.x, area.y + 1, area.width, 1);
-        let status_line = Line::from(build_status_line(app));
+        let mut status_line = Line::from(build_status_line(app));
         frame.paint_line(status_area, &status_line, background);
+        recycle_spans(&mut status_line.spans);
     }
 }
 
@@ -341,7 +338,7 @@ fn build_status_line(app: &App) -> Vec<Span<'static>> {
         && time.elapsed() < Duration::from_secs(5)
     {
         spans.push(Span::styled(
-            format!("ERROR: {} ", error),
+            pooled_fmt(format_args!("ERROR: {} ", error)),
             Style::default()
                 .fg(theme.failed_read)
                 .add_modifier(Modifier::BOLD),
@@ -354,7 +351,7 @@ fn build_status_line(app: &App) -> Vec<Span<'static>> {
         && time.elapsed() < Duration::from_secs(3)
     {
         spans.push(Span::styled(
-            format!("{} ", msg),
+            pooled_fmt(format_args!("{} ", msg)),
             Style::default()
                 .fg(theme.meter_value_ok)
                 .add_modifier(Modifier::BOLD),
@@ -365,7 +362,7 @@ fn build_status_line(app: &App) -> Vec<Span<'static>> {
     // Show persistent update available indicator (if auto_update is enabled)
     if app.config.auto_update && let Some((ref version, _)) = app.update_available {
         spans.push(Span::styled(
-            format!("[Update v{} ready - restart to apply] ", version),
+            pooled_fmt(format_args!("[Update v{} ready - restart to apply] ", version)),
             Style::default()
                 .fg(theme.meter_value_warn)
                 .add_modifier(Modifier::BOLD),
@@ -400,7 +397,7 @@ fn build_status_line(app: &App) -> Vec<Span<'static>> {
     // Show follow mode indicator
     if let Some(identity) = app.follow_pid {
         spans.push(Span::styled(
-            format!("[Follow:{}] ", identity.pid),
+            pooled_fmt(format_args!("[Follow:{}] ", identity.pid)),
             Style::default().fg(theme.process_priv),
         ));
     }
@@ -408,7 +405,7 @@ fn build_status_line(app: &App) -> Vec<Span<'static>> {
     // Show user filter if active
     if let Some(ref user) = app.user_filter {
         spans.push(Span::styled(
-            format!("User: {} ", user),
+            pooled_fmt(format_args!("User: {} ", user)),
             Style::default().fg(theme.process_priv),
         ));
     }
@@ -417,7 +414,7 @@ fn build_status_line(app: &App) -> Vec<Span<'static>> {
     if !app.filter_string.is_empty() {
         spans.push(Span::styled("Filter: ", Style::default().fg(theme.label)));
         spans.push(Span::styled(
-            app.filter_string.clone(),
+            pooled_str(&app.filter_string),
             Style::default().fg(theme.text),
         ));
         spans.push(Span::raw("  "));
@@ -427,7 +424,7 @@ fn build_status_line(app: &App) -> Vec<Span<'static>> {
     if !app.search_string.is_empty() {
         spans.push(Span::styled("Search: ", Style::default().fg(theme.label)));
         spans.push(Span::styled(
-            app.search_string.clone(),
+            pooled_str(&app.search_string),
             Style::default().fg(theme.text),
         ));
         spans.push(Span::raw("  "));
@@ -444,18 +441,18 @@ fn build_status_line(app: &App) -> Vec<Span<'static>> {
     // Show tagged count
     if !app.tagged_pids.is_empty() {
         spans.push(Span::styled(
-            format!("[{} tagged] ", app.tagged_pids.len()),
+            pooled_fmt(format_args!("[{} tagged] ", app.tagged_pids.len())),
             Style::default().fg(theme.process_tag),
         ));
     }
 
     // Show sort column
     spans.push(Span::styled(
-        format!(
+        pooled_fmt(format_args!(
             "Sort: {}{} ",
             app.sort_column.name(),
             if app.sort_ascending { "↑" } else { "↓" }
-        ),
+        )),
         Style::default().fg(theme.text_dim),
     ));
 

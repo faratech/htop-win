@@ -1,5 +1,93 @@
 # Bug remediation plan
 
+## October 2026 bug and performance passes
+
+Reviewed baseline: `7bcbd1c` (v0.2.14). Scope is the tracked application and tooling;
+the existing untracked `site/` and `manifests/` directories are excluded.
+
+The host default/stable toolchains, repository pin, minimum Rust version,
+CI/release workflows and build documentation now use Rust 1.99.1. Findings were
+logged before remediation. Reports #43 and #71 were reopened with focused new
+evidence while preserving their historical bodies.
+
+| Issue | Remediation |
+| --- | --- |
+| [#125](https://github.com/faratech/htop-win/issues/125) | Rust 1.99.1 upgrade across host, repository and workflows |
+| [#126](https://github.com/faratech/htop-win/issues/126) | Disable mouse capture before restoring cooked console input |
+| [#127](https://github.com/faratech/htop-win/issues/127) | Prepare and sync complete installation siblings before replacement; preserve recovery files on rollback failure |
+| [#128](https://github.com/faratech/htop-win/issues/128) | Serialize public install commands with other update paths |
+| [#129](https://github.com/faratech/htop-win/issues/129) | Enrich off-screen search paths and select the first match when metadata arrives |
+| [#130](https://github.com/faratech/htop-win/issues/130) | Sort Command using the same name/path value the table displays |
+| [#43](https://github.com/faratech/htop-win/issues/43) | Dispatch footer Next/Previous through modal keyboard handling and preserve cancellation |
+| [#131](https://github.com/faratech/htop-win/issues/131) | Keep Setup wheel selection on actionable settings |
+| [#132](https://github.com/faratech/htop-win/issues/132) | Keep graphics failure retry deadlines fixed until re-enumeration |
+| [#133](https://github.com/faratech/htop-win/issues/133) | Retry transient adapter classification failures without requiring changed topology |
+| [#71](https://github.com/faratech/htop-win/issues/71) | Grow executable-path buffers only on insufficient-buffer errors, without relying on an unspecified output length |
+| [#134](https://github.com/faratech/htop-win/issues/134) | Use one explicit Cargo target directory for builds and artifact copying |
+| [#135](https://github.com/faratech/htop-win/issues/135) | Update Cargo.lock during version bumps and restore version files on resolution failure |
+| [#136](https://github.com/faratech/htop-win/issues/136) | Reset all displayed utilization consistently on the first resumed sample |
+| [#137](https://github.com/faratech/htop-win/issues/137) | Reject failed CPU benchmark children and run comparable PID-sorted workloads |
+| [#138](https://github.com/faratech/htop-win/issues/138) | Keep adapter recovery active for visible/sorted graphics columns when the header is hidden |
+| [#139](https://github.com/faratech/htop-win/issues/139) | Re-prime system graphics utilization after failed or partial sweeps |
+| [#140](https://github.com/faratech/htop-win/issues/140) | Format byte columns directly into pooled strings |
+| [#141](https://github.com/faratech/htop-win/issues/141) | Remove per-slot footer label/vector allocations |
+| [#142](https://github.com/faratech/htop-win/issues/142) | Re-prime only failed per-process graphics nodes without suppressing working siblings |
+| [#143](https://github.com/faratech/htop-win/issues/143) | Verify process creation time on the graphics query handle before attributing counters |
+
+### Verification and performance
+
+The final regression pass found no further confirmed actionable defects or
+measured performance improvements to add. Verification on Rust 1.99.1 covers
+282 Windows tests, eight Python maintenance tests, Clippy with warnings denied,
+actionlint, and x64/ARM64 release builds. Added regressions exercise metadata
+arrival, modal input, both display/sort directions, controlled graphics recovery
+clocks, process-handle identity, long-path API contracts, real filesystem rollback
+failures, concurrent isolated installs, and version/build helper failures.
+
+Renderer equivalence checks matched 64,512 footer cell/style/hitbox cases and
+480 byte-formatting boundary/color/selection cases. Three alternating optimized
+LTO component comparisons measured:
+
+| Component | Before | After | Allocations before/after |
+| --- | --- | --- | --- |
+| Byte formatting, 27 rows | 33.004 µs | 17.243 µs | 81 / 0 |
+| Footer rendering | 6.597 µs | 4.103 µs | 27 / 3 |
+
+These component improvements are approximately 48% and 38%; they do not claim
+that the whole application is that much faster. The local rerunnable probe and
+raw results are `target/audit-results/render-bench.py` and `render-bench.txt`.
+Creation-time verification adds one GetProcessTimes call per graphics query
+handle; an eight-round native probe measured a median 0.450 µs per handle here,
+with no extra successful-path handle opens or formatted-error allocations.
+
+The original revision was built separately with Rust 1.99.1 and an independent
+target directory. Three alternating live comparisons used 50 iterations,
+100 ms intervals, PID sorting, automatic updates disabled and isolated settings.
+Before the additional renderer optimizations, median baseline/candidate results
+were 7.381/7.175 ms collection, 0.545/0.506 ms composition and 687.5/625 ms CPU
+time. These are workload-specific observations, not performance guarantees.
+
+The final three-round live comparison recorded median baseline/candidate
+composition of 0.818/0.679 ms and CPU time of 796.875/765.625 ms. Collection
+was 9.686/10.346 ms and publish-to-frame latency 0.601/0.783 ms in that run;
+the component results above isolate the renderer improvement, while these live
+results also include system load and the added process-identity verification.
+Raw final samples are in `target/audit-results/live-final.json`.
+
+Checks run unattended: comparison fixtures are native executables launched
+directly from local Windows TEMP with shell execution disabled. No `.cmd` or
+`.ps1` association prompts are needed. No real user process is terminated and
+installation tests use an isolated LOCALAPPDATA fixture.
+
+Windows refused direct replacement of a running executable during verification.
+Installation therefore stages complete bytes before rename-aside/promotion;
+there remains a short interruption window between the two renames. Recovery
+paths are retained and reported if rollback fails.
+
+---
+
+## September 2026 audit history
+
 Audit date: 2026-09-08. Reviewed baseline: `7dffedd5a23c3a52101a10bc4d27169d314f27cf`, plus the selection fix for issue #86.
 
 ## Delivery and scope

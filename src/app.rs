@@ -919,6 +919,9 @@ pub struct App {
     pub search_string: String,
     /// Cached lowercase search string (updated when search_string changes)
     pub search_string_lower: String,
+    /// Select the first match once the current process set has the paths an
+    /// edited search needs. Later snapshots must preserve Next/Previous.
+    pending_search_selection: bool,
     /// Filter string
     pub filter_string: String,
     /// Cached lowercase filter string (updated when filter_string changes)
@@ -1144,6 +1147,7 @@ impl App {
             tree_view,
             search_string: String::new(),
             search_string_lower: String::new(),
+            pending_search_selection: false,
             filter_string: String::new(),
             filter_string_lower: String::new(),
             user_filter: None,
@@ -1859,32 +1863,38 @@ impl App {
         );
     }
 
-    /// Keep the per-process GPU/NPU collection gates in sync with what's
-    /// displayed. Collection costs a handle open plus a few syscalls per
-    /// process per tick, so each class only runs while one of its columns
-    /// is visible or sorted.
-    fn refresh_adapter_collection_flags(&self) {
+    /// Adapter families needed by process columns and sorting, independently
+    /// of whether their header meters are visible.
+    fn process_adapter_collect_requirements(&self) -> u8 {
+        use crate::system::collect_gates;
+
         let gpu_wanted = matches!(self.sort_column, SortColumn::Gpu | SortColumn::GpuMem)
             || self
                 .cached_visible_columns
                 .iter()
                 .any(|c| matches!(c, SortColumn::Gpu | SortColumn::GpuMem));
-        crate::system::set_gpu_process_stats_enabled(gpu_wanted);
-
         let npu_wanted = matches!(self.sort_column, SortColumn::Npu | SortColumn::NpuMem)
             || self
                 .cached_visible_columns
                 .iter()
                 .any(|c| matches!(c, SortColumn::Npu | SortColumn::NpuMem));
-        crate::system::set_npu_process_stats_enabled(npu_wanted);
+        (if gpu_wanted { collect_gates::GPU } else { 0 })
+            | (if npu_wanted { collect_gates::NPU } else { 0 })
+    }
+
+    /// Per-process queries and adapter refreshes use the same requirements so
+    /// hiding the header cannot leave process statistics without an adapter.
+    fn refresh_adapter_collection_flags(&self) {
+        use crate::system::collect_gates;
+
+        let requirements = self.process_adapter_collect_requirements();
+        crate::system::set_gpu_process_stats_enabled(requirements & collect_gates::GPU != 0);
+        crate::system::set_npu_process_stats_enabled(requirements & collect_gates::NPU != 0);
 
         // Keep the pinned-GPU selection in sync with config (Setup can change it).
         crate::system::set_gpu_selection(self.config.gpu_meter_adapter.as_deref());
     }
 
-    /// Canonical metadata the collector must populate for the active
-    /// filter/sort/dialog. The default returns no requirements, keeping normal
-    /// steady-state collection free of all-process Windows calls.
     /// Which collector subsystems the visible UI actually needs this tick.
     /// Computed from the same layout arithmetic the header renders with
     /// (`ui::header::filler_plan`), so a gated-off collector is never one the
@@ -1893,12 +1903,10 @@ impl App {
         use crate::system::collect_gates;
         use crate::config::MeterMode;
 
+        let mut bits = self.process_adapter_collect_requirements();
         if !self.show_header {
-            // Nothing in the header renders, so no subsystem is needed.
-            return 0;
+            return bits;
         }
-
-        let mut bits = 0u8;
         // The Uptime row also renders the average CPU% from the per-core data,
         // so it keeps CPU collection alive even with the CPU meters hidden
         // (issue #97).
@@ -1949,6 +1957,7 @@ impl App {
             arch: matches!(self.sort_column, SortColumn::Arch),
             efficiency: matches!(self.sort_column, SortColumn::Efficiency),
             exe_path: has_filter
+                || !self.search_string_lower.is_empty()
                 || (self.config.show_program_path
                     && matches!(self.sort_column, SortColumn::Command)),
         }
@@ -2110,6 +2119,8 @@ impl App {
             self.ensure_visible();
         }
 
+        self.select_pending_search_match();
+
         // Handle follow mode - find and select the followed PID
         if let Some(follow_identity) = self.follow_pid
             && let Some(idx) = self.display_position(|p| p.identity() == follow_identity)
@@ -2239,6 +2250,15 @@ impl App {
         move |index, process| (key.map_or(0, |key| key(process)) ^ flip, index)
     }
 
+    /// Text painted in the Command column, also used as its sort key.
+    pub(crate) fn command_text(&self) -> fn(&ProcessInfo) -> &str {
+        if self.config.show_program_path {
+            |process| &process.command
+        } else {
+            |process| &process.name
+        }
+    }
+
     /// Sort `sort_entry` entries by the active sort column. Ties keep
     /// collector order, so equal rows don't trade places between snapshots.
     /// Numeric columns sort the entries' keys in place (built during the
@@ -2246,7 +2266,7 @@ impl App {
     fn sort_order(&self, order: &mut [(u64, usize)]) {
         let text: fn(&ProcessInfo) -> &str = match self.sort_column {
             SortColumn::User => |p| &p.user,
-            SortColumn::Command => |p| &p.command,
+            SortColumn::Command => self.command_text(),
             _ => {
                 order.sort_unstable();
                 return;
@@ -2685,24 +2705,39 @@ impl App {
             return;
         }
         self.search_string_lower = self.search_string.to_lowercase();
-        // Find first matching process using pre-computed lowercase strings
-        if select_first
-            && !self.search_string_lower.is_empty()
-            && let Some(idx) = self.display_position(|p| {
-                p.name_lower.contains(&self.search_string_lower)
-                    || p.command_lower.contains(&self.search_string_lower)
-            })
-        {
-            self.selected_index = idx;
-            self.ensure_visible();
+        if select_first {
+            self.pending_search_selection = !self.search_string_lower.is_empty();
+            self.select_pending_search_match();
         }
         // Update matches_search flags for highlighting
         self.needs_process_update = true;
     }
 
+    fn select_pending_search_match(&mut self) {
+        if !self.pending_search_selection
+            || !self
+                .canonical_enrichment
+                .contains(self.canonical_enrichment_requirements())
+        {
+            return;
+        }
+        self.pending_search_selection = false;
+        // Find first matching process using pre-computed lowercase strings
+        if let Some(idx) = self.display_position(|p| {
+            p.name_lower.contains(&self.search_string_lower)
+                || p.command_lower.contains(&self.search_string_lower)
+        }) {
+            self.selected_index = idx;
+            self.ensure_visible();
+        }
+    }
+
     /// Find next search match
     pub fn find_next(&mut self) {
-        if self.search_string_lower.is_empty() || self.display.is_empty() {
+        if self.pending_search_selection
+            || self.search_string_lower.is_empty()
+            || self.display.is_empty()
+        {
             return;
         }
         let start = self.selected_index + 1;
@@ -2724,7 +2759,10 @@ impl App {
 
     /// Find previous search match
     pub fn find_prev(&mut self) {
-        if self.search_string_lower.is_empty() || self.display.is_empty() {
+        if self.pending_search_selection
+            || self.search_string_lower.is_empty()
+            || self.display.is_empty()
+        {
             return;
         }
         let len = self.display.len();
@@ -2750,6 +2788,7 @@ impl App {
 
     /// Clear active search query and remove search highlights.
     pub fn clear_search(&mut self) {
+        self.pending_search_selection = false;
         if !self.search_string.is_empty() {
             self.search_string.clear();
             self.search_string_lower.clear();
@@ -2982,6 +3021,7 @@ impl App {
             if let Some(p) = self.processes.iter_mut().find(|p| p.identity() == id) {
                 p.exe_path = shared.clone();
                 p.command = shared;
+                p.command_lower = clean.to_lowercase().into();
             }
         }
 
@@ -3213,6 +3253,7 @@ impl App {
             } => {
                 self.search_string = original;
                 self.search_string_lower = self.search_string.to_lowercase();
+                self.pending_search_selection = false;
                 restore_selection = original_selection;
                 self.update_displayed_processes();
                 self.needs_process_update = false;
@@ -3921,6 +3962,182 @@ mod tests {
     }
 
     #[test]
+    fn cold_offscreen_path_search_selects_after_enrichment_and_preserves_next() {
+        use crate::system::ProcessEnrichmentRequirements;
+
+        let snapshot = |with_paths| {
+            let mut processes: Vec<_> = (1..=42).map(|pid| process(pid, 0)).collect();
+            if with_paths {
+                for p in &mut processes[39..41] {
+                    p.command = format!(r"C:\TargetDir\p{}.exe", p.pid).into();
+                    p.exe_path = p.command.clone();
+                    p.command_lower = p.command.to_lowercase().into();
+                }
+            }
+            crate::data::SystemSnapshot {
+                metrics: SystemMetrics::default(),
+                processes,
+                refresh_duration: Duration::ZERO,
+                enrichment: ProcessEnrichmentRequirements {
+                    exe_path: with_paths,
+                    ..Default::default()
+                },
+                published_at: Instant::now(),
+            }
+        };
+
+        for show_program_path in [false, true] {
+            for paused in [false, true] {
+                let mut app = App::new(Config {
+                    show_program_path,
+                    ..Config::default()
+                });
+                app.sort_column = SortColumn::Pid;
+                app.sort_ascending = true;
+                app.visible_height = 1;
+                app.paused = paused;
+                app.apply_snapshot(snapshot(false));
+                app.start_search();
+                app.input_char('C');
+                for c in r":\targetdir\".chars() {
+                    app.input_char(c);
+                }
+                app.apply_search();
+                assert!(app.canonical_enrichment_requirements().exe_path);
+                assert!(!app.canonical_enrichment_requirements().user);
+                assert!(app.pending_search_selection);
+                app.find_next();
+                app.apply_snapshot(snapshot(false));
+                assert_eq!(app.selected_process().map(|p| p.pid), Some(1));
+
+                // Enter may close the search before the authoritative snapshot
+                // arrives; its first match still needs to become selected.
+                app.dialog = DialogState::None;
+                app.apply_snapshot(snapshot(true));
+                assert_eq!(app.selected_process().map(|p| p.pid), Some(40));
+                assert_eq!(app.scroll_offset, 39);
+                assert!(!app.pending_search_selection);
+                app.find_next();
+                assert_eq!(app.selected_process().map(|p| p.pid), Some(41));
+                app.apply_snapshot(snapshot(true));
+                assert_eq!(app.selected_process().map(|p| p.pid), Some(41));
+                app.find_prev();
+                assert_eq!(app.selected_process().map(|p| p.pid), Some(40));
+            }
+        }
+    }
+
+    #[test]
+    fn cancelling_a_pending_path_search_cannot_select_a_late_match() {
+        let mut app = App::new(Config::default());
+        app.processes = vec![process(1, 0), process(2, 0)];
+        app.update_displayed_processes();
+        app.start_search();
+        app.input_char('p');
+        app.apply_search();
+        assert!(app.pending_search_selection);
+        app.cancel_dialog();
+        assert!(!app.pending_search_selection);
+        assert!(app.search_string.is_empty());
+        app.selected_index = 1;
+        app.canonical_enrichment.exe_path = true;
+        app.update_displayed_processes();
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(2));
+    }
+
+    #[test]
+    fn search_footer_next_preserves_modifiers_and_cancel_state() {
+        use crate::input::{handle_key_event, handle_mouse_event};
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+
+        let mut app = App::new(Config::default());
+        app.set_display_for_test(vec![process(1, 0), process(2, 0), process(3, 0)]);
+        app.canonical_enrichment.exe_path = true;
+        app.selected_index = 2;
+        app.start_search();
+        app.input_char('p');
+        app.apply_search();
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(1));
+        app.ui_bounds.add_function_key(3, 5, 20, 8);
+        let mut click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 6,
+            row: 20,
+            modifiers: KeyModifiers::empty(),
+        };
+        handle_mouse_event(&mut app, click);
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(2));
+        click.modifiers = KeyModifiers::SHIFT;
+        handle_mouse_event(&mut app, click);
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(1));
+        handle_key_event(&mut app, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(app.search_string.is_empty());
+        assert_eq!(app.selected_process().map(|p| p.pid), Some(3));
+    }
+
+    #[test]
+    fn command_sort_uses_displayed_text_and_keeps_ties_in_collector_order() {
+        let mut alpha = process(1, 0);
+        alpha.name = "Alpha.exe".into();
+        let mut zulu = process(2, 0);
+        zulu.name = "Zulu.exe".into();
+        let mut alpha_tie = process(3, 0);
+        alpha_tie.name = alpha.name.clone();
+        let mut app = App::new(Config::default());
+        app.processes = vec![alpha, zulu, alpha_tie];
+        app.sort_column = SortColumn::Command;
+
+        for paths_cached in [false, true] {
+            app.processes[0].command = if paths_cached {
+                r"C:\z\Alpha.exe"
+            } else {
+                "Alpha.exe"
+            }
+            .into();
+            app.processes[1].command = if paths_cached {
+                r"C:\a\Zulu.exe"
+            } else {
+                "Zulu.exe"
+            }
+            .into();
+            app.processes[2].command = app.processes[0].command.clone();
+            for show_program_path in [true, false] {
+                app.config.show_program_path = show_program_path;
+                for ascending in [false, true] {
+                    app.sort_ascending = ascending;
+                    let mut entries: Vec<_> = app
+                        .processes
+                        .iter()
+                        .enumerate()
+                        .map(|(index, p)| app.sort_entry()(index, p))
+                        .collect();
+                    app.sort_order(&mut entries);
+                    let indices: Vec<_> = entries.iter().map(|&(_, index)| index).collect();
+                    let alpha_first = ascending != (paths_cached && show_program_path);
+                    assert_eq!(
+                        indices,
+                        if alpha_first {
+                            vec![0, 2, 1]
+                        } else {
+                            vec![1, 0, 2]
+                        }
+                    );
+                    assert_eq!(
+                        app.command_text()(&app.processes[0]),
+                        if show_program_path {
+                            &*app.processes[0].command
+                        } else {
+                            "Alpha.exe"
+                        }
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn dependent_sort_waits_for_collector_enrichment() {
         let snapshot = |pid, enrichment| crate::data::SystemSnapshot {
             metrics: SystemMetrics::default(),
@@ -4003,7 +4220,7 @@ mod tests {
         }
     }
 
-    /// The comparator each column sorted by before the key sort.
+    /// Reference comparators with the default name display in Command.
     fn reference_cmp(column: SortColumn, a: &ProcessInfo, b: &ProcessInfo) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         let f = |x: f32, y: f32| x.partial_cmp(&y).unwrap_or(Ordering::Equal);
@@ -4021,7 +4238,7 @@ mod tests {
             SortColumn::Shr => a.shared_mem.cmp(&b.shared_mem),
             SortColumn::Status => a.status.cmp(&b.status),
             SortColumn::StartTime => a.start_time.cmp(&b.start_time),
-            SortColumn::Command => a.command.cmp(&b.command),
+            SortColumn::Command => a.name.cmp(&b.name),
             SortColumn::Elevated => a.is_elevated.cmp(&b.is_elevated),
             SortColumn::Arch => a.arch.sort_rank().cmp(&b.arch.sort_rank()),
             SortColumn::Efficiency => a.efficiency_mode.cmp(&b.efficiency_mode),
@@ -4247,6 +4464,36 @@ mod tests {
         app.config.show_uptime_meter = true;
         app.show_header = false;
         assert_eq!(app.canonical_collect_requirements(), 0);
+    }
+
+    #[test]
+    fn hidden_header_keeps_only_adapters_needed_by_process_columns_or_sorting() {
+        use crate::system::collect_gates;
+
+        let cases: &[(&[SortColumn], SortColumn, u8)] = &[
+            (&[SortColumn::Pid], SortColumn::Cpu, 0),
+            (&[SortColumn::Gpu], SortColumn::Cpu, collect_gates::GPU),
+            (&[SortColumn::Pid], SortColumn::GpuMem, collect_gates::GPU),
+            (&[SortColumn::NpuMem], SortColumn::Cpu, collect_gates::NPU),
+            (&[SortColumn::Pid], SortColumn::Npu, collect_gates::NPU),
+            (
+                &[SortColumn::GpuMem],
+                SortColumn::NpuMem,
+                collect_gates::GPU | collect_gates::NPU,
+            ),
+        ];
+        let mut app = App::new(Config::default());
+        app.system_metrics.cpu.core_usage = vec![0.0; 2];
+        app.terminal_width = 120;
+        for &(columns, sort_column, adapter_bits) in cases {
+            app.cached_visible_columns = columns.to_vec();
+            app.sort_column = sort_column;
+            assert_eq!(app.process_adapter_collect_requirements(), adapter_bits);
+            app.show_header = false;
+            assert_eq!(app.canonical_collect_requirements(), adapter_bits);
+            app.show_header = true;
+            assert_eq!(app.canonical_collect_requirements(), collect_gates::ALL);
+        }
     }
 
     #[test]
@@ -4727,6 +4974,29 @@ mod tests {
 
         let path = app.selected_process_exe_path();
         assert_eq!(path.as_deref(), Some(r"C:\Program Files\My App\my_app.exe"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn newly_resolved_executable_path_updates_the_search_key() {
+        let mut app = App::new(Config::default());
+        let mut processes = Vec::new();
+        app.system_metrics.update_processes_native(&mut processes);
+        let mut own_process = processes
+            .into_iter()
+            .find(|p| p.pid == std::process::id())
+            .expect("the current process must be enumerated");
+        own_process.exe_path = "".into();
+        own_process.command = own_process.name.clone();
+        own_process.command_lower = own_process.name_lower.clone();
+        app.set_display_for_test(vec![own_process]);
+
+        let path = app
+            .selected_process_exe_path()
+            .expect("the current executable is readable");
+        let own_process = app.selected_process().unwrap();
+        assert_eq!(&*own_process.command, path);
+        assert_eq!(&*own_process.command_lower, path.to_lowercase());
     }
 
     #[test]

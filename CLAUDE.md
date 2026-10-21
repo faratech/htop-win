@@ -16,6 +16,11 @@ cargo clippy --all-targets -- -D warnings   # Lint exactly as CI does (must be c
 The crate is Windows-only. From WSL/Linux, add `--target x86_64-pc-windows-gnu`
 to build, clippy and test; the test executables run through WSL interop.
 
+Windows process fixtures must run unattended. Launch native executables directly
+with shell execution disabled; generated fixtures should live in local Windows
+TEMP and use the GUI subsystem when they need no console. Shell-associated
+`.cmd`/`.ps1` fixtures on WSL shares can trigger interactive security prompts.
+
 ### Benchmarking
 `htop-win --benchmark=N [-d MS]` runs N refreshes and prints timing: collection,
 draw (compose vs diff+output), rows repainted and bytes per frame, snapshot

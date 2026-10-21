@@ -147,11 +147,20 @@ def ensure_targets(target_names: list[str], dry_run: bool = False) -> bool:
     return True
 
 
+def get_target_dir() -> Path:
+    """Resolve one directory for Cargo and artifact publication alike."""
+    configured = os.environ.get("CARGO_TARGET_DIR")
+    directory = Path(configured) if configured else TARGET_DIR
+    if not directory.is_absolute():
+        directory = PROJECT_DIR / directory
+    return directory.resolve()
+
+
 def get_build_output_path(target_name: str) -> Path:
     """Get the path to the built executable in the target directory."""
     target = TARGETS[target_name]
     triple = target["triple"]
-    return TARGET_DIR / triple / "release" / "htop-win.exe"
+    return get_target_dir() / triple / "release" / "htop-win.exe"
 
 
 def get_final_output_path(target_name: str) -> Path:
@@ -199,7 +208,8 @@ def build_target(
     env = get_env_for_target(target_name)
     env["CARGO_BUILD_JOBS"] = str(num_jobs)
 
-    cmd = ["cargo", "build", "--release", "--target", triple, "-j", str(num_jobs)]
+    cmd = ["cargo", "build", "--locked", "--release", "--target", triple,
+           "--target-dir", str(get_target_dir()), "-j", str(num_jobs)]
 
     return run_command(cmd, env=env, cwd=PROJECT_DIR, dry_run=dry_run)
 
@@ -214,7 +224,8 @@ def check_target(target_name: str, dry_run: bool = False) -> bool:
     print(f"{'='*60}")
 
     env = get_env_for_target(target_name)
-    cmd = ["cargo", "check", "--target", triple]
+    cmd = ["cargo", "check", "--locked", "--target", triple,
+           "--target-dir", str(get_target_dir())]
 
     return run_command(cmd, env=env, cwd=PROJECT_DIR, dry_run=dry_run)
 

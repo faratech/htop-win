@@ -163,7 +163,7 @@ cargo build --release
 .\target\release\htop-win.exe
 ```
 
-**Requirements**: Rust 1.99+ (2024 edition), Windows 10/11. The repository pins Rust 1.99.0 via `rust-toolchain.toml`.
+**Requirements**: Rust 1.99.1+ (2024 edition), Windows 10/11. The repository pins Rust 1.99.1 via `rust-toolchain.toml`.
 
 ---
 
