@@ -25,7 +25,9 @@ class CrossBuildTests(unittest.TestCase):
     def test_build_and_copy_use_the_same_directory_even_with_stale_default_output(self):
         for override in (None, "relative-cache", "absolute"):
             with self.subTest(override=override), tempfile.TemporaryDirectory() as temporary:
-                root = Path(temporary)
+                # Windows TEMP may use an 8.3 profile alias (RUNNER~1).
+                # Match the helper's canonical paths when comparing outputs.
+                root = Path(temporary).resolve()
                 tool = load_tool("build-cross.py")
                 tool.PROJECT_DIR = root
                 tool.TARGET_DIR = root / "target"
