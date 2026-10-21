@@ -317,4 +317,5 @@ jobs:
         uses: vedantmgoyal2009/winget-releaser@v2
         with:
           identifier: faratech.htop-win
+          release-tag: ${{ needs.prepare.outputs.tag }}
           token: ${{ env.WINGET_TOKEN }}
