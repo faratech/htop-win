@@ -255,7 +255,11 @@ fn ratio_column_rect(inner: Rect, col_idx: usize, cols: usize) -> Rect {
     }
     let base = inner.width as usize / cols;
     let rem = inner.width as usize % cols;
-    let width = if col_idx + 1 == cols { base + rem } else { base };
+    let width = if col_idx + 1 == cols {
+        base + rem
+    } else {
+        base
+    };
     Rect::new(
         inner.x + (base * col_idx) as u16,
         inner.y,

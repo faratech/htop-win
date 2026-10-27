@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{CliOverrides, Config};
 use crate::system::{ProcessIdentity, ProcessInfo, SystemMetrics};
 use crate::terminal::Rect;
 use crate::ui::colors::Theme;
@@ -545,7 +545,6 @@ impl SetupEntry {
         SetupEntry::Item(SetupItem::AutoUpdate),
         SetupEntry::Item(SetupItem::MouseEnabled),
         SetupEntry::Item(SetupItem::ColorScheme),
-
         SetupEntry::Section("Process Display"),
         SetupEntry::Item(SetupItem::TreeView),
         SetupEntry::Item(SetupItem::ShowProgramPath),
@@ -555,14 +554,12 @@ impl SetupEntry {
         SetupEntry::Item(SetupItem::HighlightNewProcesses),
         SetupEntry::Item(SetupItem::HighlightLargeNumbers),
         SetupEntry::Item(SetupItem::ConfigureColumns),
-
         SetupEntry::Section("Meters & Hardware"),
         SetupEntry::Item(SetupItem::CpuMeterMode),
         SetupEntry::Item(SetupItem::MemoryMeterMode),
         SetupEntry::Item(SetupItem::GpuMeterMode),
         SetupEntry::Item(SetupItem::GpuMeterAdapter),
         SetupEntry::Item(SetupItem::NpuMeterMode),
-
         SetupEntry::Section("Safety & Maintenance"),
         SetupEntry::Item(SetupItem::ConfirmKill),
         SetupEntry::Item(SetupItem::ResetAllSettings),
@@ -1043,6 +1040,8 @@ pub struct App {
     /// Readonly policy supplied by the command line. Unlike persisted config,
     /// this cannot be cleared by Reset All Settings during the session.
     runtime_readonly: bool,
+    /// Command-line settings kept out of the config file when it is saved.
+    cli_overrides: Option<CliOverrides>,
 }
 
 fn clamp_char_boundary(buffer: &str, cursor: usize) -> usize {
@@ -1203,12 +1202,37 @@ impl App {
             screen_tabs,
             active_tab: 0,
             runtime_readonly: false,
+            cli_overrides: None,
         }
     }
 
     /// Apply an immutable readonly policy for this process lifetime.
     pub fn set_runtime_readonly(&mut self, readonly: bool) {
         self.runtime_readonly |= readonly;
+    }
+
+    /// Keep command-line settings out of the config file (see `CliOverrides`).
+    pub fn set_cli_overrides(&mut self, overrides: CliOverrides) {
+        self.cli_overrides = Some(overrides);
+    }
+
+    /// Sort the active tab by `column` for this session (`-s`). The tab's
+    /// direction is kept when it already sorts by `column`; otherwise the
+    /// sort is descending, as when a new column is picked in-app.
+    pub fn apply_cli_sort(&mut self, column: SortColumn) {
+        let saved = (self.sort_column, self.sort_ascending);
+        if self.sort_column != column {
+            self.sort_column = column;
+            self.sort_ascending = false;
+        }
+        let launched = (self.sort_column, self.sort_ascending);
+        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
+            (tab.sort_column, tab.sort_ascending) = launched;
+        }
+        if let Some(overrides) = self.cli_overrides.as_mut() {
+            overrides.set_sort(self.active_tab, saved, launched);
+        }
+        self.needs_process_update = true;
     }
 
     pub fn is_readonly(&self) -> bool {
@@ -1370,7 +1394,18 @@ impl App {
         }
         self.sync_config_from_active_tab();
         self.config.screen_tabs = Some(self.screen_tabs.clone());
-        let result = self.config.save().map_err(|error| error.to_string());
+        let result = match self.cli_overrides.as_mut() {
+            Some(overrides) => {
+                let persisted = overrides.persistable(&self.config);
+                let result = persisted.save();
+                if result.is_ok() {
+                    overrides.record_saved(persisted);
+                }
+                result
+            }
+            None => self.config.save(),
+        };
+        let result = result.map_err(|error| error.to_string());
         self.record_config_save_result(result)
     }
 
@@ -1436,6 +1471,8 @@ impl App {
 
     /// Reset persisted preferences while preserving immutable runtime policy.
     pub fn reset_settings(&mut self) {
+        // A reset replaces command-line settings too, so save the defaults.
+        self.cli_overrides = None;
         self.config.reset_to_defaults();
         self.reset_screen_tabs();
         self.apply_config_to_live_state();
@@ -1900,8 +1937,8 @@ impl App {
     /// (`ui::header::filler_plan`), so a gated-off collector is never one the
     /// user could see. Pushed to the collector on change by the event loop.
     pub fn canonical_collect_requirements(&self) -> u8 {
-        use crate::system::collect_gates;
         use crate::config::MeterMode;
+        use crate::system::collect_gates;
 
         let mut bits = self.process_adapter_collect_requirements();
         if !self.show_header {
@@ -2395,7 +2432,11 @@ impl App {
                     let tree_prefix = if pending.depth == 0 {
                         String::new()
                     } else {
-                        let branch = if pending.is_last { "└─ " } else { "├─ " };
+                        let branch = if pending.is_last {
+                            "└─ "
+                        } else {
+                            "├─ "
+                        };
                         // One allocation sized up front; the old clone-then-push
                         // allocated twice (clone at parent length, then regrow).
                         let mut prefix =
@@ -2947,7 +2988,11 @@ impl App {
             match crate::system::set_efficiency_mode(*identity, target_state) {
                 Ok(_) => {
                     success += 1;
-                    if let Some(proc) = self.processes.iter_mut().find(|p| p.identity() == *identity) {
+                    if let Some(proc) = self
+                        .processes
+                        .iter_mut()
+                        .find(|p| p.identity() == *identity)
+                    {
                         proc.efficiency_mode = target_state;
                     }
                 }
@@ -2973,7 +3018,10 @@ impl App {
             }
         } else if success == 0 {
             self.last_error = Some((
-                format!("Failed to set efficiency mode: {}", last_err.unwrap_or_default()),
+                format!(
+                    "Failed to set efficiency mode: {}",
+                    last_err.unwrap_or_default()
+                ),
                 Instant::now(),
             ));
         } else {
@@ -2998,7 +3046,9 @@ impl App {
             let path = crate::system::get_process_exe_path(id);
             if !path.is_empty() {
                 (path, Some(id))
-            } else if !proc.command.is_empty() && (proc.command.contains('\\') || proc.command.contains('/')) {
+            } else if !proc.command.is_empty()
+                && (proc.command.contains('\\') || proc.command.contains('/'))
+            {
                 (proc.command.to_string(), None)
             } else {
                 return None;
@@ -3036,7 +3086,9 @@ impl App {
                 .map(|p| p.name.to_string())
                 .unwrap_or_else(|| "process".to_string());
             self.last_error = Some((
-                format!("Cannot open location for '{name}': path unavailable (access denied or system process)"),
+                format!(
+                    "Cannot open location for '{name}': path unavailable (access denied or system process)"
+                ),
                 Instant::now(),
             ));
             return;
@@ -3092,26 +3144,19 @@ impl App {
 
             match cmd.spawn() {
                 Ok(_) => {
-                    self.status_message = Some((
-                        format!("Opened in Explorer: {}", path),
-                        Instant::now(),
-                    ));
+                    self.status_message =
+                        Some((format!("Opened in Explorer: {}", path), Instant::now()));
                 }
                 Err(e) => {
-                    self.last_error = Some((
-                        format!("Failed to launch Explorer: {}", e),
-                        Instant::now(),
-                    ));
+                    self.last_error =
+                        Some((format!("Failed to launch Explorer: {}", e), Instant::now()));
                 }
             }
         }
 
         #[cfg(not(windows))]
         {
-            self.status_message = Some((
-                format!("File location: {}", path),
-                Instant::now(),
-            ));
+            self.status_message = Some((format!("File location: {}", path), Instant::now()));
         }
     }
 
@@ -3120,7 +3165,9 @@ impl App {
         let text = self
             .selected_process_exe_path()
             .or_else(|| self.selected_process().map(|p| p.name.to_string()));
-        let Some(text) = text else { return; };
+        let Some(text) = text else {
+            return;
+        };
         match copy_to_clipboard(&text) {
             Ok(()) => {
                 self.status_message = Some((
@@ -3136,14 +3183,14 @@ impl App {
 
     /// Copy selected process's PID to clipboard
     pub fn copy_selected_process_pid(&mut self) {
-        let Some(pid) = self.selected_process().map(|p| p.pid) else { return; };
+        let Some(pid) = self.selected_process().map(|p| p.pid) else {
+            return;
+        };
         let text = pid.to_string();
         match copy_to_clipboard(&text) {
             Ok(()) => {
-                self.status_message = Some((
-                    format!("Copied PID {} to clipboard", text),
-                    Instant::now(),
-                ));
+                self.status_message =
+                    Some((format!("Copied PID {} to clipboard", text), Instant::now()));
             }
             Err(e) => {
                 self.last_error = Some((e, Instant::now()));
@@ -3843,7 +3890,10 @@ mod tests {
         for &item in SetupItem::ALL {
             assert!(seen_items.insert(item), "duplicate item in SetupItem::ALL");
             let idx = item.index();
-            assert!(seen_indices.insert(idx), "duplicate index in SetupEntry::ALL");
+            assert!(
+                seen_indices.insert(idx),
+                "duplicate index in SetupEntry::ALL"
+            );
             assert_eq!(SetupEntry::ALL[idx], SetupEntry::Item(item));
         }
 
@@ -4652,6 +4702,49 @@ mod tests {
         assert!(!app.config_dirty);
     }
 
+    #[test]
+    fn cli_sort_applies_to_the_active_tab_without_being_saved() {
+        let mut app = App::new(Config::default());
+        let saved = app.config.clone();
+        app.set_cli_overrides(CliOverrides::new(saved.clone(), saved));
+        app.sort_column = SortColumn::Pid;
+        app.sort_ascending = true;
+        app.screen_tabs[0].sort_column = SortColumn::Pid;
+        app.screen_tabs[0].sort_ascending = true;
+
+        // The same column keeps the tab's direction.
+        app.apply_cli_sort(SortColumn::Pid);
+        assert_eq!(
+            (app.sort_column, app.sort_ascending),
+            (SortColumn::Pid, true)
+        );
+
+        // A new column sorts descending, like picking it in-app.
+        app.apply_cli_sort(SortColumn::IoRate);
+        assert_eq!(
+            (app.sort_column, app.sort_ascending),
+            (SortColumn::IoRate, false)
+        );
+        assert_eq!(app.screen_tabs[0].sort_column, SortColumn::IoRate);
+
+        app.config.screen_tabs = Some(app.screen_tabs.clone());
+        let written = app.cli_overrides.as_ref().unwrap().persistable(&app.config);
+        let main = &written.screen_tabs.unwrap()[0];
+        assert_eq!(
+            (main.sort_column, main.sort_ascending),
+            (SortColumn::Pid, true)
+        );
+    }
+
+    #[test]
+    fn reset_settings_drops_cli_overrides() {
+        let mut app = App::new(Config::default());
+        let config = app.config.clone();
+        app.set_cli_overrides(CliOverrides::new(config.clone(), config));
+        app.reset_settings();
+        assert!(app.cli_overrides.is_none());
+    }
+
     fn zero_height_app() -> App {
         let mut app = App::new(Config::default());
         // A viewport with no rows: collapsed window, or a layout pass that
@@ -4790,7 +4883,11 @@ mod tests {
                 let tree_prefix = if pending.depth == 0 {
                     String::new()
                 } else {
-                    let branch = if pending.is_last { "\u{2514}\u{2500} " } else { "\u{251c}\u{2500} " };
+                    let branch = if pending.is_last {
+                        "\u{2514}\u{2500} "
+                    } else {
+                        "\u{251c}\u{2500} "
+                    };
                     let mut prefix =
                         String::with_capacity(pending.parent_prefix.len() + branch.len());
                     prefix.push_str(&pending.parent_prefix);
