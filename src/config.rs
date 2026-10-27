@@ -614,6 +614,97 @@ impl Config {
     }
 }
 
+/// Settings that command-line options replaced for this session only.
+///
+/// Options such as `-d`, `-t`, `--no-color` or `-s` change the live config,
+/// but must not be written back to the config file when something else (Setup,
+/// a column change) saves it. A setting that still holds its command-line
+/// value is saved with the value from the file; once the user changes it
+/// in-app, the new value is saved as usual.
+#[derive(Debug, Clone)]
+pub struct CliOverrides {
+    /// What the config file holds (as loaded, then as last written).
+    saved: Config,
+    /// The config the session started with, after the command line.
+    launched: Config,
+    sort: Option<SortOverride>,
+}
+
+/// A `-s` sort applied to one screen tab: (column, ascending) pairs.
+#[derive(Debug, Clone, Copy)]
+struct SortOverride {
+    tab: usize,
+    saved: (crate::app::SortColumn, bool),
+    launched: (crate::app::SortColumn, bool),
+}
+
+impl CliOverrides {
+    pub fn new(saved: Config, launched: Config) -> Self {
+        Self {
+            saved,
+            launched,
+            sort: None,
+        }
+    }
+
+    /// Record a command-line sort that replaced `saved` on screen tab `tab`.
+    pub fn set_sort(
+        &mut self,
+        tab: usize,
+        saved: (crate::app::SortColumn, bool),
+        launched: (crate::app::SortColumn, bool),
+    ) {
+        self.sort = Some(SortOverride {
+            tab,
+            saved,
+            launched,
+        });
+    }
+
+    /// The config to write for live config `current`.
+    pub fn persistable(&self, current: &Config) -> Config {
+        let mut out = current.clone();
+        macro_rules! keep_saved {
+            ($($field:ident),*) => {$(
+                if current.$field == self.launched.$field {
+                    out.$field = self.saved.$field.clone();
+                }
+            )*};
+        }
+        keep_saved!(
+            refresh_rate_ms,
+            tree_view_default,
+            color_scheme,
+            highlight_new_processes,
+            highlight_duration_ms,
+            auto_update
+        );
+        if let Some(sort) = self.sort
+            && let Some(tab) = out
+                .screen_tabs
+                .as_mut()
+                .and_then(|tabs| tabs.get_mut(sort.tab))
+            && (tab.sort_column, tab.sort_ascending) == sort.launched
+        {
+            (tab.sort_column, tab.sort_ascending) = sort.saved;
+        }
+        out
+    }
+
+    /// Note that `written` (from `persistable`) is now the file's content.
+    pub fn record_saved(&mut self, written: Config) {
+        if let Some(sort) = self.sort.as_mut()
+            && let Some(tab) = written
+                .screen_tabs
+                .as_ref()
+                .and_then(|tabs| tabs.get(sort.tab))
+        {
+            sort.saved = (tab.sort_column, tab.sort_ascending);
+        }
+        self.saved = written;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,5 +802,85 @@ mod tests {
         assert!(config.show_cpu_meters);
         assert!(config.show_memory_meter);
         assert!(config.show_swap_meter);
+    }
+
+    #[test]
+    fn cli_overrides_are_not_saved_until_changed_in_app() {
+        let saved = Config {
+            refresh_rate_ms: 2000,
+            color_scheme: ColorScheme::Nord,
+            highlight_new_processes: false,
+            ..Config::default()
+        };
+        // -d 100 --no-color -H 5 -t --no-auto-update
+        let launched = Config {
+            refresh_rate_ms: 100,
+            tree_view_default: true,
+            color_scheme: ColorScheme::Monochrome,
+            highlight_new_processes: true,
+            highlight_duration_ms: 5000,
+            auto_update: false,
+            ..saved.clone()
+        };
+        let mut overrides = CliOverrides::new(saved, launched.clone());
+
+        // Saving an unrelated Setup change keeps the file's values.
+        let mut current = launched;
+        current.show_clock = true;
+        let written = overrides.persistable(&current);
+        assert!(written.show_clock);
+        assert_eq!(written.refresh_rate_ms, 2000);
+        assert!(!written.tree_view_default);
+        assert_eq!(written.color_scheme, ColorScheme::Nord);
+        assert!(!written.highlight_new_processes);
+        assert_eq!(written.highlight_duration_ms, 3000);
+        assert!(written.auto_update);
+        overrides.record_saved(written);
+
+        // A setting the user changes in-app is saved, and stays saved.
+        current.refresh_rate_ms = 500;
+        current.color_scheme = ColorScheme::Midnight;
+        let written = overrides.persistable(&current);
+        assert_eq!(written.refresh_rate_ms, 500);
+        assert_eq!(written.color_scheme, ColorScheme::Midnight);
+        assert!(!written.tree_view_default);
+        overrides.record_saved(written);
+        let written = overrides.persistable(&current);
+        assert_eq!(written.refresh_rate_ms, 500);
+        assert_eq!(written.color_scheme, ColorScheme::Midnight);
+    }
+
+    #[test]
+    fn cli_sort_is_not_saved_until_changed_in_app() {
+        use crate::app::{ScreenTab, SortColumn};
+
+        let tabs = vec![
+            ScreenTab::default_main(&Config::default()),
+            ScreenTab::default_io(),
+        ];
+        let saved = Config {
+            screen_tabs: Some(tabs.clone()),
+            ..Config::default()
+        };
+        let mut overrides = CliOverrides::new(saved.clone(), saved.clone());
+        overrides.set_sort(0, (SortColumn::Cpu, false), (SortColumn::Pid, false));
+
+        let mut current = saved;
+        let main = &mut current.screen_tabs.as_mut().unwrap()[0];
+        main.sort_column = SortColumn::Pid;
+        let written = overrides.persistable(&current);
+        let written_tabs = written.screen_tabs.as_ref().unwrap();
+        assert_eq!(written_tabs[0].sort_column, SortColumn::Cpu);
+        assert_eq!(written_tabs[1].sort_column, tabs[1].sort_column);
+        overrides.record_saved(written);
+
+        // Reversing the -s sort in-app saves the new direction.
+        current.screen_tabs.as_mut().unwrap()[0].sort_ascending = true;
+        let written = overrides.persistable(&current);
+        let main = &written.screen_tabs.as_ref().unwrap()[0];
+        assert_eq!(
+            (main.sort_column, main.sort_ascending),
+            (SortColumn::Pid, true)
+        );
     }
 }

@@ -15,7 +15,7 @@ use crossterm::{
 use terminal::{CrosstermBackend, Terminal};
 
 use app::App;
-use config::Config;
+use config::{CliOverrides, Config};
 
 /// Command-line arguments (parsed with lightweight lexopt)
 #[derive(Debug, Default)]
@@ -23,7 +23,7 @@ struct Args {
     delay: Option<u64>,
     user: Option<String>,
     tree: bool,
-    sort: Option<String>,
+    sort: Option<app::SortColumn>,
     no_mouse: bool,
     no_color: bool,
     pids: Option<Vec<u32>>,
@@ -82,7 +82,11 @@ fn parse_args() -> Result<Args, lexopt::Error> {
                 args.tree = true;
             }
             Short('s') | Long("sort") => {
-                args.sort = Some(parser.value()?.parse()?);
+                let name: String = parser.value()?.parse()?;
+                args.sort = Some(
+                    parse_sort_column(&name)
+                        .ok_or_else(|| format!("Unknown sort column: {name}"))?,
+                );
             }
             Long("no-mouse") => {
                 args.no_mouse = true;
@@ -159,6 +163,26 @@ fn parse_args() -> Result<Args, lexopt::Error> {
     Ok(args)
 }
 
+/// Resolve a `-s` column: any column header (case-insensitive, e.g. `io_rate`,
+/// `gpu%`) or one of the short aliases htop users type.
+fn parse_sort_column(name: &str) -> Option<app::SortColumn> {
+    use app::SortColumn;
+    let alias = match name.to_ascii_lowercase().as_str() {
+        "cpu" => Some(SortColumn::Cpu),
+        "mem" | "memory" => Some(SortColumn::Mem),
+        "time" => Some(SortColumn::Time),
+        "cmd" => Some(SortColumn::Command),
+        "threads" => Some(SortColumn::Threads),
+        _ => None,
+    };
+    alias.or_else(|| {
+        SortColumn::all()
+            .iter()
+            .copied()
+            .find(|column| column.name().eq_ignore_ascii_case(name))
+    })
+}
+
 fn print_help() {
     println!("htop-win {}", env!("CARGO_PKG_VERSION"));
     println!("Interactive process viewer for Windows\n");
@@ -167,8 +191,9 @@ fn print_help() {
     println!("  -d, --delay <MS>             Refresh rate in milliseconds (default: 1500)");
     println!("  -u, --user <USER>            Show only processes owned by USER");
     println!("  -t, --tree                   Start in tree view mode");
-    println!("  -s, --sort <COLUMN>          Sort by: pid, ppid, cpu/cpu%, mem/mem%/memory,");
-    println!("                               time, command/cmd, user, threads/thr");
+    println!("  -s, --sort <COLUMN>          Sort by any column header (case-insensitive),");
+    println!("                               e.g. pid, cpu%, mem%, time+, io_rate, gpu%;");
+    println!("                               aliases: cpu, mem/memory, time, cmd, threads");
     println!("      --no-mouse               Disable mouse support");
     println!("      --no-color               Use monochrome mode");
     println!("  -p, --pid <PID,...>          Show only specific PIDs (comma-separated)");
@@ -514,14 +539,28 @@ fn panic_message<'a>(info: &'a std::panic::PanicHookInfo<'_>) -> &'a str {
     }
 }
 
-fn load_session_config(args: &Args) -> (Config, bool) {
+/// The session's settings: the config file with command-line options applied,
+/// plus what saving must keep from the file.
+struct SessionConfig {
+    config: Config,
+    overrides: CliOverrides,
+    first_run: bool,
+}
+
+fn load_session_config(args: &Args) -> SessionConfig {
     // Load this before terminal setup because mouse capture is itself a
     // persisted setting, not merely an in-app rendering preference.
     let first_run = !Config::config_path().is_some_and(|path| path.exists());
-    let mut config = Config::load();
+    let saved = Config::load();
+    let mut config = saved.clone();
     apply_config_overrides(&mut config, args);
+    let overrides = CliOverrides::new(saved, config.clone());
 
-    (config, first_run)
+    SessionConfig {
+        config,
+        overrides,
+        first_run,
+    }
 }
 
 fn apply_config_overrides(config: &mut Config, args: &Args) {
@@ -540,6 +579,11 @@ fn apply_config_overrides(config: &mut Config, args: &Args) {
     }
     if args.no_auto_update {
         config.auto_update = false;
+    }
+    // Benchmarks iterate quickly unless -d asks for a realistic rate (e.g. to
+    // measure snapshot lag at a normal cadence).
+    if args.benchmark.is_some() && args.delay.is_none() {
+        config.refresh_rate_ms = 10;
     }
 }
 
@@ -588,12 +632,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let (config, first_run) = load_session_config(&args);
-    let mouse_enabled = config.mouse_enabled && !args.no_mouse;
+    let session = load_session_config(&args);
+    let mouse_enabled = session.config.mouse_enabled && !args.no_mouse;
 
     // Apply any pending update before starting (downloaded in previous session)
     // only if automatic updates are enabled.
-    let update_just_applied = if config.auto_update {
+    let update_just_applied = if session.config.auto_update {
         installer::apply_pending_update()
     } else {
         false
@@ -656,7 +700,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     enable_raw_mode()?;
 
     let (result, bench_stats, process_count) =
-        run_tui(&args, update_just_applied, config, first_run, mouse_enabled);
+        run_tui(&args, update_just_applied, session, mouse_enabled);
 
     // Restore terminal — the one restore point for both Ok and error returns
     restore_terminal();
@@ -683,8 +727,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn run_tui(
     args: &Args,
     update_just_applied: bool,
-    config: Config,
-    first_run: bool,
+    session: SessionConfig,
     mouse_enabled: bool,
 ) -> (
     Result<(), Box<dyn std::error::Error>>,
@@ -696,8 +739,7 @@ fn run_tui(
     let result = run_tui_inner(
         args,
         update_just_applied,
-        config,
-        first_run,
+        session,
         mouse_enabled,
         &mut bench_stats,
         &mut process_count,
@@ -710,8 +752,7 @@ fn run_tui(
 fn run_tui_inner(
     args: &Args,
     update_just_applied: bool,
-    config: Config,
-    first_run: bool,
+    session: SessionConfig,
     mouse_enabled: bool,
     bench_stats: &mut Option<BenchmarkStats>,
     process_count: &mut usize,
@@ -734,8 +775,14 @@ fn run_tui_inner(
         let _ = event::read();
     }
 
+    let SessionConfig {
+        config,
+        overrides,
+        first_run,
+    } = session;
     let mut app = App::new(config);
     app.set_runtime_readonly(args.readonly);
+    app.set_cli_overrides(overrides);
     app.update_checked = update_just_applied;
 
     // Apply user filter from CLI
@@ -744,18 +791,8 @@ fn run_tui_inner(
     }
 
     // Apply sort column from CLI
-    if let Some(ref sort) = args.sort {
-        app.sort_column = match sort.to_lowercase().as_str() {
-            "pid" => app::SortColumn::Pid,
-            "cpu" | "cpu%" => app::SortColumn::Cpu,
-            "mem" | "mem%" | "memory" => app::SortColumn::Mem,
-            "time" => app::SortColumn::Time,
-            "command" | "cmd" => app::SortColumn::Command,
-            "user" => app::SortColumn::User,
-            "ppid" => app::SortColumn::PPid,
-            "threads" | "thr" => app::SortColumn::Threads,
-            _ => return Err(format!("Unknown sort column: {sort}").into()),
-        };
+    if let Some(column) = args.sort {
+        app.apply_cli_sort(column);
     }
 
     // Apply filter from CLI
@@ -782,12 +819,8 @@ fn run_tui_inner(
     // Setup benchmark mode if requested
     let benchmark_mode = args.benchmark;
     if let Some(n) = benchmark_mode {
+        // The refresh rate is set in apply_config_overrides.
         app.max_iterations = Some(n);
-        // Minimal delay for faster iteration, unless -d asks for a realistic
-        // rate (e.g. to measure snapshot lag at a normal cadence).
-        if args.delay.is_none() {
-            app.config.refresh_rate_ms = 10;
-        }
     }
 
     // Spawn background data collector and wait for initial snapshot
@@ -1198,6 +1231,45 @@ mod tests {
         apply_config_overrides(&mut config, &args);
 
         assert!(!config.auto_update);
+    }
+
+    #[test]
+    fn sort_accepts_every_column_header_and_aliases() {
+        use app::SortColumn;
+        for &column in SortColumn::all() {
+            assert_eq!(parse_sort_column(column.name()), Some(column));
+            assert_eq!(
+                parse_sort_column(&column.name().to_ascii_lowercase()),
+                Some(column)
+            );
+        }
+        assert_eq!(parse_sort_column("cpu"), Some(SortColumn::Cpu));
+        assert_eq!(parse_sort_column("Memory"), Some(SortColumn::Mem));
+        assert_eq!(parse_sort_column("time"), Some(SortColumn::Time));
+        assert_eq!(parse_sort_column("cmd"), Some(SortColumn::Command));
+        assert_eq!(parse_sort_column("threads"), Some(SortColumn::Threads));
+        assert_eq!(parse_sort_column("io_r/s"), Some(SortColumn::IoReadRate));
+        assert_eq!(parse_sort_column("bogus"), None);
+    }
+
+    #[test]
+    fn benchmark_refresh_rate_yields_to_an_explicit_delay() {
+        let mut config = Config::default();
+        let args = Args {
+            benchmark: Some(5),
+            ..Args::default()
+        };
+        apply_config_overrides(&mut config, &args);
+        assert_eq!(config.refresh_rate_ms, 10);
+
+        let mut config = Config::default();
+        let args = Args {
+            benchmark: Some(5),
+            delay: Some(500),
+            ..Args::default()
+        };
+        apply_config_overrides(&mut config, &args);
+        assert_eq!(config.refresh_rate_ms, 500);
     }
 
     #[test]

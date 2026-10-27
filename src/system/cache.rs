@@ -633,19 +633,15 @@ impl ProcessCache {
             } else {
                 Duration::ZERO
             };
-            let replaced = cache
-                .map
-                .entry(Box::from(exe_path))
-                .or_default()
-                .insert(
-                    start_time_100ns,
-                    ExeStatusEntry {
-                        updated: result.0,
-                        deleted: result.1,
-                        checked_at: now,
-                        next_check: now + EXE_STATUS_TTL + jitter,
-                    },
-                );
+            let replaced = cache.map.entry(Box::from(exe_path)).or_default().insert(
+                start_time_100ns,
+                ExeStatusEntry {
+                    updated: result.0,
+                    deleted: result.1,
+                    checked_at: now,
+                    next_check: now + EXE_STATUS_TTL + jitter,
+                },
+            );
             if replaced.is_none() {
                 cache.len += 1;
             }
@@ -855,7 +851,8 @@ mod tests {
     fn write_file_with_mtime(path: &std::path::Path, mtime: SystemTime) {
         use std::io::Write as _;
         let mut f = std::fs::File::create(path).expect("create temp file");
-        f.write_all(b"htop-win exe-status test").expect("write temp file");
+        f.write_all(b"htop-win exe-status test")
+            .expect("write temp file");
         f.set_times(std::fs::FileTimes::new().set_modified(mtime))
             .expect("set mtime");
     }
@@ -1311,7 +1308,12 @@ mod tests {
             cache.check_exe_status_impl(&path, 1_000 + i, t0, true, true);
         }
         let cached = cache.with_exe_status(|m| m.values().map(|b| b.len()).sum::<usize>());
-        assert_eq!(cached, 50, "budget of {} covers 50 entries", config::EXE_STATS_PER_TICK);
+        assert_eq!(
+            cached,
+            50,
+            "budget of {} covers 50 entries",
+            config::EXE_STATS_PER_TICK
+        );
     }
 
     #[test]

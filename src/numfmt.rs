@@ -72,11 +72,12 @@ pub(crate) fn push_tenths(buf: &mut String, value: impl Into<f64>, width: usize)
     debug_assert!(value >= 0.0 && value.is_finite(), "push_tenths: {value}");
     let tenths = exact_scaled(value, 10);
     let whole = tenths / 10;
-    let digits_len = usize::from(whole == 0) + if whole == 0 {
-        0
-    } else {
-        whole.ilog10() as usize + 1
-    };
+    let digits_len = usize::from(whole == 0)
+        + if whole == 0 {
+            0
+        } else {
+            whole.ilog10() as usize + 1
+        };
     let total = digits_len + 2; // '.' + one decimal digit
     if width > total {
         buf.extend(std::iter::repeat_n(' ', width - total));
@@ -109,7 +110,9 @@ mod tests {
     #[test]
     fn tenths_matches_format_at_boundaries() {
         // Values where binary/decimal rounding could disagree.
-        let cases = [0.0f64, 0.05, 0.15, 0.25, 0.35, 0.5, 0.95, 1.5, 2.5, 99.95, 100.0];
+        let cases = [
+            0.0f64, 0.05, 0.15, 0.25, 0.35, 0.5, 0.95, 1.5, 2.5, 99.95, 100.0,
+        ];
         for &value in &cases {
             for width in [0usize, 4, 5, 6] {
                 assert_eq!(
@@ -154,7 +157,11 @@ mod tests {
     fn round0_matches_format_at_boundaries() {
         let cases = [0.0f64, 0.5, 1.5, 2.5, 3.5, 0.49, 0.51, 99.5, 1023.5];
         for &value in &cases {
-            assert_eq!(round0_str(value), format!("{:.0}", value), "round0({value})");
+            assert_eq!(
+                round0_str(value),
+                format!("{:.0}", value),
+                "round0({value})"
+            );
         }
     }
 
@@ -169,7 +176,11 @@ mod tests {
             if !value.is_finite() || value >= 1e12 {
                 continue;
             }
-            assert_eq!(round0_str(value), format!("{:.0}", value), "round0({value})");
+            assert_eq!(
+                round0_str(value),
+                format!("{:.0}", value),
+                "round0({value})"
+            );
         }
     }
 
@@ -261,7 +272,11 @@ mod bytes_tests {
             for delta in [0u64, 1, 5, 51, 512, 5120, 52_428] {
                 let base = 1u64 << pow;
                 for bytes in [base.saturating_sub(delta), base + delta, base / 2 + delta] {
-                    assert_eq!(scaled_bytes(bytes, pow), reference(bytes, pow, 1), "1dp {bytes}/{pow}");
+                    assert_eq!(
+                        scaled_bytes(bytes, pow),
+                        reference(bytes, pow, 1),
+                        "1dp {bytes}/{pow}"
+                    );
                     assert_eq!(
                         scaled_bytes_round0(bytes, pow),
                         reference(bytes, pow, 0),
@@ -280,7 +295,11 @@ mod bytes_tests {
             state ^= state << 17;
             let bytes = state >> 11;
             let pow = (state >> 60) as u32 % 3 * 10 + 10;
-            assert_eq!(scaled_bytes(bytes, pow), reference(bytes, pow, 1), "1dp {bytes}/{pow}");
+            assert_eq!(
+                scaled_bytes(bytes, pow),
+                reference(bytes, pow, 1),
+                "1dp {bytes}/{pow}"
+            );
             assert_eq!(
                 scaled_bytes_round0(bytes, pow),
                 reference(bytes, pow, 0),
