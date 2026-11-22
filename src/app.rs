@@ -545,7 +545,6 @@ impl SetupEntry {
         SetupEntry::Item(SetupItem::AutoUpdate),
         SetupEntry::Item(SetupItem::MouseEnabled),
         SetupEntry::Item(SetupItem::ColorScheme),
-
         SetupEntry::Section("Process Display"),
         SetupEntry::Item(SetupItem::TreeView),
         SetupEntry::Item(SetupItem::ShowProgramPath),
@@ -555,14 +554,12 @@ impl SetupEntry {
         SetupEntry::Item(SetupItem::HighlightNewProcesses),
         SetupEntry::Item(SetupItem::HighlightLargeNumbers),
         SetupEntry::Item(SetupItem::ConfigureColumns),
-
         SetupEntry::Section("Meters & Hardware"),
         SetupEntry::Item(SetupItem::CpuMeterMode),
         SetupEntry::Item(SetupItem::MemoryMeterMode),
         SetupEntry::Item(SetupItem::GpuMeterMode),
         SetupEntry::Item(SetupItem::GpuMeterAdapter),
         SetupEntry::Item(SetupItem::NpuMeterMode),
-
         SetupEntry::Section("Safety & Maintenance"),
         SetupEntry::Item(SetupItem::ConfirmKill),
         SetupEntry::Item(SetupItem::ResetAllSettings),
@@ -1900,8 +1897,8 @@ impl App {
     /// (`ui::header::filler_plan`), so a gated-off collector is never one the
     /// user could see. Pushed to the collector on change by the event loop.
     pub fn canonical_collect_requirements(&self) -> u8 {
-        use crate::system::collect_gates;
         use crate::config::MeterMode;
+        use crate::system::collect_gates;
 
         let mut bits = self.process_adapter_collect_requirements();
         if !self.show_header {
@@ -2064,15 +2061,11 @@ impl App {
                         return false;
                     }
                     // Text filter - use pre-computed lowercase strings
-                    if has_filter
-                        && !(p.name_lower.contains(&self.filter_string_lower)
-                            || p.command_lower.contains(&self.filter_string_lower)
-                            || filter_as_pid.is_some_and(|n| p.pid == n)
-                            || p.user_lower.contains(&self.filter_string_lower))
-                    {
-                        return false;
-                    }
-                    true
+                    !has_filter
+                        || p.name_lower.contains(&self.filter_string_lower)
+                        || p.command_lower.contains(&self.filter_string_lower)
+                        || filter_as_pid.is_some_and(|n| p.pid == n)
+                        || p.user_lower.contains(&self.filter_string_lower)
                 })
                 .map(|(index, p)| sort_entry(index, p)),
         );
@@ -2395,7 +2388,11 @@ impl App {
                     let tree_prefix = if pending.depth == 0 {
                         String::new()
                     } else {
-                        let branch = if pending.is_last { "└─ " } else { "├─ " };
+                        let branch = if pending.is_last {
+                            "└─ "
+                        } else {
+                            "├─ "
+                        };
                         // One allocation sized up front; the old clone-then-push
                         // allocated twice (clone at parent length, then regrow).
                         let mut prefix =
@@ -2947,7 +2944,11 @@ impl App {
             match crate::system::set_efficiency_mode(*identity, target_state) {
                 Ok(_) => {
                     success += 1;
-                    if let Some(proc) = self.processes.iter_mut().find(|p| p.identity() == *identity) {
+                    if let Some(proc) = self
+                        .processes
+                        .iter_mut()
+                        .find(|p| p.identity() == *identity)
+                    {
                         proc.efficiency_mode = target_state;
                     }
                 }
@@ -2973,7 +2974,10 @@ impl App {
             }
         } else if success == 0 {
             self.last_error = Some((
-                format!("Failed to set efficiency mode: {}", last_err.unwrap_or_default()),
+                format!(
+                    "Failed to set efficiency mode: {}",
+                    last_err.unwrap_or_default()
+                ),
                 Instant::now(),
             ));
         } else {
@@ -2998,7 +3002,9 @@ impl App {
             let path = crate::system::get_process_exe_path(id);
             if !path.is_empty() {
                 (path, Some(id))
-            } else if !proc.command.is_empty() && (proc.command.contains('\\') || proc.command.contains('/')) {
+            } else if !proc.command.is_empty()
+                && (proc.command.contains('\\') || proc.command.contains('/'))
+            {
                 (proc.command.to_string(), None)
             } else {
                 return None;
@@ -3036,7 +3042,9 @@ impl App {
                 .map(|p| p.name.to_string())
                 .unwrap_or_else(|| "process".to_string());
             self.last_error = Some((
-                format!("Cannot open location for '{name}': path unavailable (access denied or system process)"),
+                format!(
+                    "Cannot open location for '{name}': path unavailable (access denied or system process)"
+                ),
                 Instant::now(),
             ));
             return;
@@ -3092,26 +3100,19 @@ impl App {
 
             match cmd.spawn() {
                 Ok(_) => {
-                    self.status_message = Some((
-                        format!("Opened in Explorer: {}", path),
-                        Instant::now(),
-                    ));
+                    self.status_message =
+                        Some((format!("Opened in Explorer: {}", path), Instant::now()));
                 }
                 Err(e) => {
-                    self.last_error = Some((
-                        format!("Failed to launch Explorer: {}", e),
-                        Instant::now(),
-                    ));
+                    self.last_error =
+                        Some((format!("Failed to launch Explorer: {}", e), Instant::now()));
                 }
             }
         }
 
         #[cfg(not(windows))]
         {
-            self.status_message = Some((
-                format!("File location: {}", path),
-                Instant::now(),
-            ));
+            self.status_message = Some((format!("File location: {}", path), Instant::now()));
         }
     }
 
@@ -3120,7 +3121,9 @@ impl App {
         let text = self
             .selected_process_exe_path()
             .or_else(|| self.selected_process().map(|p| p.name.to_string()));
-        let Some(text) = text else { return; };
+        let Some(text) = text else {
+            return;
+        };
         match copy_to_clipboard(&text) {
             Ok(()) => {
                 self.status_message = Some((
@@ -3136,14 +3139,14 @@ impl App {
 
     /// Copy selected process's PID to clipboard
     pub fn copy_selected_process_pid(&mut self) {
-        let Some(pid) = self.selected_process().map(|p| p.pid) else { return; };
+        let Some(pid) = self.selected_process().map(|p| p.pid) else {
+            return;
+        };
         let text = pid.to_string();
         match copy_to_clipboard(&text) {
             Ok(()) => {
-                self.status_message = Some((
-                    format!("Copied PID {} to clipboard", text),
-                    Instant::now(),
-                ));
+                self.status_message =
+                    Some((format!("Copied PID {} to clipboard", text), Instant::now()));
             }
             Err(e) => {
                 self.last_error = Some((e, Instant::now()));
@@ -3843,7 +3846,10 @@ mod tests {
         for &item in SetupItem::ALL {
             assert!(seen_items.insert(item), "duplicate item in SetupItem::ALL");
             let idx = item.index();
-            assert!(seen_indices.insert(idx), "duplicate index in SetupEntry::ALL");
+            assert!(
+                seen_indices.insert(idx),
+                "duplicate index in SetupEntry::ALL"
+            );
             assert_eq!(SetupEntry::ALL[idx], SetupEntry::Item(item));
         }
 
@@ -4790,7 +4796,11 @@ mod tests {
                 let tree_prefix = if pending.depth == 0 {
                     String::new()
                 } else {
-                    let branch = if pending.is_last { "\u{2514}\u{2500} " } else { "\u{251c}\u{2500} " };
+                    let branch = if pending.is_last {
+                        "\u{2514}\u{2500} "
+                    } else {
+                        "\u{251c}\u{2500} "
+                    };
                     let mut prefix =
                         String::with_capacity(pending.parent_prefix.len() + branch.len());
                     prefix.push_str(&pending.parent_prefix);

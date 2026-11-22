@@ -914,7 +914,11 @@ fn handle_setup_nav(selected: &mut usize, key: KeyCode) {
             *selected = next;
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            let mut next = if *selected + 1 >= len { 0 } else { *selected + 1 };
+            let mut next = if *selected + 1 >= len {
+                0
+            } else {
+                *selected + 1
+            };
             while matches!(SetupEntry::ALL.get(next), Some(SetupEntry::Section(_))) {
                 next = if next + 1 >= len { 0 } else { next + 1 };
             }
@@ -2220,7 +2224,10 @@ mod tests {
             app.dialog,
             DialogState::Setup { selected } if selected == SetupItem::first_navigable_index()
         ));
-        assert_eq!(app.config.refresh_rate_ms, Config::default().refresh_rate_ms);
+        assert_eq!(
+            app.config.refresh_rate_ms,
+            Config::default().refresh_rate_ms
+        );
     }
 
     #[test]

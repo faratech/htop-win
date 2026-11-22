@@ -2210,9 +2210,9 @@ impl<'a> Frame<'a> {
     fn finish(mut self) -> Option<(u16, u16)> {
         self.finish_base();
         if let Some(memo) = self.memo.as_deref_mut() {
-            for row in 0..self.claimed.len() {
+            for (row, key) in memo.keys.iter_mut().enumerate().take(self.claimed.len()) {
                 if self.buffer.row_touched(row) {
-                    memo.keys[row] = None;
+                    *key = None;
                     self.buffer.clear_touched(row);
                 }
             }

@@ -84,10 +84,10 @@ pub use memory::{MemoryInfo, format_bytes, push_bytes};
 pub use process::ProcessArch;
 pub use process::{
     ProcessEnrichmentRequirements, ProcessIdentity, ProcessInfo, apply_cached_metadata,
-    enable_debug_privilege, enrich_processes_at,
-    enrich_processes, enrich_processes_for, get_process_affinity, get_process_exe_path,
-    get_process_io_counters, hydrate_processes_from_cache, kill_process, set_efficiency_mode,
-    set_priority_class, set_process_affinity,
+    enable_debug_privilege, enrich_processes, enrich_processes_at, enrich_processes_for,
+    get_process_affinity, get_process_exe_path, get_process_io_counters,
+    hydrate_processes_from_cache, kill_process, set_efficiency_mode, set_priority_class,
+    set_process_affinity,
 };
 
 /// System metrics
@@ -372,9 +372,7 @@ fn get_network_stats() -> bool {
             for entry in entries {
                 // Skip loopback and non-operational interfaces. Omitting a down
                 // interface also discards its baseline so reconnecting starts at 0.
-                if entry.OperStatus == IfOperStatusUp
-                    && entry.Type != IF_TYPE_SOFTWARE_LOOPBACK
-                {
+                if entry.OperStatus == IfOperStatusUp && entry.Type != IF_TYPE_SOFTWARE_LOOPBACK {
                     interfaces.insert(
                         entry.InterfaceLuid.Value,
                         NetworkCounters {
@@ -427,7 +425,8 @@ pub mod collect_gates {
     pub const ALL: u8 = NET | BATTERY | CPU | GPU | NPU;
 }
 
-static COLLECT_GATES: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(collect_gates::ALL);
+static COLLECT_GATES: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(collect_gates::ALL);
 
 /// Absent-battery latch: confirm absence for this many ticks, then repoll
 /// only every [`BATTERY_ABSENT_REPOLL_TICKS`] (≈30 s at the default rate).
@@ -510,11 +509,8 @@ impl SystemMetrics {
                 .unwrap_or(0.0);
             NETWORK_INTERFACES.with(|cell| {
                 let mut interfaces = cell.borrow_mut();
-                let (rx_bytes, tx_bytes, rx_rate, tx_rate) = network_totals_and_rates(
-                    &interfaces,
-                    self.prev_network.as_ref(),
-                    elapsed,
-                );
+                let (rx_bytes, tx_bytes, rx_rate, tx_rate) =
+                    network_totals_and_rates(&interfaces, self.prev_network.as_ref(), elapsed);
                 self.net_rx_bytes = rx_bytes;
                 self.net_tx_bytes = tx_bytes;
                 self.net_rx_rate = rx_rate;
@@ -549,7 +545,9 @@ impl SystemMetrics {
         self.battery_absent_ticks = self.battery_absent_ticks.saturating_add(1);
         if self.battery_percent.is_none()
             && self.battery_absent_ticks > BATTERY_ABSENT_CONFIRM_TICKS
-            && !self.battery_absent_ticks.is_multiple_of(BATTERY_ABSENT_REPOLL_TICKS)
+            && !self
+                .battery_absent_ticks
+                .is_multiple_of(BATTERY_ABSENT_REPOLL_TICKS)
         {
             return;
         }
@@ -656,73 +654,76 @@ impl SystemMetrics {
                 alive.clear();
                 alive.resize(processes.len(), false);
 
-            // Per-process GPU/NPU stats (empty unless the hardware exists and
-            // one of its columns is currently visible or sorted). Skip allocating
-            // the all-PIDs vector on the common path where stats are disabled;
-            // still call process_stats(&[]) so its gate-change bookkeeping runs.
-            let adapter_stats = if d3dkmt::process_stats_enabled() {
-                let pids: Vec<(u32, u64)> = proc_list
-                    .iter()
-                    .map(|p| (p.pid(), p.create_time()))
-                    .collect();
-                d3dkmt::process_stats(&pids)
-            } else {
-                d3dkmt::process_stats(&[])
-            };
+                // Per-process GPU/NPU stats (empty unless the hardware exists and
+                // one of its columns is currently visible or sorted). Skip allocating
+                // the all-PIDs vector on the common path where stats are disabled;
+                // still call process_stats(&[]) so its gate-change bookkeeping runs.
+                let adapter_stats = if d3dkmt::process_stats_enabled() {
+                    let pids: Vec<(u32, u64)> = proc_list
+                        .iter()
+                        .map(|p| (p.pid(), p.create_time()))
+                        .collect();
+                    d3dkmt::process_stats(&pids)
+                } else {
+                    d3dkmt::process_stats(&[])
+                };
 
-            // Iterate raw processes
-            PID_INDEX_SCRATCH.with(|scratch| {
-                let mut existing_map = scratch.borrow_mut();
-                existing_map.clear();
-                existing_map.reserve(processes.len());
-                for (i, p) in processes.iter().enumerate() {
-                    existing_map.insert(p.pid, i);
-                }
-                NEW_PROCESSES.with(|new_cell| {
-                    let mut new_processes = new_cell.borrow_mut();
-                    new_processes.clear();
-                with_process_rates(|rates| {
-                    for raw_proc in proc_list.iter() {
-                        let pid = raw_proc.pid();
-                        let cpu_pct = rates.cpu_percentages.get(&pid).copied().unwrap_or(0.0);
-                        let (io_read_rate, io_write_rate) =
-                            rates.io_rates.get(&pid).copied().unwrap_or((0, 0));
-                        let proc_adapter = adapter_stats.get(&pid).copied().unwrap_or_default();
-
-                        if let Some(&idx) = existing_map.get(&pid) {
-                            alive[idx] = true;
-                            let native_start = raw_proc.create_time();
-                            let existing_proc = &mut processes[idx];
-
-                            if native_start == existing_proc.create_time_100ns {
-                                // Update existing process (reuses string allocations)
-                                existing_proc.update_from_raw(&raw_proc, cpu_pct, total_mem);
-                            } else {
-                                // PID reuse: replace entirely
-                                *existing_proc =
-                                    ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem);
-                            }
-                            existing_proc.io_read_rate = io_read_rate;
-                            existing_proc.io_write_rate = io_write_rate;
-                            existing_proc.gpu_percent = proc_adapter.gpu_percent;
-                            existing_proc.gpu_memory = proc_adapter.gpu_memory;
-                            existing_proc.npu_percent = proc_adapter.npu_percent;
-                            existing_proc.npu_memory = proc_adapter.npu_memory;
-                        } else {
-                            let mut proc_info =
-                                ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem);
-                            proc_info.io_read_rate = io_read_rate;
-                            proc_info.io_write_rate = io_write_rate;
-                            proc_info.gpu_percent = proc_adapter.gpu_percent;
-                            proc_info.gpu_memory = proc_adapter.gpu_memory;
-                            proc_info.npu_percent = proc_adapter.npu_percent;
-                            proc_info.npu_memory = proc_adapter.npu_memory;
-                            new_processes.push(proc_info);
-                        }
+                // Iterate raw processes
+                PID_INDEX_SCRATCH.with(|scratch| {
+                    let mut existing_map = scratch.borrow_mut();
+                    existing_map.clear();
+                    existing_map.reserve(processes.len());
+                    for (i, p) in processes.iter().enumerate() {
+                        existing_map.insert(p.pid, i);
                     }
+                    NEW_PROCESSES.with(|new_cell| {
+                        let mut new_processes = new_cell.borrow_mut();
+                        new_processes.clear();
+                        with_process_rates(|rates| {
+                            for raw_proc in proc_list.iter() {
+                                let pid = raw_proc.pid();
+                                let cpu_pct =
+                                    rates.cpu_percentages.get(&pid).copied().unwrap_or(0.0);
+                                let (io_read_rate, io_write_rate) =
+                                    rates.io_rates.get(&pid).copied().unwrap_or((0, 0));
+                                let proc_adapter =
+                                    adapter_stats.get(&pid).copied().unwrap_or_default();
+
+                                if let Some(&idx) = existing_map.get(&pid) {
+                                    alive[idx] = true;
+                                    let native_start = raw_proc.create_time();
+                                    let existing_proc = &mut processes[idx];
+
+                                    if native_start == existing_proc.create_time_100ns {
+                                        // Update existing process (reuses string allocations)
+                                        existing_proc
+                                            .update_from_raw(&raw_proc, cpu_pct, total_mem);
+                                    } else {
+                                        // PID reuse: replace entirely
+                                        *existing_proc =
+                                            ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem);
+                                    }
+                                    existing_proc.io_read_rate = io_read_rate;
+                                    existing_proc.io_write_rate = io_write_rate;
+                                    existing_proc.gpu_percent = proc_adapter.gpu_percent;
+                                    existing_proc.gpu_memory = proc_adapter.gpu_memory;
+                                    existing_proc.npu_percent = proc_adapter.npu_percent;
+                                    existing_proc.npu_memory = proc_adapter.npu_memory;
+                                } else {
+                                    let mut proc_info =
+                                        ProcessInfo::from_raw(&raw_proc, cpu_pct, total_mem);
+                                    proc_info.io_read_rate = io_read_rate;
+                                    proc_info.io_write_rate = io_write_rate;
+                                    proc_info.gpu_percent = proc_adapter.gpu_percent;
+                                    proc_info.gpu_memory = proc_adapter.gpu_memory;
+                                    proc_info.npu_percent = proc_adapter.npu_percent;
+                                    proc_info.npu_memory = proc_adapter.npu_memory;
+                                    new_processes.push(proc_info);
+                                }
+                            }
+                        });
+                    });
                 });
-                });
-            });
 
                 // Remove dead processes. Order-preserving and hash-free: `alive`
                 // was sized to `processes` before the merge above, and appending

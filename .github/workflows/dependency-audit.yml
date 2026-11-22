@@ -39,13 +39,13 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch; toolchain set explicitly
         with:
-          toolchain: 1.99.1
+          toolchain: 1.100.0
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked --version 0.22.2
+        run: cargo install cargo-audit --locked --version 0.23.0
 
       - name: Audit dependencies
         run: cargo audit --deny warnings

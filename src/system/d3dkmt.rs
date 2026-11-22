@@ -936,7 +936,9 @@ pub fn process_stats(processes: &[(u32, u64)]) -> HashMap<u32, ProcAdapterStats>
     }
 
     // Prune baselines for PIDs that died or could no longer be opened.
-    sweep.prev_proc_running.retain(|key, _| current_keys.contains(key));
+    sweep
+        .prev_proc_running
+        .retain(|key, _| current_keys.contains(key));
 
     // Phase 3 (locked): move the updated baselines back. The state cannot have
     // been recreated or re-laid-out meanwhile: only refresh() (same collector
@@ -1535,11 +1537,7 @@ mod tests {
     fn test_proc_sweep_flattened_indices_cover_all_slots() {
         use super::{AdapterClass as C, total_node_slots};
         // GPU(3 nodes), NPU(2), GPU(4) -> 9 slots whatever is enabled.
-        let adapters = [
-            desc(C::Gpu, 3, 1),
-            desc(C::Npu, 2, 2),
-            desc(C::Gpu, 4, 1),
-        ];
+        let adapters = [desc(C::Gpu, 3, 1), desc(C::Npu, 2, 2), desc(C::Gpu, 4, 1)];
         assert_eq!(total_node_slots(&adapters), 9);
         for (gpu_enabled, npu_enabled) in [(true, true), (true, false), (false, true)] {
             let mut seen = [0usize; 9];

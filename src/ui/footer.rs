@@ -1,7 +1,7 @@
 use crate::terminal::{Frame, Line, Modifier, Rect, Span, Style};
 
-use crate::app::{App, DialogState, FocusRegion};
 use super::text_pool::{pooled_fmt, pooled_str, pooled_string, recycle_spans};
+use crate::app::{App, DialogState, FocusRegion};
 
 /// Blank run for empty footer slots (max slot width: label 6 + gap 1 + key 1).
 const FOOTER_BLANKS: &str = "                                ";
@@ -48,8 +48,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, area: Rect) {
             x_pos += total_width;
 
             // Check if this key is focused
-            let is_focused =
-                footer_focused && key_num.is_some() && key_index == focused_key_index;
+            let is_focused = footer_focused && key_num.is_some() && key_index == focused_key_index;
             key_index += if key_num.is_some() { 1 } else { 0 };
 
             // Use inverted colors for focused key
@@ -130,7 +129,6 @@ fn compute_label_width(
 fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str, &'static str)] {
     match &app.dialog {
         DialogState::Help { .. } => &[
-
             (Some(1), "F1", ""),
             (Some(2), "F2", ""),
             (Some(3), "F3", ""),
@@ -143,7 +141,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (Some(10), "F10", "Quit"),
         ],
         DialogState::Search { .. } => &[
-
             (None, "Enter", "Done"),
             (None, "Esc", "Cancel"),
             (Some(3), "F3", "Next"),
@@ -156,7 +153,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
         ],
         DialogState::Filter { .. } => &[
-
             (None, "Enter", "Done"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
@@ -169,7 +165,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
         ],
         DialogState::SortSelect { .. } => &[
-
             (None, "Enter", "Select"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
@@ -182,7 +177,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
         ],
         DialogState::Kill { .. } => &[
-
             (None, "Enter", "Terminate"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
@@ -195,7 +189,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
         ],
         DialogState::ConfirmReset => &[
-
             (None, "Enter", "Reset"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
@@ -208,7 +201,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
         ],
         DialogState::Priority { .. } => &[
-
             (None, "↑/↓", "Select"),
             (None, "Enter", "Set"),
             (None, "Esc", "Cancel"),
@@ -221,7 +213,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
         ],
         DialogState::UserSelect { .. } => &[
-
             (None, "Enter", "Select"),
             (None, "Esc", "Cancel"),
             (None, "", ""),
@@ -234,7 +225,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
         ],
         DialogState::Environment { .. } => &[
-
             (None, "Esc", "Close"),
             (None, "↑↓", "Scroll"),
             (None, "", ""),
@@ -247,7 +237,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
         ],
         DialogState::ColorScheme { .. } | DialogState::GpuSelect { .. } => &[
-
             (None, "Enter", "Select"),
             (None, "Esc", "Back"),
             (None, "", ""),
@@ -260,7 +249,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
         ],
         DialogState::CommandWrap { .. } => &[
-
             (None, "Esc", "Close"),
             (None, "↑↓", "Scroll"),
             (None, "", ""),
@@ -273,7 +261,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
         ],
         DialogState::ColumnConfig { .. } => &[
-
             (None, "Space", "Toggle"),
             (None, "Shift+↑↓", "Order"),
             (None, "Esc", "Done"),
@@ -286,7 +273,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
         ],
         DialogState::Affinity { .. } => &[
-
             (None, "Space", "Toggle"),
             (None, "a", "All"),
             (None, "n", "None"),
@@ -299,7 +285,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
         ],
         DialogState::ProcessInfo { .. } => &[
-
             (None, "Esc", "Close"),
             (None, "↑↓", "Scroll"),
             (None, "", ""),
@@ -312,7 +297,6 @@ fn get_function_keys_with_num(app: &App) -> &'static [(Option<u8>, &'static str,
             (None, "", ""),
         ],
         DialogState::None | DialogState::Setup { .. } => &[
-
             (Some(1), "F1", "Help"),
             (Some(2), "F2", "Setup"),
             (Some(3), "F3", "Search"),
@@ -360,9 +344,14 @@ fn build_status_line(app: &App) -> Vec<Span<'static>> {
     }
 
     // Show persistent update available indicator (if auto_update is enabled)
-    if app.config.auto_update && let Some((ref version, _)) = app.update_available {
+    if app.config.auto_update
+        && let Some((ref version, _)) = app.update_available
+    {
         spans.push(Span::styled(
-            pooled_fmt(format_args!("[Update v{} ready - restart to apply] ", version)),
+            pooled_fmt(format_args!(
+                "[Update v{} ready - restart to apply] ",
+                version
+            )),
             Style::default()
                 .fg(theme.meter_value_warn)
                 .add_modifier(Modifier::BOLD),

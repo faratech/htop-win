@@ -1186,19 +1186,19 @@ mod tests {
             0,
             1,
             59,
-            60,             // 1 minute
-            3_599,          // 59:59
-            3_600,          // 1 hour
-            86_399,         // 23h59:59
-            86_400,         // 1 day
-            432_000,        // 5 days
-            8_553_600,      // 99 days
-            8_553_601,      // 99d 00h +1s boundary
-            17_280_000,     // 200 days
-            31_535_999,     // 364d 23h 59m 59s
-            31_536_000,     // 365 days -> year scale
-            34_560_000,     // 400 days
-            7_889_400_000,  // ~250 years, multi-digit year
+            60,            // 1 minute
+            3_599,         // 59:59
+            3_600,         // 1 hour
+            86_399,        // 23h59:59
+            86_400,        // 1 day
+            432_000,       // 5 days
+            8_553_600,     // 99 days
+            8_553_601,     // 99d 00h +1s boundary
+            17_280_000,    // 200 days
+            31_535_999,    // 364d 23h 59m 59s
+            31_536_000,    // 365 days -> year scale
+            34_560_000,    // 400 days
+            7_889_400_000, // ~250 years, multi-digit year
         ];
         for &secs in samples {
             let d = std::time::Duration::from_secs(secs);

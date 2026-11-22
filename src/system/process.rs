@@ -2,9 +2,9 @@
 
 #[cfg(windows)]
 use std::collections::HashMap;
+use std::sync::Arc;
 #[cfg(not(windows))]
 use std::time::Duration;
-use std::sync::Arc;
 
 #[cfg(windows)]
 use super::native::{SystemProcess, filetime_to_unix};

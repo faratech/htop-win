@@ -770,24 +770,19 @@ pub fn draw_setup(frame: &mut Frame, app: &mut App) {
                             .fg(theme.meter_label)
                             .add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(
-                        "─".repeat(rule_len),
-                        Style::default().fg(theme.border),
-                    ),
+                    Span::styled("─".repeat(rule_len), Style::default().fg(theme.border)),
                 ]))
             }
-            SetupEntry::Item(item) => {
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("   {:<28} ", item.label()),
-                        item_style(idx == selected, theme),
-                    ),
-                    Span::styled(
-                        setup_item_value(*item, app),
-                        Style::default().fg(theme.meter_value_ok),
-                    ),
-                ]))
-            }
+            SetupEntry::Item(item) => ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("   {:<28} ", item.label()),
+                    item_style(idx == selected, theme),
+                ),
+                Span::styled(
+                    setup_item_value(*item, app),
+                    Style::default().fg(theme.meter_value_ok),
+                ),
+            ])),
         })
         .collect();
 
