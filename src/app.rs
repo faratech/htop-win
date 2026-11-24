@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{CliOverrides, Config};
 use crate::system::{ProcessIdentity, ProcessInfo, SystemMetrics};
 use crate::terminal::Rect;
 use crate::ui::colors::Theme;
@@ -1040,6 +1040,8 @@ pub struct App {
     /// Readonly policy supplied by the command line. Unlike persisted config,
     /// this cannot be cleared by Reset All Settings during the session.
     runtime_readonly: bool,
+    /// Command-line settings kept out of the config file when it is saved.
+    cli_overrides: Option<CliOverrides>,
 }
 
 fn clamp_char_boundary(buffer: &str, cursor: usize) -> usize {
@@ -1200,12 +1202,37 @@ impl App {
             screen_tabs,
             active_tab: 0,
             runtime_readonly: false,
+            cli_overrides: None,
         }
     }
 
     /// Apply an immutable readonly policy for this process lifetime.
     pub fn set_runtime_readonly(&mut self, readonly: bool) {
         self.runtime_readonly |= readonly;
+    }
+
+    /// Keep command-line settings out of the config file (see `CliOverrides`).
+    pub fn set_cli_overrides(&mut self, overrides: CliOverrides) {
+        self.cli_overrides = Some(overrides);
+    }
+
+    /// Sort the active tab by `column` for this session (`-s`). The tab's
+    /// direction is kept when it already sorts by `column`; otherwise the
+    /// sort is descending, as when a new column is picked in-app.
+    pub fn apply_cli_sort(&mut self, column: SortColumn) {
+        let saved = (self.sort_column, self.sort_ascending);
+        if self.sort_column != column {
+            self.sort_column = column;
+            self.sort_ascending = false;
+        }
+        let launched = (self.sort_column, self.sort_ascending);
+        if let Some(tab) = self.screen_tabs.get_mut(self.active_tab) {
+            (tab.sort_column, tab.sort_ascending) = launched;
+        }
+        if let Some(overrides) = self.cli_overrides.as_mut() {
+            overrides.set_sort(self.active_tab, saved, launched);
+        }
+        self.needs_process_update = true;
     }
 
     pub fn is_readonly(&self) -> bool {
@@ -1367,7 +1394,18 @@ impl App {
         }
         self.sync_config_from_active_tab();
         self.config.screen_tabs = Some(self.screen_tabs.clone());
-        let result = self.config.save().map_err(|error| error.to_string());
+        let result = match self.cli_overrides.as_mut() {
+            Some(overrides) => {
+                let persisted = overrides.persistable(&self.config);
+                let result = persisted.save();
+                if result.is_ok() {
+                    overrides.record_saved(persisted);
+                }
+                result
+            }
+            None => self.config.save(),
+        };
+        let result = result.map_err(|error| error.to_string());
         self.record_config_save_result(result)
     }
 
@@ -1433,6 +1471,8 @@ impl App {
 
     /// Reset persisted preferences while preserving immutable runtime policy.
     pub fn reset_settings(&mut self) {
+        // A reset replaces command-line settings too, so save the defaults.
+        self.cli_overrides = None;
         self.config.reset_to_defaults();
         self.reset_screen_tabs();
         self.apply_config_to_live_state();
@@ -4656,6 +4696,49 @@ mod tests {
 
         assert!(app.record_config_save_result(Ok(())));
         assert!(!app.config_dirty);
+    }
+
+    #[test]
+    fn cli_sort_applies_to_the_active_tab_without_being_saved() {
+        let mut app = App::new(Config::default());
+        let saved = app.config.clone();
+        app.set_cli_overrides(CliOverrides::new(saved.clone(), saved));
+        app.sort_column = SortColumn::Pid;
+        app.sort_ascending = true;
+        app.screen_tabs[0].sort_column = SortColumn::Pid;
+        app.screen_tabs[0].sort_ascending = true;
+
+        // The same column keeps the tab's direction.
+        app.apply_cli_sort(SortColumn::Pid);
+        assert_eq!(
+            (app.sort_column, app.sort_ascending),
+            (SortColumn::Pid, true)
+        );
+
+        // A new column sorts descending, like picking it in-app.
+        app.apply_cli_sort(SortColumn::IoRate);
+        assert_eq!(
+            (app.sort_column, app.sort_ascending),
+            (SortColumn::IoRate, false)
+        );
+        assert_eq!(app.screen_tabs[0].sort_column, SortColumn::IoRate);
+
+        app.config.screen_tabs = Some(app.screen_tabs.clone());
+        let written = app.cli_overrides.as_ref().unwrap().persistable(&app.config);
+        let main = &written.screen_tabs.unwrap()[0];
+        assert_eq!(
+            (main.sort_column, main.sort_ascending),
+            (SortColumn::Pid, true)
+        );
+    }
+
+    #[test]
+    fn reset_settings_drops_cli_overrides() {
+        let mut app = App::new(Config::default());
+        let config = app.config.clone();
+        app.set_cli_overrides(CliOverrides::new(config.clone(), config));
+        app.reset_settings();
+        assert!(app.cli_overrides.is_none());
     }
 
     fn zero_height_app() -> App {

@@ -92,7 +92,7 @@ A dedicated tab focused on disk I/O activity:
 - **8 color themes**: Default, Monochrome, Light Terminal, Midnight, Nord, and more
 - **Configurable columns**: Show/hide and reorder any column, saved per-tab
 - **Adjustable refresh rate**: 100ms to 5 seconds
-- **Persistent settings**: Configuration saved to `%APPDATA%\htop-win\config`
+- **Persistent settings**: Configuration saved to `%APPDATA%\htop-win\config`; command-line options apply to that session only
 
 ---
 
@@ -176,8 +176,9 @@ Options:
   -d, --delay <MS>          Refresh rate in milliseconds [default: 1500]
   -u, --user <USER>         Show only processes from this user
   -p, --pid <PID,...>       Show only these PIDs (comma-separated)
-  -s, --sort <COLUMN>       Sort by: pid, ppid, cpu/cpu%, mem/mem%/memory, time,
-                            command/cmd, user, threads/thr
+  -s, --sort <COLUMN>       Sort by any column header, case-insensitive (pid, cpu%,
+                            mem%, time+, io_rate, gpu%, ...); aliases: cpu,
+                            mem/memory, time, cmd, threads
   -t, --tree                Start in tree view mode
   -F, --filter <STRING>     Initial filter string
   -H, --highlight-changes <SECS>
